@@ -15,6 +15,66 @@ pool = ConnectionPool(DSN, min_size=1, max_size=10, open=True)
 app = FastAPI(title="Terra Land Intelligence API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# --- SELF-INITIALIZATION -----------------------------------------------------
+# On first boot against an empty database: create extensions + tables (idempotent)
+# and seed the demo parcels so the live site works immediately. When the real
+# county ingest runs later, it upserts over this. All best-effort: if seeding
+# fails the API still starts and simply serves an empty map.
+_here = pathlib.Path(__file__).resolve().parent
+
+def _init_db():
+    import transform as T
+    ddl = (_here / "schema.sql").read_text()
+    stmts = [s.strip() for s in "\n".join(
+        l for l in ddl.splitlines() if not l.strip().startswith("--")
+    ).split(";") if s.strip()]
+    with pool.connection() as c:
+        for s in stmts:
+            c.execute(s)
+        c.commit()
+        zn = c.execute("SELECT count(*) FROM zones").fetchone()[0]
+        if zn == 0:
+            zones = json.load(open(_here / "scored_zctas.json"))["features"]
+            with c.cursor() as cur:
+                for z in zones:
+                    sig = z["signals"]
+                    cur.execute(
+                        "INSERT INTO zones(zcta,geom,signals,water_status,growth_default) "
+                        "VALUES(%s,ST_Multi(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)),%s::jsonb,%s,%s) "
+                        "ON CONFLICT (zcta) DO NOTHING",
+                        (z["zcta"], json.dumps(z["geometry"]), json.dumps(sig),
+                         sig["water_status"], round(T.zone_growth(sig), 2)))
+            c.commit()
+        pn = c.execute("SELECT count(*) FROM parcels").fetchone()[0]
+        if pn == 0 and (_here / "parcels.json").exists():
+            parcels = json.load(open(_here / "parcels.json"))
+            zsig = {z: json.loads(s) for z, s in
+                    c.execute("SELECT zcta, signals::text FROM zones").fetchall()}
+            with c.cursor() as cur:
+                for p in parcels:
+                    sig = zsig.get(p["zcta"])
+                    if not sig:
+                        continue
+                    g = T.zone_growth(sig)
+                    ts = round(T.target_score(g, p.get("tenure"), p["owner_type"], p["use"]), 1)
+                    cur.execute(
+                        "INSERT INTO parcels(apn,geom,zcta,situs_address,city,use,acres,est,assessed,"
+                        "owner,owner_type,absentee,acquired,tenure,paid,status,list_price,growth_score,target_score) "
+                        "VALUES(%s,ST_SetSRID(ST_Point(%s,%s),4326),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (apn) DO NOTHING",
+                        (p["apn"], p["lon"], p["lat"], p["zcta"], p["address"], p["city"], p["use"],
+                         p["acres"], p["est"], p["assessed"], p["owner"], p["owner_type"],
+                         p.get("absentee", False), p.get("acquired"), p.get("tenure"), p.get("paid"),
+                         p["status"], p.get("list_price"), round(g, 2), ts))
+            c.commit()
+
+@app.on_event("startup")
+def _startup():
+    try:
+        _init_db()
+    except Exception as e:
+        print("init/seed skipped:", e)
+
 def q1(sql, params=None):
     with pool.connection() as c, c.cursor() as cur:
         cur.execute(sql, params or ())
