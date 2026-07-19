@@ -1,0 +1,23 @@
+# Render blueprint. New -> Blueprint -> point at this repo.
+# The database lives on Neon (free 10GB). Set DATABASE_URL below to your Neon string.
+services:
+  - type: web
+    name: acreon
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        sync: false          # paste your Neon connection string in the Render dashboard
+    healthCheckPath: /healthz
+
+  - type: cron
+    name: acreon-ingest
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    schedule: "0 8 * * 1"    # Mondays 08:00 UTC
+    dockerCommand: sh -c "python load_zones.py && python ingest.py"
+    envVars:
+      - key: DATABASE_URL
+        sync: false

@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: acreon
+      POSTGRES_PASSWORD: acreon
+      POSTGRES_DB: acreon
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acreon -d acreon"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://acreon:acreon@db:5432/acreon
+      PORT: "8080"
+    ports: ["8080:8080"]
+    depends_on:
+      db: { condition: service_healthy }
+  ingest:
+    build: .
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql://acreon:acreon@db:5432/acreon
+    depends_on:
+      db: { condition: service_healthy }
+    entrypoint: ["sh","-c"]
+    command: ["python load_zones.py && python ingest.py"]
+volumes:
+  pgdata:

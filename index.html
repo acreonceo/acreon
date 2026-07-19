@@ -1,0 +1,198 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terra - Phoenix Land Intelligence</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root{--paper:#f6f3ec;--panel:#fbfaf6;--ink:#1b1915;--ink-soft:#5b564d;--line:#e0d9c9;--line-strong:#c7bda8;
+    --teal:#2f6f6a;--good:#3f8f5a;--warn:#c1892b;--bad:#b0472f;
+    --hot0:#efe9dd;--hot2:#e0a24f;--hot4:#9d2a1c;--mono:ui-monospace,Menlo,Consolas,monospace;}
+  *{box-sizing:border-box}html,body{margin:0;height:100%}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:var(--paper);font-size:14px}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  #app{display:grid;grid-template-columns:360px 1fr;height:100vh}
+  aside{border-right:1px solid var(--line-strong);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+  .brand{padding:12px 16px;border-bottom:1px solid var(--line-strong);font-weight:800;font-size:18px}
+  .brand b{color:var(--teal)}
+  .search{padding:10px 14px;border-bottom:1px solid var(--line);position:relative}
+  .search input{width:100%;padding:8px 10px;border:1px solid var(--line-strong);border-radius:8px;font:inherit}
+  .res{position:absolute;left:14px;right:14px;top:48px;background:#fff;border:1px solid var(--line-strong);border-radius:8px;z-index:5;max-height:260px;overflow:auto;display:none;box-shadow:0 10px 30px -18px rgba(0,0,0,.4)}
+  .res.on{display:block}.res div{padding:8px 10px;font-size:12.5px;cursor:pointer;border-bottom:1px solid var(--line)}
+  .res div:hover{background:var(--paper)} .res .m{color:var(--ink-soft);font-family:var(--mono);font-size:11px}
+  .tabs{display:flex;gap:2px;padding:8px 14px}
+  .tabs button{flex:1;border:1px solid var(--line-strong);background:#fff;padding:7px;font:inherit;font-weight:600;cursor:pointer;border-radius:7px;color:var(--ink-soft)}
+  .tabs button[aria-selected=true]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+  .body{overflow:auto;flex:1;min-height:0;padding:0 14px 24px}
+  .filters{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:6px 0 10px}
+  .filters label{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-soft);font-weight:700}
+  .filters select{width:100%;padding:6px;border:1px solid var(--line-strong);border-radius:6px;font:inherit;font-size:12.5px}
+  .card{border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin:6px 0;cursor:pointer;background:var(--panel)}
+  .card:hover{border-color:var(--teal)}
+  .card .r1{display:flex;justify-content:space-between;font-weight:650}
+  .card .r2{display:flex;justify-content:space-between;font-size:11.5px;color:var(--ink-soft);margin-top:3px}
+  .pill{font-family:var(--mono);font-weight:700;font-size:11px;padding:2px 6px;border-radius:6px;color:#fff}
+  #map{position:relative}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px;margin:8px 0}
+  .kv .k{color:var(--ink-soft)} .kv .v{text-align:right;font-family:var(--mono)}
+  h2{font-size:18px;margin:12px 0 2px}.sub{color:var(--ink-soft);font-size:12px}
+  h3{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:16px 0 6px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}th{font-size:9.5px;text-transform:uppercase;color:var(--ink-soft);text-align:right;padding:3px}th:first-child{text-align:left}
+  td{padding:6px 3px;text-align:right;border-top:1px solid var(--line);font-family:var(--mono)}td:first-child{text-align:left;font-family:inherit}
+  .verdict{border-radius:8px;padding:9px 11px;color:#fff;font-weight:800;margin-top:8px;display:flex;justify-content:space-between;align-items:center}
+  .verdict small{font-weight:400;opacity:.9;font-size:11px;text-align:right;max-width:60%}
+  .empty{color:var(--ink-soft);padding:24px 4px}
+</style>
+
+<div id="app">
+  <aside>
+    <div class="brand">Terra<b>.</b> <span style="font-weight:400;font-size:11px;color:var(--ink-soft);letter-spacing:.15em">MARICOPA LAND</span></div>
+    <div class="search">
+      <input id="q" placeholder="Search APN, address, or owner" autocomplete="off">
+      <div class="res" id="res"></div>
+    </div>
+    <div class="tabs"><button data-t="detail" aria-selected="true">Parcel</button><button data-t="targets" aria-selected="false">Targets</button></div>
+    <div class="body" id="detailPane"><div class="empty">Search a parcel or click one on the map.</div></div>
+    <div class="body" id="targetPane" style="display:none">
+      <div class="filters">
+        <div><label>Use</label><select id="fUse"><option value="">Vacant + Ag</option><option>Vacant</option><option>Agricultural</option></select></div>
+        <div><label>Owner</label><select id="fOwner"><option value="">Any</option><option>Individual</option><option>Trust/LLC</option><option>Investor</option></select></div>
+        <div><label>Min acres</label><select id="fAcres"><option value="0">Any</option><option value="5">5+</option><option value="20">20+</option><option value="40">40+</option></select></div>
+        <div><label>Min held</label><select id="fTen"><option value="0">Any</option><option value="20">20+</option><option value="30">30+</option></select></div>
+      </div>
+      <div id="targetList"></div>
+    </div>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script>
+const API = window.API_BASE || "";              // same-origin by default
+const money=v=>{v=Math.round(v||0);const s=v<0?"-":"";v=Math.abs(v);return v>=1e6?s+"$"+(v/1e6).toFixed(v>=1e7?1:2)+"M":v>=1e3?s+"$"+Math.round(v/1e3)+"k":s+"$"+v};
+const pct=v=>(v*100).toFixed(1)+"%";
+const GC={assured:"#3f8f5a",alternative_pending:"#c1892b",groundwater_constrained:"#7a8790"};
+const GL={assured:"Assured supply",alternative_pending:"Alternative pending",groundwater_constrained:"Groundwater constrained"};
+function ramp(v){v=Math.max(0,Math.min(100,v));const s=[[0,"#efe9dd"],[50,"#e0a24f"],[100,"#9d2a1c"]];
+  const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
+  for(let i=0;i<s.length-1;i++){if(v<=s[i+1][0]){const t=(v-s[i][0])/(s[i+1][0]-s[i][0]),a=hex(s[i][1]),b=hex(s[i+1][1]);
+    return `rgb(${a.map((x,k)=>Math.round(x+(b[k]-x)*t)).join(",")})`;}}return s[2][1];}
+
+// ---- forecast (same model as the standalone tool) ----
+const ASM={base:.035,opt:1.0,hurdle:.07,sell:.08,carry:.007}, SP=.07, JUMP=.5;
+function forecast(p){
+  const V0 = p.status==="For sale"? p.list_price : p.est;
+  const g=(p.growth_score||0)/100, r=ASM.base+SP*g;
+  const pU=t=>Math.max(0,Math.min(.95,g*ASM.opt*Math.pow(t/20,1.3)));
+  const base=t=>V0*Math.pow(1+r,t)*(1+JUMP*pU(t));
+  const pv=T=>{let s=0;for(let t=1;t<=T;t++)s+=V0*Math.pow(1+r,t)*ASM.carry/Math.pow(1+ASM.hurdle,t);return s;};
+  return {V0, base, fair:T=>base(T)/Math.pow(1+ASM.hurdle,T)-pv(T), sell:V0*(1-ASM.sell)};
+}
+const cagr=(v0,vt,t)=>Math.pow(vt/v0,1/t)-1;
+
+// ---- map ----
+const map=new maplibregl.Map({
+  container:"map",
+  style:{version:8, sources:{
+    carto:{type:"raster",tiles:["https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"],tileSize:256,attribution:"CARTO, OpenStreetMap"}
+  }, layers:[{id:"bg",type:"raster",source:"carto"}]},
+  center:[-112.2,33.5], zoom:8.2
+});
+map.on("load",()=>{
+  fetch(API+"/zones").then(r=>r.json()).then(gj=>{
+    map.addSource("zones",{type:"geojson",data:gj});
+    map.addLayer({id:"zones-fill",type:"fill",source:"zones",
+      paint:{"fill-color":["interpolate",["linear"],["get","growth"],0,"#efe9dd",50,"#e0a24f",100,"#9d2a1c"],"fill-opacity":0.18}});
+    map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#c7bda8","line-width":0.6}});
+  });
+  map.addSource("parcels",{type:"vector",tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt"],minzoom:6,maxzoom:16});
+  map.addLayer({id:"parcels-fill",type:"fill",source:"parcels","source-layer":"parcels",
+    paint:{"fill-color":["interpolate",["linear"],["get","target_score"],0,"#efe9dd",50,"#e0a24f",90,"#9d2a1c"],
+           "fill-opacity":0.85,"fill-outline-color":"#fff"}});
+  map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",
+    filter:["==","$type","Point"],
+    paint:{"circle-radius":["interpolate",["linear"],["zoom"],8,2.5,14,6],
+           "circle-color":["interpolate",["linear"],["get","target_score"],0,"#efe9dd",50,"#e0a24f",90,"#9d2a1c"],
+           "circle-stroke-color":"#fff","circle-stroke-width":0.8}});
+  map.on("click",["parcels-fill","parcels-pt"],e=>{ if(e.features[0]) openParcel(e.features[0].properties.apn); });
+  map.on("mouseenter","parcels-pt",()=>map.getCanvas().style.cursor="pointer");
+  map.on("mouseleave","parcels-pt",()=>map.getCanvas().style.cursor="");
+});
+
+// ---- parcel detail ----
+async function openParcel(apn){
+  showTab("detail");
+  const p=await (await fetch(API+"/parcels/"+apn)).json();
+  const sg=p.zone_signals||{}; const ws=sg.water_status;
+  const fc=forecast(p), H=10;
+  const projC=cagr(fc.V0,fc.base(H),H), diff=projC-ASM.hurdle;
+  const dLbl=diff>0.01?"Clears hurdle":diff>=-0.01?"At hurdle":"Below hurdle";
+  const dCol=diff>0.01?"var(--good)":diff>=-0.01?"var(--warn)":"var(--bad)";
+  const holdPV=fc.fair(H), sell=fc.sell;
+  const verdict=holdPV>sell*1.05?["HOLD","var(--good)"]:holdPV<sell*0.95?["SELL","var(--bad)"]:["MARGINAL","var(--warn)"];
+  const rows=[5,10,20].map(t=>`<tr><td>${t}-yr</td><td>${money(fc.base(t))}</td><td>${pct(cagr(fc.V0,fc.base(t),t))}</td><td>${(fc.base(t)/fc.V0).toFixed(2)}×</td></tr>`).join("");
+  const gain=p.paid?(p.est/p.paid).toFixed(1)+"×":"n/a";
+  const held=p.acquired?`${p.acquired} (${p.tenure} yrs)`:"Not on record";
+  document.getElementById("detailPane").innerHTML=`
+    <h2>${p.situs_address||p.apn}</h2>
+    <div class="sub">${p.city||""} ${p.zcta||""} &middot; ${p.use} &middot; ${p.acres} ac &middot; APN ${p.apn}</div>
+    <div style="margin-top:6px">
+      <span class="pill" style="background:${ramp(p.growth_score)}">Growth ${Math.round(p.growth_score)}</span>
+      ${ws?`<span class="pill" style="background:${GC[ws]};margin-left:5px">${GL[ws]}</span>`:""}
+      ${p.status==="For sale"?`<span class="pill" style="background:var(--teal);margin-left:5px">For sale ${money(p.list_price)}</span>`:""}
+    </div>
+    <h3>Ownership</h3>
+    <div class="kv"><span class="k">Owner</span><span class="v" style="font-family:inherit">${p.owner}</span>
+      <span class="k">Type</span><span class="v" style="font-family:inherit">${p.owner_type}</span>
+      <span class="k">Held since</span><span class="v">${held}</span>
+      <span class="k">Acquired for</span><span class="v">${p.paid?money(p.paid):"No recorded sale"}</span>
+      <span class="k">Est. value</span><span class="v">${money(p.est)}</span>
+      <span class="k">Implied gain</span><span class="v">${gain}</span></div>
+    <h3>Purchase read &middot; 10-yr</h3>
+    <div style="font-weight:800;color:${dCol}">${dLbl} &middot; ${pct(projC)}/yr vs ${pct(ASM.hurdle)} hurdle</div>
+    <h3>Projected value if held</h3>
+    <table><tr><th>Horizon</th><th>Value</th><th>CAGR</th><th>×</th></tr>${rows}</table>
+    <h3>Hold or sell</h3>
+    <div class="kv"><span class="k">Sell now, net</span><span class="v">${money(sell)}</span>
+      <span class="k">Hold, value today</span><span class="v">${money(holdPV)}</span></div>
+    <div class="verdict" style="background:${verdict[1]}">${verdict[0]}<small>${verdict[0]==="HOLD"?"holding beats selling at your hurdle":verdict[0]==="SELL"?"trails your hurdle after costs":"within ~5%, depends on the water path"}</small></div>`;
+  const geo=await (await fetch(API+"/parcels/"+apn)).json(); // (detail already has centroid via targets; fly to zone center)
+}
+
+// ---- search ----
+const q=document.getElementById("q"), res=document.getElementById("res");
+let t=null;
+q.addEventListener("input",()=>{clearTimeout(t);const v=q.value.trim();if(v.length<2){res.classList.remove("on");return;}
+  t=setTimeout(async()=>{
+    const rows=await (await fetch(API+"/parcels/search?q="+encodeURIComponent(v))).json();
+    res.innerHTML=rows.map(r=>`<div data-apn="${r.apn}">${r.situs_address} <span class="m">${r.city} ${r.zcta} &middot; ${money(r.est)}</span></div>`).join("")||`<div class="m" style="padding:8px 10px">No match</div>`;
+    res.classList.add("on");
+    res.querySelectorAll("[data-apn]").forEach(d=>d.addEventListener("click",()=>{openParcel(d.dataset.apn);res.classList.remove("on");q.value="";}));
+  },200);
+});
+document.addEventListener("click",e=>{if(!q.parentNode.contains(e.target))res.classList.remove("on");});
+
+// ---- targets ----
+let markers=[];
+async function loadTargets(){
+  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),limit:60});
+  const rows=await (await fetch(API+"/targets?"+p)).json();
+  document.getElementById("targetList").innerHTML=rows.map(r=>`
+    <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
+      <div class="r1"><span>${r.situs_address}</span><span class="pill" style="background:${ramp(r.target_score)}">${Math.round(r.target_score)}</span></div>
+      <div class="r2"><span>${r.use} &middot; ${r.acres} ac &middot; held ${r.tenure??"?"}y</span><span>${money(r.est)}</span></div>
+    </div>`).join("")||`<div class="empty">No targets match.</div>`;
+  document.querySelectorAll("#targetList .card").forEach(c=>c.addEventListener("click",()=>{
+    openParcel(c.dataset.apn); map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
+  markers.forEach(m=>m.remove()); markers=rows.map(r=>new maplibregl.Marker({color:"#1b1915"}).setLngLat([r.lon,r.lat]).addTo(map));
+}
+const val=id=>document.getElementById(id).value;
+["fUse","fOwner","fAcres","fTen"].forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
+
+function showTab(t){
+  document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-selected",b.dataset.t===t));
+  document.getElementById("detailPane").style.display=t==="detail"?"block":"none";
+  document.getElementById("targetPane").style.display=t==="targets"?"block":"none";
+  if(t==="targets" && !document.getElementById("targetList").children.length) loadTargets();
+}
+document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.t)));
+</script>
