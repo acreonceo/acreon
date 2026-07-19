@@ -124,7 +124,7 @@ def zones():
           'type','Feature',
           'geometry', ST_AsGeoJSON(geom)::jsonb,
           'properties', jsonb_build_object('zcta',zcta,'growth',growth_default,
-                                           'water_status',water_status)))
+                                           'water_status',water_status,'signals',signals)))
       ) FROM zones""")
     return Response(json.dumps(row[0]), media_type="application/json")
 

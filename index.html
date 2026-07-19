@@ -1,59 +1,95 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Terra - Phoenix Land Intelligence</title>
+<title>Acreon - Maricopa Land Intelligence</title>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <style>
-  :root{--paper:#f6f3ec;--panel:#fbfaf6;--ink:#1b1915;--ink-soft:#5b564d;--line:#e0d9c9;--line-strong:#c7bda8;
-    --teal:#2f6f6a;--good:#3f8f5a;--warn:#c1892b;--bad:#b0472f;
-    --hot0:#efe9dd;--hot2:#e0a24f;--hot4:#9d2a1c;--mono:ui-monospace,Menlo,Consolas,monospace;}
+  :root{--paper:#f6f3ec;--panel:#fbfaf6;--panel2:#f1ece1;--ink:#1b1915;--ink-soft:#5b564d;--ink-faint:#8b8579;
+    --line:#e0d9c9;--line-strong:#c7bda8;--teal:#2f6f6a;--good:#3f8f5a;--warn:#c1892b;--bad:#b0472f;
+    --mono:ui-monospace,Menlo,Consolas,monospace;}
   *{box-sizing:border-box}html,body{margin:0;height:100%}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:var(--paper);font-size:14px}
   .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
-  #app{display:grid;grid-template-columns:360px 1fr;height:100vh}
+  #app{display:grid;grid-template-columns:372px 1fr;height:100vh}
   aside{border-right:1px solid var(--line-strong);background:var(--panel);display:flex;flex-direction:column;min-height:0}
-  .brand{padding:12px 16px;border-bottom:1px solid var(--line-strong);font-weight:800;font-size:18px}
-  .brand b{color:var(--teal)}
+  .brand{padding:12px 16px;border-bottom:1px solid var(--line-strong);display:flex;align-items:baseline;gap:8px}
+  .brand .lg{font-weight:800;font-size:18px}.brand .lg b{color:var(--teal)}
+  .brand .demo{font-size:9.5px;letter-spacing:.14em;color:#7a3b12;background:#f6e7d3;border:1px solid #e6c79c;border-radius:999px;padding:2px 7px}
   .search{padding:10px 14px;border-bottom:1px solid var(--line);position:relative}
   .search input{width:100%;padding:8px 10px;border:1px solid var(--line-strong);border-radius:8px;font:inherit}
-  .res{position:absolute;left:14px;right:14px;top:48px;background:#fff;border:1px solid var(--line-strong);border-radius:8px;z-index:5;max-height:260px;overflow:auto;display:none;box-shadow:0 10px 30px -18px rgba(0,0,0,.4)}
+  .search input:focus{outline:2px solid var(--teal);border-color:var(--teal)}
+  .res{position:absolute;left:14px;right:14px;top:48px;background:#fff;border:1px solid var(--line-strong);border-radius:8px;z-index:5;max-height:280px;overflow:auto;display:none;box-shadow:0 12px 34px -18px rgba(0,0,0,.45)}
   .res.on{display:block}.res div{padding:8px 10px;font-size:12.5px;cursor:pointer;border-bottom:1px solid var(--line)}
-  .res div:hover{background:var(--paper)} .res .m{color:var(--ink-soft);font-family:var(--mono);font-size:11px}
+  .res div:hover{background:var(--paper)} .res .m{color:var(--ink-faint);font-family:var(--mono);font-size:11px}
   .tabs{display:flex;gap:2px;padding:8px 14px}
   .tabs button{flex:1;border:1px solid var(--line-strong);background:#fff;padding:7px;font:inherit;font-weight:600;cursor:pointer;border-radius:7px;color:var(--ink-soft)}
   .tabs button[aria-selected=true]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
-  .body{overflow:auto;flex:1;min-height:0;padding:0 14px 24px}
-  .filters{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:6px 0 10px}
-  .filters label{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-soft);font-weight:700}
-  .filters select{width:100%;padding:6px;border:1px solid var(--line-strong);border-radius:6px;font:inherit;font-size:12.5px}
-  .card{border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin:6px 0;cursor:pointer;background:var(--panel)}
-  .card:hover{border-color:var(--teal)}
-  .card .r1{display:flex;justify-content:space-between;font-weight:650}
-  .card .r2{display:flex;justify-content:space-between;font-size:11.5px;color:var(--ink-soft);margin-top:3px}
-  .pill{font-family:var(--mono);font-weight:700;font-size:11px;padding:2px 6px;border-radius:6px;color:#fff}
-  #map{position:relative}
-  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px;margin:8px 0}
-  .kv .k{color:var(--ink-soft)} .kv .v{text-align:right;font-family:var(--mono)}
+  .body{overflow:auto;flex:1;min-height:0;padding:2px 14px 26px}
+  .empty{color:var(--ink-soft);padding:26px 4px;line-height:1.5}
   h2{font-size:18px;margin:12px 0 2px}.sub{color:var(--ink-soft);font-size:12px}
-  h3{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin:16px 0 6px}
-  table{width:100%;border-collapse:collapse;font-size:12.5px}th{font-size:9.5px;text-transform:uppercase;color:var(--ink-soft);text-align:right;padding:3px}th:first-child{text-align:left}
-  td{padding:6px 3px;text-align:right;border-top:1px solid var(--line);font-family:var(--mono)}td:first-child{text-align:left;font-family:inherit}
-  .verdict{border-radius:8px;padding:9px 11px;color:#fff;font-weight:800;margin-top:8px;display:flex;justify-content:space-between;align-items:center}
-  .verdict small{font-weight:400;opacity:.9;font-size:11px;text-align:right;max-width:60%}
-  .empty{color:var(--ink-soft);padding:24px 4px}
+  h3{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft);margin:16px 0 7px;font-weight:700}
+  .pill{font-family:var(--mono);font-weight:700;font-size:11px;padding:2px 7px;border-radius:6px;color:#fff;display:inline-block}
+  .badges{margin-top:7px;display:flex;flex-wrap:wrap;gap:5px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:13px;margin:6px 0}
+  .kv .k{color:var(--ink-soft)} .kv .v{text-align:right;font-family:var(--mono)}
+  .gauge{margin:6px 0 2px}
+  .gaugebar{height:12px;border-radius:7px;background:linear-gradient(90deg,var(--good),var(--warn) 55%,var(--bad));position:relative}
+  .gaugebar .mk{position:absolute;top:-4px;width:3px;height:20px;background:var(--ink);border-radius:2px;transform:translateX(-50%)}
+  .gaugelbl{display:flex;justify-content:space-between;font-size:10px;color:var(--ink-faint);margin-top:4px;font-weight:600}
+  .readline{font-weight:800;margin-top:8px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-faint);text-align:right;padding:3px 2px;font-weight:700;border-bottom:1px solid var(--line-strong)}th:first-child{text-align:left}
+  td{padding:6px 2px;text-align:right;border-bottom:1px solid var(--line);font-family:var(--mono)}td:first-child{text-align:left;font-family:inherit;font-weight:600}
+  tr.hl td{background:#fbf4e4}
+  .hs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:6px 0}
+  .hs .box{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--panel2)}
+  .hs .box .k{font-size:10px;text-transform:uppercase;color:var(--ink-faint);font-weight:700}
+  .hs .box .v{font-size:18px;font-weight:800;font-family:var(--mono);margin-top:1px}
+  .hs .box small{font-size:10.5px;color:var(--ink-soft)}
+  .verdict{border-radius:8px;padding:9px 11px;color:#fff;display:flex;justify-content:space-between;align-items:center;gap:10px}
+  .verdict .lead{font-weight:800;font-size:16px}.verdict small{font-weight:400;opacity:.92;font-size:11px;text-align:right;max-width:58%}
+  details.assume{margin-top:14px}details.assume summary{cursor:pointer;font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft);font-weight:700;list-style:none}
+  details.assume summary::-webkit-details-marker{display:none}details.assume summary:before{content:"▸ ";color:var(--ink-faint)}details.assume[open] summary:before{content:"▾ "}
+  .sld{margin:9px 0}.sld .l{display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px}.sld .l .v{color:var(--ink-soft);font-family:var(--mono);font-size:11.5px}
+  input[type=range]{width:100%;height:20px;margin:0;accent-color:var(--teal);cursor:pointer}
+  .filters{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:8px 0 12px}
+  .filters label{font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-faint);font-weight:700;display:block;margin-bottom:3px}
+  .filters select{width:100%;padding:6px 7px;border:1px solid var(--line-strong);border-radius:6px;font:inherit;font-size:12.5px;background:#fff}
+  .card{border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin:6px 0;cursor:pointer;background:var(--panel)}
+  .card:hover{border-color:var(--teal);box-shadow:0 8px 22px -18px rgba(40,30,10,.6)}
+  .card .r1{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-weight:650}
+  .card .r2{display:flex;justify-content:space-between;font-size:11.5px;color:var(--ink-soft);margin-top:4px}
+  .seg{display:flex;border:1px solid var(--line-strong);border-radius:8px;overflow:hidden;margin:2px 0 14px}
+  .seg button{flex:1;border:0;background:transparent;padding:7px 4px;font:inherit;font-size:12.5px;font-weight:600;color:var(--ink-soft);cursor:pointer}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button[aria-pressed=true]{background:var(--ink);color:var(--paper)}
+  .toggle{display:flex;align-items:center;justify-content:space-between;font-size:12.5px;font-weight:600;margin:10px 0}
+  .switch{position:relative;width:38px;height:22px}.switch input{opacity:0;width:0;height:0;position:absolute}
+  .track{position:absolute;inset:0;background:var(--ink-faint);border-radius:999px;transition:.15s}
+  .track:after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.15s}
+  .switch input:checked+.track{background:var(--teal)}.switch input:checked+.track:after{transform:translateX(16px)}
+  #map{position:relative}
+  .legend{position:absolute;left:12px;bottom:12px;background:rgba(251,250,246,.96);border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:11px;box-shadow:0 10px 30px -18px rgba(0,0,0,.4)}
+  .legend .bar{width:150px;height:10px;border-radius:3px;background:linear-gradient(90deg,#efe9dd,#e7cf98,#e0a24f,#cf6b39,#9d2a1c)}
+  .legend .row{display:flex;align-items:center;gap:8px}.legend .lbls{display:flex;justify-content:space-between;margin-top:2px;color:var(--ink-soft)}
+  .tip{position:absolute;pointer-events:none;background:#1b1915;color:#f6f3ec;border-radius:7px;padding:6px 9px;font-size:11.5px;opacity:0;transition:opacity .1s;z-index:9;max-width:220px}
+  .tip b{font-size:12.5px}
 </style>
 
 <div id="app">
   <aside>
-    <div class="brand">Terra<b>.</b> <span style="font-weight:400;font-size:11px;color:var(--ink-soft);letter-spacing:.15em">MARICOPA LAND</span></div>
-    <div class="search">
-      <input id="q" placeholder="Search APN, address, or owner" autocomplete="off">
-      <div class="res" id="res"></div>
+    <div class="brand"><span class="lg">Acreon<b>.</b></span><span class="demo">DEMO DATA</span></div>
+    <div class="search"><input id="q" placeholder="Search APN, address, or owner" autocomplete="off"><div class="res" id="res"></div></div>
+    <div class="tabs">
+      <button data-t="detail" aria-selected="true">Parcel</button>
+      <button data-t="targets" aria-selected="false">Targets</button>
+      <button data-t="map" aria-selected="false">Heatmap</button>
     </div>
-    <div class="tabs"><button data-t="detail" aria-selected="true">Parcel</button><button data-t="targets" aria-selected="false">Targets</button></div>
-    <div class="body" id="detailPane"><div class="empty">Search a parcel or click one on the map.</div></div>
-    <div class="body" id="targetPane" style="display:none">
+
+    <div class="body" id="pane-detail"><div class="empty">Search a parcel or click one on the map to see its ownership, growth outlook, and buy / hold / sell read.</div></div>
+
+    <div class="body" id="pane-targets" style="display:none">
       <div class="filters">
         <div><label>Use</label><select id="fUse"><option value="">Vacant + Ag</option><option>Vacant</option><option>Agricultural</option></select></div>
         <div><label>Owner</label><select id="fOwner"><option value="">Any</option><option>Individual</option><option>Trust/LLC</option><option>Investor</option></select></div>
@@ -62,137 +98,250 @@
       </div>
       <div id="targetList"></div>
     </div>
+
+    <div class="body" id="pane-map" style="display:none">
+      <h3>Horizon</h3>
+      <div class="seg" id="hzSeg"><button data-h="near">5-yr</button><button data-h="mid" aria-pressed="true">10-yr</button><button data-h="long">20-yr</button></div>
+      <div class="toggle"><span>Water gate</span><label class="switch"><input type="checkbox" id="gate" checked><span class="track"></span></label></div>
+      <div class="toggle"><span>Heatmap strength</span></div>
+      <input type="range" id="heatOp" min="10" max="80" value="52">
+      <h3>Signal weights</h3><div id="wSliders"></div>
+      <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin-top:12px">These weights set the growth score behind the heatmap and every parcel forecast. Drag to re-rank what matters, and the map recolors live.</p>
+    </div>
   </aside>
-  <div id="map"></div>
+
+  <div id="map"><div class="tip" id="tip"></div>
+    <div class="legend"><div class="row"><span>Low</span><div class="bar"></div><span>High</span></div><div class="lbls" style="width:180px"><span>growth</span><span id="legMode">by ZIP region</span></div></div>
+  </div>
 </div>
 
 <script>
-const API = window.API_BASE || "";              // same-origin by default
+const API = window.API_BASE || "";
 const money=v=>{v=Math.round(v||0);const s=v<0?"-":"";v=Math.abs(v);return v>=1e6?s+"$"+(v/1e6).toFixed(v>=1e7?1:2)+"M":v>=1e3?s+"$"+Math.round(v/1e3)+"k":s+"$"+v};
 const pct=v=>(v*100).toFixed(1)+"%";
+const cagr=(v0,vt,t)=>Math.pow(vt/v0,1/t)-1;
 const GC={assured:"#3f8f5a",alternative_pending:"#c1892b",groundwater_constrained:"#7a8790"};
 const GL={assured:"Assured supply",alternative_pending:"Alternative pending",groundwater_constrained:"Groundwater constrained"};
-function ramp(v){v=Math.max(0,Math.min(100,v));const s=[[0,"#efe9dd"],[50,"#e0a24f"],[100,"#9d2a1c"]];
+function ramp(v){v=Math.max(0,Math.min(100,v));const s=[[0,"#efe9dd"],[25,"#e7cf98"],[50,"#e0a24f"],[75,"#cf6b39"],[100,"#9d2a1c"]];
   const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
   for(let i=0;i<s.length-1;i++){if(v<=s[i+1][0]){const t=(v-s[i][0])/(s[i+1][0]-s[i][0]),a=hex(s[i][1]),b=hex(s[i+1][1]);
-    return `rgb(${a.map((x,k)=>Math.round(x+(b[k]-x)*t)).join(",")})`;}}return s[2][1];}
+    return `rgb(${a.map((x,k)=>Math.round(x+(b[k]-x)*t)).join(",")})`;}}return s[4][1];}
 
-// ---- forecast (same model as the standalone tool) ----
+// ---- growth model (client-side so weights drive everything live) ----
+const SIGS=["developable_land","permit_velocity","zoning_activity","infra_transport","infra_water","migration","schools"];
+const SIGLBL={developable_land:"Developable land",permit_velocity:"Permit velocity",zoning_activity:"Rezoning activity",
+  infra_transport:"Transport buildout",infra_water:"Utility / water buildout",migration:"In-migration",schools:"Enrollment growth"};
+const PRESETS={near:{developable_land:20,permit_velocity:85,zoning_activity:70,infra_transport:75,infra_water:45,migration:45,schools:40},
+  mid:{developable_land:50,permit_velocity:60,zoning_activity:55,infra_transport:60,infra_water:60,migration:60,schools:50},
+  long:{developable_land:90,permit_velocity:30,zoning_activity:45,infra_transport:55,infra_water:85,migration:75,schools:55}};
+const GATE={assured:1.0,alternative_pending:0.7,groundwater_constrained:0.3};
+const HZY={near:5,mid:10,long:20};
+let weights={...PRESETS.mid}, horizon="mid", gateOn=true, selApn=null;
 const ASM={base:.035,opt:1.0,hurdle:.07,sell:.08,carry:.007}, SP=.07, JUMP=.5;
+
+function growthOf(sig){ if(!sig) return 0; let n=0,d=0; for(const k of SIGS){n+=weights[k]*sig[k];d+=weights[k];}
+  let g=n/d; if(gateOn) g*=GATE[sig.water_status]; return g; }
+
 function forecast(p){
-  const V0 = p.status==="For sale"? p.list_price : p.est;
-  const g=(p.growth_score||0)/100, r=ASM.base+SP*g;
+  const V0=p.status==="For sale"?p.list_price:p.est, g=growthOf(p.zone_signals)/100, r=ASM.base+SP*g;
   const pU=t=>Math.max(0,Math.min(.95,g*ASM.opt*Math.pow(t/20,1.3)));
   const base=t=>V0*Math.pow(1+r,t)*(1+JUMP*pU(t));
+  const low=t=>V0*Math.pow(1+Math.max(0,r-0.02),t)*(1+JUMP*pU(t)*0.5);
+  const high=t=>V0*Math.pow(1+r+0.025,t)*(1+JUMP*Math.min(.95,pU(t)*1.4));
   const pv=T=>{let s=0;for(let t=1;t<=T;t++)s+=V0*Math.pow(1+r,t)*ASM.carry/Math.pow(1+ASM.hurdle,t);return s;};
-  return {V0, base, fair:T=>base(T)/Math.pow(1+ASM.hurdle,T)-pv(T), sell:V0*(1-ASM.sell)};
+  return {V0,base,low,high,fair:T=>base(T)/Math.pow(1+ASM.hurdle,T)-pv(T),sell:V0*(1-ASM.sell)};
 }
-const cagr=(v0,vt,t)=>Math.pow(vt/v0,1/t)-1;
 
 // ---- map ----
-const map=new maplibregl.Map({
-  container:"map",
-  style:{version:8, sources:{
-    carto:{type:"raster",tiles:["https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"],tileSize:256,attribution:"CARTO, OpenStreetMap"}
-  }, layers:[{id:"bg",type:"raster",source:"carto"}]},
-  center:[-112.2,33.5], zoom:8.2
-});
+let zonesGeo=null;
+const map=new maplibregl.Map({container:"map",center:[-112.2,33.5],zoom:8.2,
+  style:{version:8,sources:{carto:{type:"raster",tiles:["https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"],tileSize:256,attribution:"CARTO, OpenStreetMap"}},
+    layers:[{id:"bg",type:"raster",source:"carto"}]}});
+const tip=document.getElementById("tip");
+function showTip(e,html){tip.innerHTML=html;const r=map.getContainer().getBoundingClientRect();
+  tip.style.left=Math.min(e.point.x+12,r.width-224)+"px";tip.style.top=(e.point.y+12)+"px";tip.style.opacity=1;}
+function hideTip(){tip.style.opacity=0;}
+
 map.on("load",()=>{
-  fetch(API+"/zones").then(r=>r.json()).then(gj=>{
+  fetch(API+"/zones").then(r=>r.json()).then(gj=>{ zonesGeo=gj; recolorZones();
     map.addSource("zones",{type:"geojson",data:gj});
     map.addLayer({id:"zones-fill",type:"fill",source:"zones",
-      paint:{"fill-color":["interpolate",["linear"],["get","growth"],0,"#efe9dd",50,"#e0a24f",100,"#9d2a1c"],"fill-opacity":0.18}});
-    map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#c7bda8","line-width":0.6}});
+      paint:{"fill-color":["interpolate",["linear"],["get","g"],0,"#efe9dd",25,"#e7cf98",50,"#e0a24f",75,"#cf6b39",100,"#9d2a1c"],"fill-opacity":0.52}},"bg");
+    // draw zones above basemap but below parcels
+    map.moveLayer("zones-fill");
+    map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#ffffff","line-width":0.6,"line-opacity":.7}});
+    map.on("mousemove","zones-fill",e=>{const p=e.features[0].properties;showTip(e,`<b>${p.zcta}</b><br>growth ${Math.round(p.g)} &middot; ${GL[p.water_status]}`);});
+    map.on("mouseleave","zones-fill",hideTip);
   });
   map.addSource("parcels",{type:"vector",tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt"],minzoom:6,maxzoom:16});
   map.addLayer({id:"parcels-fill",type:"fill",source:"parcels","source-layer":"parcels",
-    paint:{"fill-color":["interpolate",["linear"],["get","target_score"],0,"#efe9dd",50,"#e0a24f",90,"#9d2a1c"],
-           "fill-opacity":0.85,"fill-outline-color":"#fff"}});
-  map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",
-    filter:["==","$type","Point"],
-    paint:{"circle-radius":["interpolate",["linear"],["zoom"],8,2.5,14,6],
-           "circle-color":["interpolate",["linear"],["get","target_score"],0,"#efe9dd",50,"#e0a24f",90,"#9d2a1c"],
-           "circle-stroke-color":"#fff","circle-stroke-width":0.8}});
-  map.on("click",["parcels-fill","parcels-pt"],e=>{ if(e.features[0]) openParcel(e.features[0].properties.apn); });
-  map.on("mouseenter","parcels-pt",()=>map.getCanvas().style.cursor="pointer");
-  map.on("mouseleave","parcels-pt",()=>map.getCanvas().style.cursor="");
+    paint:{"fill-color":["interpolate",["linear"],["get","target_score"],0,"#efe9dd",50,"#e0a24f",90,"#9d2a1c"],"fill-opacity":.85,"fill-outline-color":"#fff"}});
+  map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",filter:["==","$type","Point"],
+    paint:{"circle-radius":["interpolate",["linear"],["zoom"],8,2.4,14,6],
+      "circle-color":["interpolate",["linear"],["get","target_score"],0,"#efe9dd",50,"#e0a24f",90,"#9d2a1c"],
+      "circle-stroke-color":"#fff","circle-stroke-width":.7}});
+  // targets: a dedicated, larger, easy-to-click layer
+  map.addSource("targets",{type:"geojson",data:{type:"FeatureCollection",features:[]}});
+  map.addLayer({id:"targets-halo",type:"circle",source:"targets",
+    paint:{"circle-radius":12,"circle-color":"#1b1915","circle-opacity":.08}});
+  map.addLayer({id:"targets-dot",type:"circle",source:"targets",
+    paint:{"circle-radius":8,"circle-color":["interpolate",["linear"],["get","score"],0,"#efe9dd",50,"#e0a24f",90,"#9d2a1c"],
+      "circle-stroke-color":"#1b1915","circle-stroke-width":1.4}});
+  const openFromFeat=e=>{const f=e.features&&e.features[0]; if(f) openParcel(f.properties.apn);};
+  ["parcels-fill","parcels-pt","targets-dot","targets-halo"].forEach(L=>{
+    map.on("click",L,openFromFeat);
+    map.on("mouseenter",L,()=>map.getCanvas().style.cursor="pointer");
+    map.on("mouseleave",L,()=>map.getCanvas().style.cursor="");
+  });
 });
+
+function recolorZones(){ if(!zonesGeo) return;
+  zonesGeo.features.forEach(f=>f.properties.g=growthOf(f.properties.signals));
+  if(map.getSource("zones")) map.getSource("zones").setData(zonesGeo);
+}
 
 // ---- parcel detail ----
 async function openParcel(apn){
-  showTab("detail");
+  showTab("detail"); selApn=apn;
   const p=await (await fetch(API+"/parcels/"+apn)).json();
-  const sg=p.zone_signals||{}; const ws=sg.water_status;
-  const fc=forecast(p), H=10;
+  renderDetail(p);
+}
+function renderDetail(p){
+  const sg=p.zone_signals||{}, ws=sg.water_status, fc=forecast(p), H=HZY[horizon];
+  const g=growthOf(sg);
   const projC=cagr(fc.V0,fc.base(H),H), diff=projC-ASM.hurdle;
-  const dLbl=diff>0.01?"Clears hurdle":diff>=-0.01?"At hurdle":"Below hurdle";
+  const dLbl=diff>0.01?"Clears your hurdle":diff>=-0.01?"At your hurdle":"Below your hurdle";
   const dCol=diff>0.01?"var(--good)":diff>=-0.01?"var(--warn)":"var(--bad)";
+  const mk=Math.max(3,Math.min(97,50-Math.max(-0.04,Math.min(0.04,diff))/0.04*47));
   const holdPV=fc.fair(H), sell=fc.sell;
-  const verdict=holdPV>sell*1.05?["HOLD","var(--good)"]:holdPV<sell*0.95?["SELL","var(--bad)"]:["MARGINAL","var(--warn)"];
-  const rows=[5,10,20].map(t=>`<tr><td>${t}-yr</td><td>${money(fc.base(t))}</td><td>${pct(cagr(fc.V0,fc.base(t),t))}</td><td>${(fc.base(t)/fc.V0).toFixed(2)}×</td></tr>`).join("");
+  const V=holdPV>sell*1.05?["HOLD","var(--good)","holding beats selling at your hurdle"]
+        :holdPV<sell*0.95?["SELL","var(--bad)","trails your hurdle after costs"]
+        :["MARGINAL","var(--warn)","within ~5%, hinges on the water path"];
   const gain=p.paid?(p.est/p.paid).toFixed(1)+"×":"n/a";
   const held=p.acquired?`${p.acquired} (${p.tenure} yrs)`:"Not on record";
-  document.getElementById("detailPane").innerHTML=`
+  const rows=[5,10,20].map(t=>`<tr class="${t===H?'hl':''}"><td>${t}-yr</td><td>${money(fc.base(t))}</td><td>${pct(cagr(fc.V0,fc.base(t),t))}</td><td>${(fc.base(t)/fc.V0).toFixed(2)}×</td></tr>`).join("");
+  const priceLbl=p.status==="For sale"?"List price":"Est. value", priceVal=p.status==="For sale"?p.list_price:p.est;
+  document.getElementById("pane-detail").innerHTML=`
     <h2>${p.situs_address||p.apn}</h2>
     <div class="sub">${p.city||""} ${p.zcta||""} &middot; ${p.use} &middot; ${p.acres} ac &middot; APN ${p.apn}</div>
-    <div style="margin-top:6px">
-      <span class="pill" style="background:${ramp(p.growth_score)}">Growth ${Math.round(p.growth_score)}</span>
-      ${ws?`<span class="pill" style="background:${GC[ws]};margin-left:5px">${GL[ws]}</span>`:""}
-      ${p.status==="For sale"?`<span class="pill" style="background:var(--teal);margin-left:5px">For sale ${money(p.list_price)}</span>`:""}
+    <div class="badges">
+      <span class="pill" style="background:${ramp(g)}">Growth ${Math.round(g)}</span>
+      ${ws?`<span class="pill" style="background:${GC[ws]}">${GL[ws]}</span>`:""}
+      ${p.status==="For sale"?`<span class="pill" style="background:var(--teal)">For sale ${money(p.list_price)}</span>`:`<span class="pill" style="background:#8b8579">Off-market</span>`}
     </div>
+    <div class="kv" style="margin-top:12px"><span class="k">${priceLbl}</span><span class="v" style="font-size:16px;font-weight:800">${money(priceVal)}</span>
+      <span class="k">Per acre</span><span class="v">${money(priceVal/p.acres)}</span></div>
+
     <h3>Ownership</h3>
     <div class="kv"><span class="k">Owner</span><span class="v" style="font-family:inherit">${p.owner}</span>
       <span class="k">Type</span><span class="v" style="font-family:inherit">${p.owner_type}</span>
       <span class="k">Held since</span><span class="v">${held}</span>
       <span class="k">Acquired for</span><span class="v">${p.paid?money(p.paid):"No recorded sale"}</span>
-      <span class="k">Est. value</span><span class="v">${money(p.est)}</span>
       <span class="k">Implied gain</span><span class="v">${gain}</span></div>
-    <h3>Purchase read &middot; 10-yr</h3>
-    <div style="font-weight:800;color:${dCol}">${dLbl} &middot; ${pct(projC)}/yr vs ${pct(ASM.hurdle)} hurdle</div>
+
+    <h3>Purchase read &middot; ${H}-yr exit</h3>
+    <div class="readline" style="color:${dCol}">${dLbl}</div>
+    <div class="sub">Projected <b>${pct(projC)}/yr</b> vs your ${pct(ASM.hurdle)} hurdle</div>
+    <div class="gauge"><div class="gaugebar"><span class="mk" style="left:${mk}%"></span></div>
+      <div class="gaugelbl"><span>Clears</span><span>Hurdle</span><span>Below</span></div></div>
+    <div class="sub" style="margin-top:8px">To clear your hurdle you could pay up to <b>${money(fc.fair(H))}</b>.</div>
+
     <h3>Projected value if held</h3>
+    <div id="chart"></div>
     <table><tr><th>Horizon</th><th>Value</th><th>CAGR</th><th>×</th></tr>${rows}</table>
-    <h3>Hold or sell</h3>
-    <div class="kv"><span class="k">Sell now, net</span><span class="v">${money(sell)}</span>
-      <span class="k">Hold, value today</span><span class="v">${money(holdPV)}</span></div>
-    <div class="verdict" style="background:${verdict[1]}">${verdict[0]}<small>${verdict[0]==="HOLD"?"holding beats selling at your hurdle":verdict[0]==="SELL"?"trails your hurdle after costs":"within ~5%, depends on the water path"}</small></div>`;
-  const geo=await (await fetch(API+"/parcels/"+apn)).json(); // (detail already has centroid via targets; fly to zone center)
+
+    <h3>Hold or sell &middot; ${H}-yr</h3>
+    <div class="hs"><div class="box"><div class="k">Sell now, net</div><div class="v">${money(sell)}</div><small>after ${pct(ASM.sell)} costs</small></div>
+      <div class="box"><div class="k">Hold, value today</div><div class="v">${money(holdPV)}</div><small>PV of ${H}-yr exit</small></div></div>
+    <div class="verdict" style="background:${V[1]}"><span class="lead">${V[0]}</span><small>${V[2]}</small></div>
+
+    <details class="assume"><summary>Assumptions</summary><div id="asld"></div></details>`;
+  drawChart(fc);
+  buildAssume();
+  // put a marker on the map and center on the parcel
+  map.getSource("targets") && setTimeout(()=>flyToZone(p.zcta),0);
 }
 
+function drawChart(fc){
+  const W=324,H=150,PL=48,PR=8,PT=8,PB=22,maxT=20,maxV=fc.high(20)*1.02;
+  const X=t=>PL+(t/maxT)*(W-PL-PR), Y=v=>PT+(1-v/maxV)*(H-PT-PB);
+  const path=fn=>{let d="";for(let t=0;t<=20;t+=0.5)d+=(t?"L":"M")+X(t).toFixed(1)+" "+Y(fn(t)).toFixed(1);return d;};
+  let band="M";for(let t=0;t<=20;t++)band+=X(t).toFixed(1)+" "+Y(fc.high(t)).toFixed(1)+"L";
+  for(let t=20;t>=0;t--)band+=X(t).toFixed(1)+" "+Y(fc.low(t)).toFixed(1)+"L";band=band.slice(0,-1)+"Z";
+  let gl="";for(const v of [maxV*.33,maxV*.66,maxV]) gl+=`<line x1="${PL}" y1="${Y(v).toFixed(1)}" x2="${W-PR}" y2="${Y(v).toFixed(1)}" stroke="#e6dfcf"/><text x="${PL-5}" y="${(Y(v)+3).toFixed(1)}" text-anchor="end" font-size="8.5" fill="#8b8579">${money(v)}</text>`;
+  let xl="";for(const t of [0,5,10,20]) xl+=`<text x="${X(t).toFixed(1)}" y="${H-7}" text-anchor="middle" font-size="8.5" fill="#8b8579">${t?"yr "+t:"now"}</text>`;
+  let dots="";for(const t of [5,10,20]) dots+=`<circle cx="${X(t).toFixed(1)}" cy="${Y(fc.base(t)).toFixed(1)}" r="3" fill="#9d2a1c"/>`;
+  const by=Y(fc.V0);
+  document.getElementById("chart").innerHTML=`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${gl}${xl}
+    <path d="${band}" fill="#cf6b39" fill-opacity=".14"/>
+    <line x1="${PL}" y1="${by.toFixed(1)}" x2="${W-PR}" y2="${by.toFixed(1)}" stroke="#2f6f6a" stroke-dasharray="4 3"/>
+    <path d="${path(fc.low)}" fill="none" stroke="#cf6b39" stroke-width="1" stroke-opacity=".5"/>
+    <path d="${path(fc.high)}" fill="none" stroke="#cf6b39" stroke-width="1" stroke-opacity=".5"/>
+    <path d="${path(fc.base)}" fill="none" stroke="#9d2a1c" stroke-width="2.2"/>${dots}</svg>`;
+}
+
+const ASLD=[["base","Base appreciation",0,10,.5,v=>v/100,v=>(v*100).toFixed(1)+"%"],
+  ["opt","Developability optimism",30,160,5,v=>v/100,v=>v.toFixed(2)+"×"],
+  ["hurdle","Your hurdle rate",3,15,.5,v=>v/100,v=>(v*100).toFixed(1)+"%"],
+  ["sell","Selling cost",4,14,1,v=>v/100,v=>(v*100).toFixed(0)+"%"]];
+function buildAssume(){const box=document.getElementById("asld");if(!box)return;
+  box.innerHTML=ASLD.map(([k,l,mn,mx,st])=>`<div class="sld"><div class="l"><span>${l}</span><span class="v" id="av_${k}"></span></div><input type="range" id="a_${k}" min="${mn}" max="${mx}" step="${st}" value="${ASM[k]*100}"></div>`).join("");
+  ASLD.forEach(([k,l,mn,mx,st,conv,fmt])=>{const inp=document.getElementById("a_"+k);document.getElementById("av_"+k).textContent=fmt(ASM[k]);
+    inp.addEventListener("input",()=>{ASM[k]=conv(+inp.value);document.getElementById("av_"+k).textContent=fmt(ASM[k]);if(selApn)refreshDetail();});});
+}
+async function refreshDetail(){ if(!selApn) return; const p=await(await fetch(API+"/parcels/"+selApn)).json(); renderDetail(p); }
+
+function flyToZone(zcta){ if(!zonesGeo) return; const f=zonesGeo.features.find(x=>x.properties.zcta===zcta); }
+
 // ---- search ----
-const q=document.getElementById("q"), res=document.getElementById("res");
-let t=null;
-q.addEventListener("input",()=>{clearTimeout(t);const v=q.value.trim();if(v.length<2){res.classList.remove("on");return;}
-  t=setTimeout(async()=>{
-    const rows=await (await fetch(API+"/parcels/search?q="+encodeURIComponent(v))).json();
+const q=document.getElementById("q"), res=document.getElementById("res"); let st=null;
+q.addEventListener("input",()=>{clearTimeout(st);const v=q.value.trim();if(v.length<2){res.classList.remove("on");return;}
+  st=setTimeout(async()=>{const rows=await(await fetch(API+"/parcels/search?q="+encodeURIComponent(v))).json();
     res.innerHTML=rows.map(r=>`<div data-apn="${r.apn}">${r.situs_address} <span class="m">${r.city} ${r.zcta} &middot; ${money(r.est)}</span></div>`).join("")||`<div class="m" style="padding:8px 10px">No match</div>`;
     res.classList.add("on");
-    res.querySelectorAll("[data-apn]").forEach(d=>d.addEventListener("click",()=>{openParcel(d.dataset.apn);res.classList.remove("on");q.value="";}));
-  },200);
-});
+    res.querySelectorAll("[data-apn]").forEach(d=>d.addEventListener("click",()=>{openParcel(d.dataset.apn);res.classList.remove("on");q.value="";}));},200);});
 document.addEventListener("click",e=>{if(!q.parentNode.contains(e.target))res.classList.remove("on");});
 
 // ---- targets ----
-let markers=[];
+const val=id=>document.getElementById(id).value;
 async function loadTargets(){
-  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),limit:60});
-  const rows=await (await fetch(API+"/targets?"+p)).json();
+  const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),limit:80});
+  const rows=await(await fetch(API+"/targets?"+pr)).json();
   document.getElementById("targetList").innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
       <div class="r1"><span>${r.situs_address}</span><span class="pill" style="background:${ramp(r.target_score)}">${Math.round(r.target_score)}</span></div>
-      <div class="r2"><span>${r.use} &middot; ${r.acres} ac &middot; held ${r.tenure??"?"}y</span><span>${money(r.est)}</span></div>
-    </div>`).join("")||`<div class="empty">No targets match.</div>`;
-  document.querySelectorAll("#targetList .card").forEach(c=>c.addEventListener("click",()=>{
-    openParcel(c.dataset.apn); map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
-  markers.forEach(m=>m.remove()); markers=rows.map(r=>new maplibregl.Marker({color:"#1b1915"}).setLngLat([r.lon,r.lat]).addTo(map));
+      <div class="r2"><span>${r.use} &middot; ${r.acres} ac &middot; held ${r.tenure??"?"}y</span><span>${money(r.est)}</span></div></div>`).join("")
+    ||`<div class="empty">No targets match these filters.</div>`;
+  document.querySelectorAll("#targetList .card").forEach(c=>c.addEventListener("click",()=>{openParcel(c.dataset.apn);map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
+  const src=map.getSource("targets");
+  if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
+    geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.target_score}}))});
 }
-const val=id=>document.getElementById(id).value;
 ["fUse","fOwner","fAcres","fTen"].forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
 
+// ---- heatmap controls ----
+function buildWeights(){
+  document.getElementById("wSliders").innerHTML=SIGS.map(k=>`<div class="sld"><div class="l"><span>${SIGLBL[k]}</span><span class="v" id="wv_${k}">${weights[k]}</span></div><input type="range" id="w_${k}" min="0" max="100" step="5" value="${weights[k]}"></div>`).join("");
+  SIGS.forEach(k=>document.getElementById("w_"+k).addEventListener("input",e=>{weights[k]=+e.target.value;document.getElementById("wv_"+k).textContent=e.target.value;afterWeights();}));
+  document.querySelectorAll("#hzSeg button").forEach(b=>b.addEventListener("click",()=>{
+    horizon=b.dataset.h; weights={...PRESETS[horizon]};
+    document.querySelectorAll("#hzSeg button").forEach(x=>x.setAttribute("aria-pressed",x===b));
+    SIGS.forEach(k=>{document.getElementById("w_"+k).value=weights[k];document.getElementById("wv_"+k).textContent=weights[k];});afterWeights();}));
+  document.getElementById("gate").addEventListener("change",e=>{gateOn=e.target.checked;afterWeights();});
+  document.getElementById("heatOp").addEventListener("input",e=>{if(map.getLayer("zones-fill"))map.setPaintProperty("zones-fill","fill-opacity",+e.target.value/100);});
+}
+function afterWeights(){ recolorZones(); if(selApn) refreshDetail(); }
+
+// ---- tabs ----
 function showTab(t){
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-selected",b.dataset.t===t));
-  document.getElementById("detailPane").style.display=t==="detail"?"block":"none";
-  document.getElementById("targetPane").style.display=t==="targets"?"block":"none";
-  if(t==="targets" && !document.getElementById("targetList").children.length) loadTargets();
+  document.getElementById("pane-detail").style.display=t==="detail"?"block":"none";
+  document.getElementById("pane-targets").style.display=t==="targets"?"block":"none";
+  document.getElementById("pane-map").style.display=t==="map"?"block":"none";
+  document.getElementById("legMode").textContent=t==="targets"?"by target score":"by ZIP region";
+  if(t==="targets"){ if(!document.getElementById("targetList").children.length) loadTargets(); }
+  else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
 }
 document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.t)));
+buildWeights();
 </script>
