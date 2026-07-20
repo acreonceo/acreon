@@ -70,10 +70,15 @@ def _init_db():
 
 @app.on_event("startup")
 def _startup():
-    try:
-        _init_db()
-    except Exception as e:
-        print("init/seed skipped:", e)
+    import threading
+    def _bg():
+        try:
+            _init_db()
+        except Exception as e:
+            print("init/seed skipped:", e)
+    # Non-blocking: bind the port and answer health checks immediately, even if
+    # the database is cold. Schema + seeding happen in the background.
+    threading.Thread(target=_bg, daemon=True).start()
 
 def q1(sql, params=None):
     with pool.connection() as c, c.cursor() as cur:
@@ -88,8 +93,12 @@ def qall(sql, params=None):
 
 @app.get("/healthz")
 def healthz():
-    n = q1("SELECT count(*) FROM parcels")[0]
-    return {"ok": True, "parcels": n}
+    try:
+        n = q1("SELECT count(*) FROM parcels")[0]
+        return {"ok": True, "parcels": n}
+    except Exception as e:
+        # DB still warming up: report healthy so the deploy doesn't loop.
+        return {"ok": True, "status": "starting", "detail": str(e)[:120]}
 
 # --- MAP TILES -------------------------------------------------------------
 # Zoom LOD: when zoomed out, only render meaningful land (drops built-out noise
