@@ -393,6 +393,85 @@ def admin_status(token: str):
         raise HTTPException(403, "forbidden")
     return INGEST_STATUS
 
+# --- REAL DATA: growth signals (starting with migration from Census) -------
+# Pulls population per ZIP for two years, turns the change into a real migration
+# signal, updates each zone, recomputes the default-weight growth, and re-scores
+# every parcel. Same trigger/poll pattern as the parcel ingest.
+SIGNAL_STATUS = {"state": "idle"}
+CENSUS_YEARS = (2018, 2023)
+
+def _census_pop(year):
+    r = requests.get(f"https://api.census.gov/data/{year}/acs/acs5",
+                     params={"get": "B01003_001E", "for": "zip code tabulation area:*"},
+                     timeout=120, headers={"User-Agent": UA})
+    rows = r.json()
+    hdr = rows[0]; iz = hdr.index("zip code tabulation area"); ip = hdr.index("B01003_001E")
+    out = {}
+    for row in rows[1:]:
+        try: out[row[iz]] = int(row[ip])
+        except Exception: pass
+    return out
+
+def _migration_signal(pct):          # pct = fractional pop change over the span
+    return max(0, min(100, round(50 + pct * 200)))
+
+# default-weight, water-gated growth recomputed from the signals jsonb
+GROWTH_DEFAULT_EXPR = """
+round(( 50*(signals->>'developable_land')::numeric + 60*(signals->>'permit_velocity')::numeric
+      + 55*(signals->>'zoning_activity')::numeric  + 60*(signals->>'infra_transport')::numeric
+      + 60*(signals->>'infra_water')::numeric      + 60*(signals->>'migration')::numeric
+      + 50*(signals->>'schools')::numeric ) / 395.0
+    * CASE water_status WHEN 'assured' THEN 1.0 WHEN 'alternative_pending' THEN 0.7 ELSE 0.3 END, 2)
+"""
+RESCORE_SQL = """
+UPDATE parcels p SET growth_score = z.growth_default,
+  target_score = round(0.5*coalesce(z.growth_default,0)
+    + 0.3*greatest(0,least(100,(coalesce(p.tenure,0)-2)*4.2))
+          * CASE p.owner_type WHEN 'Builder/Developer' THEN 0.35 WHEN 'Investor' THEN 0.8 ELSE 1.0 END
+    + 0.2*CASE p.use WHEN 'Vacant' THEN 100 WHEN 'Agricultural' THEN 85 ELSE 25 END, 1)
+FROM zones z WHERE p.zcta = z.zcta;
+"""
+
+def run_signals(kind="migration"):
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": kind, "detail": "fetching Census population"}
+    try:
+        with pool.connection() as c:
+            zctas = [r[0] for r in c.execute("SELECT zcta FROM zones").fetchall()]
+        new, old = _census_pop(CENSUS_YEARS[1]), _census_pop(CENSUS_YEARS[0])
+        SIGNAL_STATUS["detail"] = "updating zones"
+        updated = 0
+        with pool.connection() as c:
+            with c.cursor() as cur:
+                for z in zctas:
+                    pn, po = new.get(z), old.get(z)
+                    if not pn or not po:
+                        continue
+                    sig = _migration_signal((pn - po) / po)
+                    cur.execute("UPDATE zones SET signals = jsonb_set(signals,'{migration}', to_jsonb(%s::int)) WHERE zcta=%s", (sig, z))
+                    updated += 1
+                cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
+                cur.execute(RESCORE_SQL)
+            c.commit()
+        SIGNAL_STATUS = {"state": "done", "kind": kind, "zones_updated": updated}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "detail": str(e)[:200]}
+
+@app.get("/admin/signals")
+def admin_signals(token: str, kind: str = "migration"):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_signals, args=(kind,), daemon=True).start()
+    return {"state": "started", "kind": kind, "next": "poll /admin/signals_status?token=YOUR_TOKEN"}
+
+@app.get("/admin/signals_status")
+def admin_signals_status(token: str):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    return SIGNAL_STATUS
+
 # Serve the MapLibre frontend (single file, same origin as the API).
 _here = pathlib.Path(__file__).resolve().parent
 @app.get("/")

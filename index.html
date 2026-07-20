@@ -150,6 +150,11 @@ const ASM={base:.035,opt:1.0,hurdle:.07,sell:.08,carry:.007}, SP=.07, JUMP=.5;
 function growthOf(sig){ if(!sig) return 0; let n=0,d=0; for(const k of SIGS){n+=weights[k]*sig[k];d+=weights[k];}
   let g=n/d; if(gateOn) g*=GATE[sig.water_status]; return g; }
 
+// target score = the value the MAP colors parcels by (acquisition attractiveness)
+function tenureScoreJS(t,ot){let b=Math.max(0,Math.min(100,((t||0)-2)*4.2));let f=ot==="Builder/Developer"?0.35:(ot==="Investor"?0.8:1.0);return b*f;}
+function useScoreJS(u){return u==="Vacant"?100:(u==="Agricultural"?85:25);}
+function targetOf(p){return 0.5*growthOf(p.zone_signals)+0.3*tenureScoreJS(p.tenure,p.owner_type)+0.2*useScoreJS(p.use);}
+
 function forecast(p){
   const V0=p.status==="For sale"?p.list_price:p.est, g=growthOf(p.zone_signals)/100, r=ASM.base+SP*g;
   const pU=t=>Math.max(0,Math.min(.95,g*ASM.opt*Math.pow(t/20,1.3)));
@@ -274,11 +279,14 @@ function updateForecastUI(){
         :holdPV<sell*0.95?["SELL","var(--bad)","trails your hurdle after costs"]
         :["MARGINAL","var(--warn)","within ~5%, hinges on the water path"];
   document.getElementById("hzlabel").textContent=H+"-yr exit";
+  const target=targetOf(p);
   document.getElementById("badges").innerHTML=
-      `<span class="pill" style="background:${ramp(g)}">Growth ${Math.round(g)}</span>`
+      `<span class="pill" style="background:${ramp(target)}" title="how the map colors this parcel">Target ${Math.round(target)}</span>`
+      +`<span class="pill" style="background:${ramp(g)}">Growth ${Math.round(g)}</span>`
       +(ws?`<span class="pill" style="background:${GC[ws]}">${GL[ws]}</span>`:"")
       +(p.status==="For sale"?`<span class="pill" style="background:var(--teal)">For sale ${money(p.list_price)}</span>`:`<span class="pill" style="background:#8b8579">Off-market</span>`);
   document.getElementById("readblock").innerHTML=`
+    <div class="sub" style="margin:-2px 0 6px">A separate question from the target score above: whether the projected return beats your hurdle at today's value.</div>
     <div class="readline" style="color:${dCol}">${dLbl}</div>
     <div class="sub">Projected <b>${pct(projC)}/yr</b> vs your ${pct(ASM.hurdle)} hurdle</div>
     <div class="gauge"><div class="gaugebar"><span class="mk" style="left:${mk}%"></span></div>
