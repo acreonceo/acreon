@@ -3,7 +3,7 @@ Terra API. Serves the map (vector tiles) and the analytics (search, detail, targ
 straight from PostGIS. Every SQL statement here was validated against a live
 PostGIS instance before shipping.
 """
-import os, json, pathlib
+import os, json, pathlib, requests
 from fastapi import FastAPI, Response, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -173,6 +173,53 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
       ORDER BY target_score DESC
       LIMIT %s
     """, tuple(params))
+
+# --- REAL DATA: discovery probe -------------------------------------------
+# Hit this once (with your ADMIN_TOKEN) to confirm the server can reach the
+# county and to learn the real parcel field names before we wire the full pull.
+# It writes nothing to the database.
+COUNTY_PARCELS = ("https://gis.mcassessor.maricopa.gov/arcgis/rest/services/"
+                  "MaricopaDynamicQueryService/MapServer/3/query")
+
+def _zip_bbox(zcta):
+    zs = json.load(open(_here / "scored_zctas.json"))["features"]
+    f = next((x for x in zs if x["zcta"] == zcta), None)
+    if not f:
+        return None
+    xs, ys = [], []
+    def walk(c):
+        if c and isinstance(c[0], (int, float)) and len(c) == 2:
+            xs.append(c[0]); ys.append(c[1]); return
+        for x in c:
+            walk(x)
+    walk(f["geometry"]["coordinates"])
+    return (min(xs), min(ys), max(xs), max(ys))
+
+@app.get("/admin/probe")
+def admin_probe(token: str, zip: str = "85326"):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    bb = _zip_bbox(zip)
+    if not bb:
+        raise HTTPException(400, f"zip {zip} is not in the bundled zones")
+    params = {"where": "1=1",
+              "geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
+              "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+              "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
+              "returnGeometry": "false", "resultRecordCount": "3", "f": "json"}
+    try:
+        r = requests.get(COUNTY_PARCELS, params=params, timeout=25,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; acreon/1.0)"})
+        j = r.json()
+    except Exception as e:
+        return {"ok": False, "reached_county": False, "error": str(e)}
+    feats = j.get("features", [])
+    fields = ([f_["name"] for f_ in j["fields"]] if "fields" in j
+              else (list(feats[0]["attributes"].keys()) if feats else []))
+    return {"ok": True, "reached_county": True, "zip": zip, "bbox": bb,
+            "returned": len(feats), "field_names": fields,
+            "sample": feats[0]["attributes"] if feats else None,
+            "server_error": j.get("error")}
 
 # Serve the MapLibre frontend (single file, same origin as the API).
 _here = pathlib.Path(__file__).resolve().parent
