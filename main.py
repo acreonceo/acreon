@@ -440,27 +440,54 @@ UPDATE parcels p SET growth_score = z.growth_default,
 FROM zones z WHERE p.zcta = z.zcta;
 """
 
+# developable_land = share of a zone's area that is vacant/agricultural land,
+# computed straight from the parcels already loaded (only touches zones we have
+# parcels for; others keep their prior value).
+DEVELOPABLE_SQL = """
+WITH za AS (SELECT zcta, ST_Area(geom::geography)/4046.8564224 AS area_ac FROM zones),
+     dv AS (SELECT zcta, sum(acres) AS dev_ac FROM parcels
+            WHERE use IN ('Vacant','Agricultural') AND acres IS NOT NULL GROUP BY zcta)
+UPDATE zones z
+SET signals = jsonb_set(z.signals, '{developable_land}',
+      to_jsonb( LEAST(100, GREATEST(0, round((dv.dev_ac / NULLIF(za.area_ac,0))*100)))::int ))
+FROM za JOIN dv ON dv.zcta = za.zcta
+WHERE z.zcta = za.zcta;
+"""
+
 def run_signals(kind="migration"):
     global SIGNAL_STATUS
-    SIGNAL_STATUS = {"state": "running", "kind": kind, "detail": "fetching Census population"}
+    SIGNAL_STATUS = {"state": "running", "kind": kind, "detail": "starting"}
     try:
-        with pool.connection() as c:
-            zctas = [r[0] for r in c.execute("SELECT zcta FROM zones").fetchall()]
-        new, old = _census_pop(CENSUS_YEARS[1]), _census_pop(CENSUS_YEARS[0])
-        SIGNAL_STATUS["detail"] = "updating zones"
         updated = 0
-        with pool.connection() as c:
-            with c.cursor() as cur:
-                for z in zctas:
-                    pn, po = new.get(z), old.get(z)
-                    if not pn or not po:
-                        continue
-                    sig = _migration_signal((pn - po) / po)
-                    cur.execute("UPDATE zones SET signals = jsonb_set(signals,'{migration}', to_jsonb(%s::int)) WHERE zcta=%s", (sig, z))
-                    updated += 1
-                cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
-                cur.execute(RESCORE_SQL)
-            c.commit()
+        if kind == "migration":
+            SIGNAL_STATUS["detail"] = "fetching Census population"
+            with pool.connection() as c:
+                zctas = [r[0] for r in c.execute("SELECT zcta FROM zones").fetchall()]
+            new, old = _census_pop(CENSUS_YEARS[1]), _census_pop(CENSUS_YEARS[0])
+            SIGNAL_STATUS["detail"] = "updating zones"
+            with pool.connection() as c:
+                with c.cursor() as cur:
+                    for z in zctas:
+                        pn, po = new.get(z), old.get(z)
+                        if not pn or not po:
+                            continue
+                        sig = _migration_signal((pn - po) / po)
+                        cur.execute("UPDATE zones SET signals = jsonb_set(signals,'{migration}', to_jsonb(%s::int)) WHERE zcta=%s", (sig, z))
+                        updated += 1
+                    cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
+                    cur.execute(RESCORE_SQL)
+                c.commit()
+        elif kind == "developable":
+            SIGNAL_STATUS["detail"] = "computing from loaded parcels"
+            with pool.connection() as c:
+                with c.cursor() as cur:
+                    cur.execute(DEVELOPABLE_SQL)
+                    updated = cur.rowcount
+                    cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
+                    cur.execute(RESCORE_SQL)
+                c.commit()
+        else:
+            SIGNAL_STATUS = {"state": "error", "detail": f"unknown kind: {kind}"}; return
         SIGNAL_STATUS = {"state": "done", "kind": kind, "zones_updated": updated}
     except Exception as e:
         SIGNAL_STATUS = {"state": "error", "detail": str(e)[:200]}
