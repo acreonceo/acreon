@@ -106,7 +106,9 @@ def healthz():
 TILE_SQL = """
 WITH b AS (SELECT ST_TileEnvelope(%(z)s,%(x)s,%(y)s) g)
 SELECT ST_AsMVT(t,'parcels') FROM (
-  SELECT p.apn, p.use, p.status, p.acres, p.target_score, p.growth_score,
+  SELECT p.apn, p.use, p.status, p.acres,
+         round(p.target_score)::int AS target_score,
+         round(p.growth_score)::int AS growth_score,
          ST_AsMVTGeom(ST_Transform(p.geom,3857), b.g) geom
   FROM parcels p, b
   WHERE ST_Transform(p.geom,3857) && b.g
