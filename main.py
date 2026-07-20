@@ -401,10 +401,14 @@ SIGNAL_STATUS = {"state": "idle"}
 CENSUS_YEARS = (2018, 2023)
 
 def _census_pop(year):
-    r = requests.get(f"https://api.census.gov/data/{year}/acs/acs5",
-                     params={"get": "B01003_001E", "for": "zip code tabulation area:*"},
-                     timeout=120, headers={"User-Agent": UA})
-    rows = r.json()
+    import urllib.parse
+    q = "get=B01003_001E&for=" + urllib.parse.quote("zip code tabulation area:*", safe=":*")
+    url = f"https://api.census.gov/data/{year}/acs/acs5?{q}"
+    r = requests.get(url, timeout=120, headers={"User-Agent": UA})
+    try:
+        rows = r.json()
+    except Exception:
+        raise RuntimeError(f"census {year} status {r.status_code}: {r.text[:150]}")
     hdr = rows[0]; iz = hdr.index("zip code tabulation area"); ip = hdr.index("B01003_001E")
     out = {}
     for row in rows[1:]:
