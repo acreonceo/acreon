@@ -402,7 +402,11 @@ CENSUS_YEARS = (2018, 2023)
 
 def _census_pop(year):
     import urllib.parse
-    q = "get=B01003_001E&for=" + urllib.parse.quote("zip code tabulation area:*", safe=":*")
+    key = os.environ.get("CENSUS_KEY", "").strip()
+    if not key:
+        raise RuntimeError("CENSUS_KEY not set. Get a free key at "
+                           "api.census.gov/data/key_signup.html and add it in Render.")
+    q = "get=B01003_001E&for=" + urllib.parse.quote("zip code tabulation area:*", safe=":*") + "&key=" + key
     url = f"https://api.census.gov/data/{year}/acs/acs5?{q}"
     r = requests.get(url, timeout=120, headers={"User-Agent": UA})
     try:
