@@ -221,6 +221,167 @@ def admin_probe(token: str, zip: str = "85326"):
             "sample": feats[0]["attributes"] if feats else None,
             "server_error": j.get("error")}
 
+# --- REAL DATA: pilot ingest ----------------------------------------------
+# Pulls vacant/agricultural parcels for one ZIP from the county service, maps the
+# real fields (PUC, sale, value, owner), and replaces the demo data with real
+# parcels. Runs in a background thread; poll /admin/status. Free-tier friendly:
+# capped, one ZIP at a time.
+import threading
+UA = "Mozilla/5.0 (compatible; acreon/1.0)"
+INGEST_STATUS = {"state": "idle"}
+COUNTY_WHERE = "LC_CUR LIKE '2%' OR PUC LIKE '00%'"   # vacant + agricultural land
+
+def _num(s):
+    if s is None: return None
+    t = str(s).replace(",", "").strip()
+    if not t: return None
+    try: return int(float(t))
+    except Exception: return None
+
+def _sale_year(s):
+    s = (s or "").strip()
+    for sep in ("/", "-"):
+        if sep in s:
+            p = s.split(sep)
+            if len(p) == 3 and len(p[-1]) == 4 and p[-1].isdigit():
+                return int(p[-1])
+    return None
+
+def _classify_use(a, acres):
+    puc = (a.get("PUC") or "").strip()
+    living = a.get("LIVING_SPACE")
+    const = (a.get("CONST_YEAR") or "").strip()
+    has_structure = (isinstance(living, (int, float)) and living and living > 0) or (len(const) == 4 and const.isdigit())
+    if has_structure: return "Improved"
+    if puc.startswith("00"): return "Vacant"
+    if acres and acres >= 10: return "Agricultural"
+    return "Vacant"
+
+_ANCH = [("Buckeye",-112.58,33.37),("Goodyear",-112.36,33.44),("Avondale",-112.32,33.43),
+         ("Surprise",-112.37,33.63),("Waddell",-112.45,33.6),("Tonopah",-112.94,33.5),
+         ("Wickenburg",-112.73,33.97),("Peoria",-112.24,33.71),("Phoenix",-112.07,33.45),
+         ("Queen Creek",-111.63,33.25),("Mesa",-111.83,33.42)]
+def _city(lon, lat):
+    import math
+    return min(_ANCH, key=lambda a: math.hypot(lon-a[1], lat-a[2]))[0]
+
+def _transform_feature(ft):
+    import transform as T
+    a = ft.get("properties") or ft.get("attributes") or {}
+    geom = ft.get("geometry")
+    if not geom: return None
+    apn = (a.get("APN_DASH") or a.get("APN") or "").strip()
+    if not apn: return None
+    ls = a.get("LAND_SIZE")
+    acres = round(ls/43560.0, 3) if isinstance(ls, (int, float)) and ls > 0 else None
+    owner = (a.get("OWNER_NAME") or "").strip()
+    owner_type, absentee = T.classify_owner_type(owner, a.get("MAIL_STATE"))
+    use = _classify_use(a, acres)
+    price = _num(a.get("SALE_PRICE"))
+    est = _num(a.get("FCV_CUR")) or price or 1000
+    assessed = _num(a.get("LPV_CUR")) or int(est*0.8)
+    yr = _sale_year(a.get("SALE_DATE"))
+    if price and price > 0 and yr:
+        paid, acquired, tenure = price, yr, max(0, T.CUR_YEAR - yr)
+    else:
+        paid = acquired = tenure = None
+    lon, lat = a.get("LONGITUDE"), a.get("LATITUDE")
+    city = (a.get("PHYSICAL_CITY") or "").strip() or (_city(lon, lat) if lon and lat else "")
+    addr = (a.get("PHYSICAL_ADDRESS") or "").strip()
+    if not addr:
+        sub, lot = (a.get("SUBNAME") or "").strip(), (a.get("LOT_NUM") or "").strip()
+        addr = f"{sub} Lot {lot}".strip() if sub else f"Parcel {apn}"
+    return (apn, json.dumps(geom), addr, city, use, acres, int(est), int(assessed),
+            owner, owner_type, absentee, acquired, tenure, paid, "Off-market", None)
+
+STAGE_DDL = """
+DROP TABLE IF EXISTS parcels_stage;
+CREATE TEMP TABLE parcels_stage (
+  apn text, geom_geojson text, situs_address text, city text, use text, acres numeric,
+  est bigint, assessed bigint, owner text, owner_type text, absentee boolean,
+  acquired int, tenure int, paid bigint, status text, list_price bigint);
+"""
+STAGE_UPSERT = """
+INSERT INTO parcels AS p (apn, geom, zcta, situs_address, city, use, acres, est, assessed,
+  owner, owner_type, absentee, acquired, tenure, paid, status, list_price, growth_score, target_score, updated_at)
+SELECT s.apn, ST_SetSRID(ST_GeomFromGeoJSON(s.geom_geojson),4326), z.zcta, s.situs_address, s.city, s.use,
+  s.acres, s.est, s.assessed, s.owner, s.owner_type, s.absentee, s.acquired, s.tenure, s.paid, s.status, s.list_price,
+  z.growth_default,
+  round(0.5*coalesce(z.growth_default,0)
+      + 0.3*greatest(0,least(100,(coalesce(s.tenure,0)-2)*4.2))
+            * CASE s.owner_type WHEN 'Builder/Developer' THEN 0.35 WHEN 'Investor' THEN 0.8 ELSE 1.0 END
+      + 0.2*CASE s.use WHEN 'Vacant' THEN 100 WHEN 'Agricultural' THEN 85 ELSE 25 END, 1),
+  now()
+FROM parcels_stage s
+LEFT JOIN LATERAL (SELECT zcta, growth_default FROM zones z
+  WHERE ST_Contains(z.geom, ST_PointOnSurface(ST_SetSRID(ST_GeomFromGeoJSON(s.geom_geojson),4326))) LIMIT 1) z ON true
+WHERE s.geom_geojson IS NOT NULL
+ON CONFLICT (apn) DO UPDATE SET
+  geom=EXCLUDED.geom, zcta=EXCLUDED.zcta, situs_address=EXCLUDED.situs_address, city=EXCLUDED.city,
+  use=EXCLUDED.use, acres=EXCLUDED.acres, est=EXCLUDED.est, assessed=EXCLUDED.assessed, owner=EXCLUDED.owner,
+  owner_type=EXCLUDED.owner_type, absentee=EXCLUDED.absentee, acquired=EXCLUDED.acquired, tenure=EXCLUDED.tenure,
+  paid=EXCLUDED.paid, status=EXCLUDED.status, list_price=EXCLUDED.list_price, growth_score=EXCLUDED.growth_score,
+  target_score=EXCLUDED.target_score, updated_at=now();
+"""
+
+def run_ingest(zcta, cap=6000):
+    global INGEST_STATUS
+    INGEST_STATUS = {"state": "running", "zip": zcta, "fetched": 0, "detail": "starting"}
+    bb = _zip_bbox(zcta)
+    if not bb:
+        INGEST_STATUS = {"state": "error", "detail": f"zip {zcta} not in zones"}; return
+    feats, offset = [], 0
+    try:
+        while len(feats) < cap:
+            params = {"where": COUNTY_WHERE,
+                      "geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
+                      "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                      "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
+                      "returnGeometry": "true", "outSR": "4326", "f": "geojson",
+                      "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": 1000}
+            r = requests.get(COUNTY_PARCELS, params=params, timeout=90, headers={"User-Agent": UA})
+            batch = r.json().get("features", [])
+            if not batch: break
+            feats.extend(batch); offset += len(batch)
+            INGEST_STATUS.update(fetched=len(feats), detail="fetching")
+            if len(batch) < 1000: break
+    except Exception as e:
+        INGEST_STATUS = {"state": "error", "detail": f"fetch failed: {e}", "fetched": len(feats)}; return
+    if not feats:
+        INGEST_STATUS = {"state": "error", "detail": "county returned 0 parcels; check zip/filter"}; return
+    rows = [r for r in (_transform_feature(f) for f in feats) if r]
+    if not rows:
+        INGEST_STATUS = {"state": "error", "detail": "no usable rows after transform", "fetched": len(feats)}; return
+    INGEST_STATUS.update(detail=f"loading {len(rows)} parcels", transformed=len(rows))
+    try:
+        with pool.connection() as c:
+            with c.cursor() as cur:
+                cur.execute(STAGE_DDL)
+                with cur.copy("COPY parcels_stage (apn,geom_geojson,situs_address,city,use,acres,est,assessed,owner,owner_type,absentee,acquired,tenure,paid,status,list_price) FROM STDIN") as cp:
+                    for row in rows: cp.write_row(row)
+                cur.execute("DELETE FROM parcels;")     # swap demo data for real
+                cur.execute(STAGE_UPSERT)
+            c.commit()
+            n = c.execute("SELECT count(*) FROM parcels").fetchone()[0]
+        INGEST_STATUS = {"state": "done", "zip": zcta, "fetched": len(feats), "loaded": n}
+    except Exception as e:
+        INGEST_STATUS = {"state": "error", "detail": f"load failed: {e}", "fetched": len(feats)}
+
+@app.get("/admin/ingest")
+def admin_ingest(token: str, zip: str = "85326", cap: int = 6000):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if INGEST_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": INGEST_STATUS}
+    threading.Thread(target=run_ingest, args=(zip, cap), daemon=True).start()
+    return {"state": "started", "zip": zip, "cap": cap, "next": "poll /admin/status?token=YOUR_TOKEN"}
+
+@app.get("/admin/status")
+def admin_status(token: str):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    return INGEST_STATUS
+
 # Serve the MapLibre frontend (single file, same origin as the API).
 _here = pathlib.Path(__file__).resolve().parent
 @app.get("/")
