@@ -454,6 +454,46 @@ FROM za JOIN dv ON dv.zcta = za.zcta
 WHERE z.zcta = za.zcta;
 """
 
+# Water gate from real ADWR data: fraction of each zone covered by issued
+# Assured/Adequate Water Supply determinations -> water_status.
+AAWS_URL = "https://services.arcgis.com/C34zQ7veRS0V1t04/ArcGIS/rest/services/AAWS_Issued_Determination_2024/FeatureServer/0/query"
+WATER_OVERLAY_SQL = """
+WITH cov AS (
+  SELECT z.zcta,
+    COALESCE(SUM(ST_Area(ST_Intersection(z.geom, a.geom))),0) / NULLIF(ST_Area(z.geom),0) AS frac
+  FROM zones z LEFT JOIN aaws a ON ST_Intersects(z.geom, a.geom)
+  GROUP BY z.zcta, z.geom)
+UPDATE zones z SET water_status = CASE
+  WHEN c.frac > 0.30 THEN 'assured'
+  WHEN c.frac > 0.05 THEN 'alternative_pending'
+  ELSE 'groundwater_constrained' END
+FROM cov c WHERE z.zcta = c.zcta;
+"""
+
+def _fetch_aaws(bbox, cap=15000):
+    geoms, offset = [], 0
+    while len(geoms) < cap:
+        params = {"where": "1=1", "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+                  "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
+                  "spatialRel": "esriSpatialRelIntersects", "outFields": "OBJECTID",
+                  "returnGeometry": "true", "f": "geojson", "orderByFields": "OBJECTID",
+                  "resultOffset": offset, "resultRecordCount": 2000}
+        r = requests.get(AAWS_URL, params=params, timeout=120, headers={"User-Agent": UA})
+        try:
+            batch = r.json().get("features", [])
+        except Exception:
+            raise RuntimeError(f"ADWR status {r.status_code}: {r.text[:150]}")
+        if not batch:
+            break
+        for f in batch:
+            g = f.get("geometry")
+            if g:
+                geoms.append(json.dumps(g))
+        offset += len(batch)
+        if len(batch) < 2000:
+            break
+    return geoms
+
 def run_signals(kind="migration"):
     global SIGNAL_STATUS
     SIGNAL_STATUS = {"state": "running", "kind": kind, "detail": "starting"}
@@ -482,6 +522,24 @@ def run_signals(kind="migration"):
             with pool.connection() as c:
                 with c.cursor() as cur:
                     cur.execute(DEVELOPABLE_SQL)
+                    updated = cur.rowcount
+                    cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
+                    cur.execute(RESCORE_SQL)
+                c.commit()
+        elif kind == "water":
+            SIGNAL_STATUS["detail"] = "fetching ADWR determinations"
+            with pool.connection() as c:
+                bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+            geoms = _fetch_aaws(bb)
+            if not geoms:
+                SIGNAL_STATUS = {"state": "error", "detail": "ADWR returned 0 determination polygons"}; return
+            SIGNAL_STATUS["detail"] = f"overlaying {len(geoms)} determination areas"
+            with pool.connection() as c:
+                with c.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS aaws; CREATE TEMP TABLE aaws(geom geometry(Geometry,4326));")
+                    cur.executemany("INSERT INTO aaws(geom) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))", [(g,) for g in geoms])
+                    cur.execute("CREATE INDEX ON aaws USING gist(geom); ANALYZE aaws;")
+                    cur.execute(WATER_OVERLAY_SQL)
                     updated = cur.rowcount
                     cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
                     cur.execute(RESCORE_SQL)
