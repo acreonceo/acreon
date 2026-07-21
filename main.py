@@ -634,6 +634,42 @@ def _fetch_aaws(bbox, cap=15000):
             break
     return geoms
 
+# sales velocity: share of a zone's parcels that changed hands in the last 5 years.
+# A real market-heat proxy standing in for permit + rezoning activity.
+VELOCITY_SQL = """
+WITH sv AS (
+  SELECT zcta, count(*) FILTER (WHERE acquired >= %s)::numeric / NULLIF(count(*),0) AS share
+  FROM parcels WHERE zcta IS NOT NULL GROUP BY zcta)
+UPDATE zones z SET signals = jsonb_set(jsonb_set(z.signals,
+    '{permit_velocity}', to_jsonb(LEAST(100,GREATEST(0,round(sv.share*300)))::int)),
+    '{zoning_activity}', to_jsonb(LEAST(100,GREATEST(0,round(sv.share*300)))::int))
+FROM sv WHERE z.zcta = sv.zcta;
+"""
+
+# transport: count of ADOT programmed projects within ~2km of each zone.
+ADOT_PROJECTS_URL = "https://gis.azdot.gov/gis/rest/services/ProjectCoversheet/projects/MapServer/0/query"
+TRANSPORT_OVERLAY_SQL = """
+WITH nc AS (
+  SELECT z.zcta, count(t.*) AS n
+  FROM zones z LEFT JOIN tip t ON ST_DWithin(z.geom, t.geom, 0.02)
+  GROUP BY z.zcta)
+UPDATE zones z SET signals = jsonb_set(z.signals, '{infra_transport}',
+    to_jsonb(LEAST(100, GREATEST(0, 20 + nc.n*22))::int))
+FROM nc WHERE z.zcta = nc.zcta;
+"""
+
+def _fetch_projects(bbox):
+    params = {"where": "1=1", "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+              "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
+              "spatialRel": "esriSpatialRelIntersects", "outFields": "OBJECTID",
+              "returnGeometry": "true", "f": "geojson", "resultRecordCount": 2000}
+    r = requests.get(ADOT_PROJECTS_URL, params=params, timeout=120, headers={"User-Agent": UA})
+    try:
+        feats = r.json().get("features", [])
+    except Exception:
+        raise RuntimeError(f"ADOT status {r.status_code}: {r.text[:150]}")
+    return [json.dumps(f["geometry"]) for f in feats if f.get("geometry")]
+
 def run_signals(kind="migration"):
     global SIGNAL_STATUS
     SIGNAL_STATUS = {"state": "running", "kind": kind, "detail": "starting"}
@@ -680,6 +716,34 @@ def run_signals(kind="migration"):
                     cur.executemany("INSERT INTO aaws(geom) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))", [(g,) for g in geoms])
                     cur.execute("CREATE INDEX ON aaws USING gist(geom); ANALYZE aaws;")
                     cur.execute(WATER_OVERLAY_SQL)
+                    updated = cur.rowcount
+                    cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
+                    cur.execute(RESCORE_SQL)
+                c.commit()
+        elif kind == "velocity":
+            import transform as T
+            SIGNAL_STATUS["detail"] = "computing sales velocity from parcels"
+            with pool.connection() as c:
+                with c.cursor() as cur:
+                    cur.execute(VELOCITY_SQL, (T.CUR_YEAR - 5,))
+                    updated = cur.rowcount
+                    cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
+                    cur.execute(RESCORE_SQL)
+                c.commit()
+        elif kind == "transport":
+            SIGNAL_STATUS["detail"] = "fetching ADOT projects"
+            with pool.connection() as c:
+                bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+            geoms = _fetch_projects(bb)
+            if not geoms:
+                SIGNAL_STATUS = {"state": "error", "detail": "ADOT returned 0 projects"}; return
+            SIGNAL_STATUS["detail"] = f"overlaying {len(geoms)} projects"
+            with pool.connection() as c:
+                with c.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS tip; CREATE TEMP TABLE tip(geom geometry(Geometry,4326));")
+                    cur.executemany("INSERT INTO tip(geom) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))", [(g,) for g in geoms])
+                    cur.execute("CREATE INDEX ON tip USING gist(geom); ANALYZE tip;")
+                    cur.execute(TRANSPORT_OVERLAY_SQL)
                     updated = cur.rowcount
                     cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
                     cur.execute(RESCORE_SQL)
