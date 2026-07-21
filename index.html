@@ -75,6 +75,8 @@
   .legend .bar{width:150px;height:10px;border-radius:3px;background:linear-gradient(90deg,#d73027,#fc8d59,#fee08b,#a6d96a,#1a9850)}
   .legend .row{display:flex;align-items:center;gap:8px}.legend .lbls{display:flex;justify-content:space-between;margin-top:2px;color:var(--ink-soft)}
   .tip{position:absolute;pointer-events:none;background:#1b1915;color:#f6f3ec;border-radius:7px;padding:6px 9px;font-size:11.5px;opacity:0;transition:opacity .1s;z-index:9;max-width:220px}
+  .htip{position:fixed;pointer-events:none;background:#1b1915;color:#f6f3ec;border-radius:8px;padding:9px 12px;font-size:11.5px;line-height:1.5;opacity:0;transition:opacity .1s;z-index:99;max-width:270px;white-space:pre-line;box-shadow:0 14px 34px -14px rgba(0,0,0,.55)}
+  [data-tip]{cursor:help}
   .tip b{font-size:12.5px}
 </style>
 
@@ -114,7 +116,7 @@
     </div>
   </aside>
 
-  <div id="map"><div class="tip" id="tip"></div>
+  <div id="map"><div class="tip" id="tip"></div><div class="htip" id="htip"></div>
     <div class="legend">
       <div style="font-weight:700;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:4px">Growth outlook</div>
       <div class="row"><span>Lower</span><div class="bar"></div><span>Higher</span></div>
@@ -154,6 +156,10 @@ function growthOf(sig){ if(!sig) return 0; let n=0,d=0; for(const k of SIGS){n+=
 function tenureScoreJS(t,ot){let b=Math.max(0,Math.min(100,((t||0)-2)*4.2));let f=ot==="Builder/Developer"?0.35:(ot==="Investor"?0.8:1.0);return b*f;}
 function useScoreJS(u){return u==="Vacant"?100:(u==="Agricultural"?85:25);}
 function targetOf(p){return 0.5*growthOf(p.zone_signals)+0.3*tenureScoreJS(p.tenure,p.owner_type)+0.2*useScoreJS(p.use);}
+const escAttr=s=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+// zone shading is bold when zoomed out (macro corridor pattern) and fades to
+// outlines as parcels become legible, so the two color layers never fight.
+const zoneOpacityExpr=(m)=>["interpolate",["linear"],["zoom"],8,m,11.5,m*0.55,13,0.06,14.5,0];
 
 function forecast(p){
   const V0=p.status==="For sale"?p.list_price:p.est, g=growthOf(p.zone_signals)/100, r=ASM.base+SP*g;
@@ -180,7 +186,7 @@ map.on("load",()=>{
     map.addSource("zones",{type:"geojson",data:gj});
     const below = map.getLayer("parcels-fill") ? "parcels-fill" : undefined;
     map.addLayer({id:"zones-fill",type:"fill",source:"zones",
-      paint:{"fill-color":["get","c"],"fill-opacity":0.55}}, below);
+      paint:{"fill-color":["get","c"],"fill-opacity":zoneOpacityExpr(0.55)}}, below);
     map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#ffffff","line-width":0.6,"line-opacity":.7}}, below);
     map.on("mousemove","zones-fill",e=>{const p=e.features[0].properties;showTip(e,`<b>${p.zcta}</b><br>growth ${Math.round(p.g)} &middot; ${GL[p.water_status]}`);});
     map.on("mouseleave","zones-fill",hideTip);
@@ -204,6 +210,12 @@ map.on("load",()=>{
     map.on("click",L,openFromFeat);
     map.on("mouseenter",L,()=>map.getCanvas().style.cursor="pointer");
     map.on("mouseleave",L,()=>map.getCanvas().style.cursor="");
+  });
+  // hovering a parcel previews it before you click
+  ["parcels-fill","parcels-pt"].forEach(L=>{
+    map.on("mousemove",L,e=>{const p=e.features[0].properties;
+      showTip(e,`<b>${p.apn}</b><br>${p.use} &middot; ${p.acres?(+p.acres).toLocaleString()+" ac":"acreage n/a"}<br>target ${p.target_score??"?"} &middot; growth ${p.growth_score??"?"}`);});
+    map.on("mouseleave",L,hideTip);
   });
 });
 
@@ -279,12 +291,16 @@ function updateForecastUI(){
         :holdPV<sell*0.95?["SELL","var(--bad)","trails your hurdle after costs"]
         :["MARGINAL","var(--warn)","within ~5%, hinges on the water path"];
   document.getElementById("hzlabel").textContent=H+"-yr exit";
-  const target=targetOf(p);
+  const target=targetOf(p), gv=Math.round(g), wl=ws?GL[ws]:"n/a";
+  const tTarget=`Target score ${Math.round(target)} / 100 — how attractive this parcel is to pursue off-market, and the value the map colors by.\nFormula: 50% corridor growth + 30% owner tenure + 20% land type (vacant and ag score highest).`;
+  const tGrowth=`Corridor growth ${gv} / 100 for ZIP ${p.zcta}.\nWeighted blend of in-migration, developable land, permits, transport and schools, then multiplied by the water gate (now: ${wl}).`;
+  const tWater=`Water status from ADWR issued determinations.\nAssured: 100-year supply proven, full growth. Alternative pending: partial, growth ×0.7. Groundwater constrained: limited under current rules, growth ×0.3.`;
+  const tMkt=p.status==="For sale"?`Currently listed for sale at ${money(p.list_price)}.`:`No active MLS listing. Off-market parcels are the core acquisition opportunity, an owner you can approach directly.`;
   document.getElementById("badges").innerHTML=
-      `<span class="pill" style="background:${ramp(target)}" title="how the map colors this parcel">Target ${Math.round(target)}</span>`
-      +`<span class="pill" style="background:${ramp(g)}">Growth ${Math.round(g)}</span>`
-      +(ws?`<span class="pill" style="background:${GC[ws]}">${GL[ws]}</span>`:"")
-      +(p.status==="For sale"?`<span class="pill" style="background:var(--teal)">For sale ${money(p.list_price)}</span>`:`<span class="pill" style="background:#8b8579">Off-market</span>`);
+      `<span class="pill" style="background:${ramp(target)}" data-tip="${escAttr(tTarget)}">Target ${Math.round(target)}</span>`
+      +`<span class="pill" style="background:${ramp(g)}" data-tip="${escAttr(tGrowth)}">Growth ${gv}</span>`
+      +(ws?`<span class="pill" style="background:${GC[ws]}" data-tip="${escAttr(tWater)}">${GL[ws]}</span>`:"")
+      +(p.status==="For sale"?`<span class="pill" style="background:var(--teal)" data-tip="${escAttr(tMkt)}">For sale ${money(p.list_price)}</span>`:`<span class="pill" style="background:#8b8579" data-tip="${escAttr(tMkt)}">Off-market</span>`);
   document.getElementById("readblock").innerHTML=`
     <div class="sub" style="margin:-2px 0 6px">A separate question from the target score above: whether the projected return beats your hurdle at today's value.</div>
     <div class="readline" style="color:${dCol}">${dLbl}</div>
@@ -367,7 +383,7 @@ function buildWeights(){
     document.querySelectorAll("#hzSeg button").forEach(x=>x.setAttribute("aria-pressed",x===b));
     SIGS.forEach(k=>{document.getElementById("w_"+k).value=weights[k];document.getElementById("wv_"+k).textContent=weights[k];});afterWeights();}));
   document.getElementById("gate").addEventListener("change",e=>{gateOn=e.target.checked;afterWeights();});
-  document.getElementById("heatOp").addEventListener("input",e=>{if(map.getLayer("zones-fill"))map.setPaintProperty("zones-fill","fill-opacity",+e.target.value/100);});
+  document.getElementById("heatOp").addEventListener("input",e=>{if(map.getLayer("zones-fill"))map.setPaintProperty("zones-fill","fill-opacity",zoneOpacityExpr(+e.target.value/100));});
 }
 function afterWeights(){ recolorZones(); if(selApn) refreshDetail(); }
 
@@ -385,4 +401,10 @@ document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",
 document.getElementById("assumeBox").innerHTML='<h3 style="margin:4px 0 6px">Assumptions</h3><div id="asld"></div>';
 buildAssume();
 buildWeights();
+
+// explanatory hover bubbles for any element with data-tip (the detail pills, etc.)
+const htip=document.getElementById("htip");
+document.addEventListener("mouseover",e=>{const t=e.target.closest&&e.target.closest("[data-tip]");if(t){htip.textContent=t.dataset.tip;htip.style.opacity="1";}});
+document.addEventListener("mousemove",e=>{if(htip.style.opacity==="1"){htip.style.left=Math.min(e.clientX+14,window.innerWidth-282)+"px";htip.style.top=Math.min(e.clientY+16,window.innerHeight-130)+"px";}});
+document.addEventListener("mouseout",e=>{const t=e.target.closest&&e.target.closest("[data-tip]");if(t)htip.style.opacity="0";});
 </script>
