@@ -150,8 +150,8 @@ const HZY={near:5,mid:10,long:20};
 let weights={...PRESETS.mid}, horizon="mid", gateOn=true, selApn=null;
 const ASM={base:.035,opt:1.0,hurdle:.07,sell:.08,carry:.007}, SP=.07, JUMP=.5;
 
-function growthOf(sig){ if(!sig) return 0; let n=0,d=0; for(const k of SIGS){n+=weights[k]*sig[k];d+=weights[k];}
-  let g=n/d; if(gateOn) g*=GATE[sig.water_status]; return g; }
+function growthOf(sig){ if(!sig) return 0; let n=0,d=0; for(const k of SIGS){const v=Number(sig[k])||0; n+=weights[k]*v; d+=weights[k];}
+  let g=d?n/d:0; const gate=GATE[sig.water_status]; if(gateOn&&gate) g*=gate; return isFinite(g)?g:0; }
 
 // target score = the value the MAP colors parcels by (acquisition attractiveness)
 function tenureScoreJS(t,ot){let b=Math.max(0,Math.min(100,((t||0)-2)*4.2));let f=ot==="Builder/Developer"?0.35:(ot==="Investor"?0.8:1.0);return b*f;}
