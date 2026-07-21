@@ -164,16 +164,32 @@ def parcel(apn: str):
     return r
 
 # --- ACQUISITION TARGETS ---------------------------------------------------
+PUBLIC_OWNER_PATTERNS = [
+    'MARICOPA COUNTY%', '%STATE OF ARIZONA%', 'ARIZONA STATE LAND%', '%STATE LAND DEPART%',
+    'STATE OF ARIZONA%', 'UNITED STATES%', '%UNITED STATES OF AMERICA%', '%US GOVERNMENT%',
+    '%BUREAU OF LAND MANAGEMENT%', '%BUREAU OF RECLAMATION%', '%FOREST SERVICE%',
+    'CITY OF %', 'TOWN OF %', '%FLOOD CONTROL%', '%DEPARTMENT OF%', '%DEPT OF%',
+    '%SCHOOL DIST%', '%SCHOOL DISTRICT%', '%UNIFIED SCHOOL%', '%BOARD OF REGENTS%',
+    '%INDIAN COMMUNITY%', '%INDIAN RESERVATION%', '%PIMA MARICOPA%', '%GILA RIVER%',
+    '%SALT RIVER PROJECT%', '%FORT MCDOWELL%', '%TOHONO%', '%AK CHIN%',
+    '%GAME AND FISH%', '%CENTRAL ARIZONA PROJECT%', '%ARIZONA DEPARTMENT%',
+    '%CONSERVATION DISTRICT%', '%MUNICIPAL%', '%HOMEOWNERS ASSOC%',
+    '%COMMUNITY ASSOCIATION%', '%COMMON AREA%',
+]
+
 @app.get("/targets")
 def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
             min_tenure: int = 0, min_growth: float = 0, water_status: str = "",
-            limit: int = 100):
+            include_public: bool = False, limit: int = 100):
     where = ["status='Off-market'", "use IN ('Vacant','Agricultural')",
              "acres >= %s", "coalesce(tenure,0) >= %s", "growth_score >= %s"]
     params = [min_acres, min_tenure, min_growth]
     if use:          where.append("use = %s");         params.append(use)
     if owner_type:   where.append("owner_type = %s");  params.append(owner_type)
     if water_status: where.append("zcta IN (SELECT zcta FROM zones WHERE water_status=%s)"); params.append(water_status)
+    if not include_public:
+        where.append("NOT (coalesce(owner,'') ILIKE ANY(%s))")
+        params.append(PUBLIC_OWNER_PATTERNS)
     params.append(limit)
     return qall(f"""
       SELECT apn, situs_address, city, zcta, use, acres, owner, owner_type,
