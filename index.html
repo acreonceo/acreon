@@ -102,6 +102,7 @@
         <div><label>Min acres</label><select id="fAcres"><option value="0">Any</option><option value="5">5+</option><option value="20">20+</option><option value="40">40+</option></select></div>
         <div><label>Min held</label><select id="fTen"><option value="0">Any</option><option value="20">20+</option><option value="30">30+</option></select></div>
       </div>
+      <button id="exportBtn" style="width:100%;margin:2px 0 12px;padding:8px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-weight:600;border-radius:8px;cursor:pointer">Export this list to CSV (with owner mailing addresses)</button>
       <div id="targetList"></div>
     </div>
 
@@ -365,7 +366,7 @@ async function loadTargets(){
   document.getElementById("targetList").innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
       <div class="r1"><span>${r.situs_address}</span><span class="pill" style="background:${ramp(r.target_score)}">${Math.round(r.target_score)}</span></div>
-      <div class="r2"><span>${r.use} &middot; ${r.acres} ac &middot; held ${r.tenure??"?"}y</span><span>${money(r.est)}</span></div></div>`).join("")
+      <div class="r2"><span>${r.use} &middot; ${r.acres} ac &middot; <b>${r.acres?money(r.est/r.acres)+"/ac":"n/a"}</b> &middot; held ${r.tenure??"?"}y</span><span>${money(r.est)}</span></div></div>`).join("")
     ||`<div class="empty">No targets match these filters.</div>`;
   document.querySelectorAll("#targetList .card").forEach(c=>c.addEventListener("click",()=>{openParcel(c.dataset.apn);map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
   const src=map.getSource("targets");
@@ -373,6 +374,10 @@ async function loadTargets(){
     geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.target_score}}))});
 }
 ["fUse","fOwner","fAcres","fTen"].forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
+document.getElementById("exportBtn").addEventListener("click",()=>{
+  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),limit:2000});
+  window.location.href=API+"/targets/export?"+p;
+});
 
 // ---- heatmap controls ----
 function buildWeights(){

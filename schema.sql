@@ -71,3 +71,7 @@ CREATE INDEX IF NOT EXISTS parcels_targets_ix
 CREATE INDEX IF NOT EXISTS parcels_land_acres_ix
   ON parcels (acres DESC)
   WHERE use IN ('Vacant', 'Agricultural');
+
+-- Owner mailing address (added later for outreach export). Idempotent so existing
+-- databases pick it up on the next boot.
+ALTER TABLE parcels ADD COLUMN IF NOT EXISTS mail_address text;

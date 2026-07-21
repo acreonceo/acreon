@@ -3,7 +3,7 @@ Terra API. Serves the map (vector tiles) and the analytics (search, detail, targ
 straight from PostGIS. Every SQL statement here was validated against a live
 PostGIS instance before shipping.
 """
-import os, json, pathlib, requests
+import os, json, pathlib, requests, csv, io
 from fastapi import FastAPI, Response, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -201,6 +201,40 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
       LIMIT %s
     """, tuple(params))
 
+@app.get("/targets/export")
+def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
+                   min_tenure: int = 0, min_growth: float = 0, water_status: str = "",
+                   include_public: bool = False, limit: int = 2000):
+    """Downloadable outreach list: top private off-market targets with the owner's
+    mailing address, ready for a direct-mail merge."""
+    where = ["status='Off-market'", "use IN ('Vacant','Agricultural')",
+             "acres >= %s", "coalesce(tenure,0) >= %s", "growth_score >= %s"]
+    params = [min_acres, min_tenure, min_growth]
+    if use:          where.append("use = %s");         params.append(use)
+    if owner_type:   where.append("owner_type = %s");  params.append(owner_type)
+    if water_status: where.append("zcta IN (SELECT zcta FROM zones WHERE water_status=%s)"); params.append(water_status)
+    if not include_public:
+        where.append("NOT (coalesce(owner,'') ILIKE ANY(%s))"); params.append(PUBLIC_OWNER_PATTERNS)
+    params.append(limit)
+    rows = qall(f"""
+      SELECT apn, situs_address, city, zcta, use, acres, est,
+             CASE WHEN acres>0 THEN round(est/acres) ELSE NULL END AS per_acre,
+             owner, owner_type, absentee, tenure, acquired, paid, mail_address,
+             round(target_score) target_score, round(growth_score) growth_score
+      FROM parcels WHERE {' AND '.join(where)}
+      ORDER BY target_score DESC LIMIT %s
+    """, tuple(params))
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["APN", "Situs Address", "City", "ZIP", "Use", "Acres", "Est Value", "$/Acre",
+                "Owner", "Owner Type", "Absentee", "Years Held", "Acquired", "Paid",
+                "Owner Mailing Address", "Target Score", "Growth Score"])
+    for r in rows:
+        w.writerow([r["apn"], r["situs_address"], r["city"], r["zcta"], r["use"], r["acres"], r["est"], r["per_acre"],
+                    r["owner"], r["owner_type"], r["absentee"], r["tenure"], r["acquired"], r["paid"],
+                    r["mail_address"], r["target_score"], r["growth_score"]])
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=acreon_targets.csv"})
+
 # --- REAL DATA: discovery probe -------------------------------------------
 # Hit this once (with your ADMIN_TOKEN) to confirm the server can reach the
 # county and to learn the real parcel field names before we wire the full pull.
@@ -318,21 +352,22 @@ def _transform_feature(ft):
     if not addr:
         sub, lot = (a.get("SUBNAME") or "").strip(), (a.get("LOT_NUM") or "").strip()
         addr = f"{sub} Lot {lot}".strip() if sub else f"Parcel {apn}"
+    mail = (a.get("MAIL_ADDRESS") or "").strip()
     return (apn, json.dumps(geom), addr, city, use, acres, int(est), int(assessed),
-            owner, owner_type, absentee, acquired, tenure, paid, "Off-market", None)
+            owner, owner_type, absentee, acquired, tenure, paid, "Off-market", None, mail)
 
 STAGE_DDL = """
 DROP TABLE IF EXISTS parcels_stage;
 CREATE TEMP TABLE parcels_stage (
   apn text, geom_geojson text, situs_address text, city text, use text, acres numeric,
   est bigint, assessed bigint, owner text, owner_type text, absentee boolean,
-  acquired int, tenure int, paid bigint, status text, list_price bigint);
+  acquired int, tenure int, paid bigint, status text, list_price bigint, mail_address text);
 """
 STAGE_UPSERT = """
 INSERT INTO parcels AS p (apn, geom, zcta, situs_address, city, use, acres, est, assessed,
-  owner, owner_type, absentee, acquired, tenure, paid, status, list_price, growth_score, target_score, updated_at)
+  owner, owner_type, absentee, acquired, tenure, paid, status, list_price, mail_address, growth_score, target_score, updated_at)
 SELECT s.apn, ST_SimplifyPreserveTopology(ST_SetSRID(ST_GeomFromGeoJSON(s.geom_geojson),4326), 0.00003), z.zcta, s.situs_address, s.city, s.use,
-  s.acres, s.est, s.assessed, s.owner, s.owner_type, s.absentee, s.acquired, s.tenure, s.paid, s.status, s.list_price,
+  s.acres, s.est, s.assessed, s.owner, s.owner_type, s.absentee, s.acquired, s.tenure, s.paid, s.status, s.list_price, s.mail_address,
   z.growth_default,
   round(0.5*coalesce(z.growth_default,0)
       + 0.3*greatest(0,least(100,(coalesce(s.tenure,0)-2)*4.2))
@@ -347,7 +382,7 @@ ON CONFLICT (apn) DO UPDATE SET
   geom=EXCLUDED.geom, zcta=EXCLUDED.zcta, situs_address=EXCLUDED.situs_address, city=EXCLUDED.city,
   use=EXCLUDED.use, acres=EXCLUDED.acres, est=EXCLUDED.est, assessed=EXCLUDED.assessed, owner=EXCLUDED.owner,
   owner_type=EXCLUDED.owner_type, absentee=EXCLUDED.absentee, acquired=EXCLUDED.acquired, tenure=EXCLUDED.tenure,
-  paid=EXCLUDED.paid, status=EXCLUDED.status, list_price=EXCLUDED.list_price, growth_score=EXCLUDED.growth_score,
+  paid=EXCLUDED.paid, status=EXCLUDED.status, list_price=EXCLUDED.list_price, mail_address=EXCLUDED.mail_address, growth_score=EXCLUDED.growth_score,
   target_score=EXCLUDED.target_score, updated_at=now();
 """
 
@@ -377,7 +412,7 @@ def _load_parcels(rows, replace=False):
     with pool.connection() as c:
         with c.cursor() as cur:
             cur.execute(STAGE_DDL)
-            with cur.copy("COPY parcels_stage (apn,geom_geojson,situs_address,city,use,acres,est,assessed,owner,owner_type,absentee,acquired,tenure,paid,status,list_price) FROM STDIN") as cp:
+            with cur.copy("COPY parcels_stage (apn,geom_geojson,situs_address,city,use,acres,est,assessed,owner,owner_type,absentee,acquired,tenure,paid,status,list_price,mail_address) FROM STDIN") as cp:
                 for row in rows:
                     cp.write_row(row)
             if replace:
