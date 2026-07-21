@@ -315,7 +315,7 @@ CREATE TEMP TABLE parcels_stage (
 STAGE_UPSERT = """
 INSERT INTO parcels AS p (apn, geom, zcta, situs_address, city, use, acres, est, assessed,
   owner, owner_type, absentee, acquired, tenure, paid, status, list_price, growth_score, target_score, updated_at)
-SELECT s.apn, ST_SetSRID(ST_GeomFromGeoJSON(s.geom_geojson),4326), z.zcta, s.situs_address, s.city, s.use,
+SELECT s.apn, ST_SimplifyPreserveTopology(ST_SetSRID(ST_GeomFromGeoJSON(s.geom_geojson),4326), 0.00003), z.zcta, s.situs_address, s.city, s.use,
   s.acres, s.est, s.assessed, s.owner, s.owner_type, s.absentee, s.acquired, s.tenure, s.paid, s.status, s.list_price,
   z.growth_default,
   round(0.5*coalesce(z.growth_default,0)
@@ -335,57 +335,146 @@ ON CONFLICT (apn) DO UPDATE SET
   target_score=EXCLUDED.target_score, updated_at=now();
 """
 
-def run_ingest(zcta, cap=6000):
-    global INGEST_STATUS
-    INGEST_STATUS = {"state": "running", "zip": zcta, "fetched": 0, "detail": "starting"}
+def _fetch_parcels(zcta, cap):
     bb = _zip_bbox(zcta)
     if not bb:
-        INGEST_STATUS = {"state": "error", "detail": f"zip {zcta} not in zones"}; return
+        raise RuntimeError(f"zip {zcta} not in zones")
     feats, offset = [], 0
+    while len(feats) < cap:
+        params = {"where": COUNTY_WHERE,
+                  "geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
+                  "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                  "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
+                  "returnGeometry": "true", "outSR": "4326", "f": "geojson",
+                  "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": 1000}
+        r = requests.get(COUNTY_PARCELS, params=params, timeout=90, headers={"User-Agent": UA})
+        batch = r.json().get("features", [])
+        if not batch:
+            break
+        feats.extend(batch); offset += len(batch)
+        INGEST_STATUS.update(detail=f"fetching ({len(feats)})")
+        if len(batch) < 1000:
+            break
+    return feats
+
+def _load_parcels(rows, replace=False):
+    with pool.connection() as c:
+        with c.cursor() as cur:
+            cur.execute(STAGE_DDL)
+            with cur.copy("COPY parcels_stage (apn,geom_geojson,situs_address,city,use,acres,est,assessed,owner,owner_type,absentee,acquired,tenure,paid,status,list_price) FROM STDIN") as cp:
+                for row in rows:
+                    cp.write_row(row)
+            if replace:
+                cur.execute("DELETE FROM parcels;")
+            cur.execute(STAGE_UPSERT)
+        c.commit()
+        return c.execute("SELECT count(*) FROM parcels").fetchone()[0]
+
+def run_ingest(zcta, cap=6000, replace=False):
+    global INGEST_STATUS
+    INGEST_STATUS = {"state": "running", "zip": zcta, "detail": "starting"}
     try:
-        while len(feats) < cap:
-            params = {"where": COUNTY_WHERE,
-                      "geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
-                      "geometryType": "esriGeometryEnvelope", "inSR": "4326",
-                      "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
-                      "returnGeometry": "true", "outSR": "4326", "f": "geojson",
-                      "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": 1000}
-            r = requests.get(COUNTY_PARCELS, params=params, timeout=90, headers={"User-Agent": UA})
-            batch = r.json().get("features", [])
-            if not batch: break
-            feats.extend(batch); offset += len(batch)
-            INGEST_STATUS.update(fetched=len(feats), detail="fetching")
-            if len(batch) < 1000: break
+        feats = _fetch_parcels(zcta, cap)
     except Exception as e:
-        INGEST_STATUS = {"state": "error", "detail": f"fetch failed: {e}", "fetched": len(feats)}; return
+        INGEST_STATUS = {"state": "error", "detail": f"fetch failed: {e}"}; return
     if not feats:
         INGEST_STATUS = {"state": "error", "detail": "county returned 0 parcels; check zip/filter"}; return
     rows = [r for r in (_transform_feature(f) for f in feats) if r]
     if not rows:
-        INGEST_STATUS = {"state": "error", "detail": "no usable rows after transform", "fetched": len(feats)}; return
-    INGEST_STATUS.update(detail=f"loading {len(rows)} parcels", transformed=len(rows))
+        INGEST_STATUS = {"state": "error", "detail": "no usable rows after transform"}; return
+    INGEST_STATUS.update(detail=f"loading {len(rows)} parcels")
     try:
-        with pool.connection() as c:
-            with c.cursor() as cur:
-                cur.execute(STAGE_DDL)
-                with cur.copy("COPY parcels_stage (apn,geom_geojson,situs_address,city,use,acres,est,assessed,owner,owner_type,absentee,acquired,tenure,paid,status,list_price) FROM STDIN") as cp:
-                    for row in rows: cp.write_row(row)
-                cur.execute("DELETE FROM parcels;")     # swap demo data for real
-                cur.execute(STAGE_UPSERT)
-            c.commit()
-            n = c.execute("SELECT count(*) FROM parcels").fetchone()[0]
+        n = _load_parcels(rows, replace=replace)
         INGEST_STATUS = {"state": "done", "zip": zcta, "fetched": len(feats), "loaded": n}
     except Exception as e:
-        INGEST_STATUS = {"state": "error", "detail": f"load failed: {e}", "fetched": len(feats)}
+        INGEST_STATUS = {"state": "error", "detail": f"load failed: {e}"}
+
+def run_ingest_all(cap_per_zip=2500, replace_first=True):
+    global INGEST_STATUS
+    with pool.connection() as c:
+        zctas = [r[0] for r in c.execute("SELECT zcta FROM zones ORDER BY zcta").fetchall()]
+    total = len(zctas); loaded_zips = 0; errors = 0
+    for i, z in enumerate(zctas, 1):
+        INGEST_STATUS = {"state": "running", "mode": "county", "zip": z, "progress": f"{i}/{total}", "errors": errors}
+        try:
+            feats = _fetch_parcels(z, cap_per_zip)
+            rows = [r for r in (_transform_feature(f) for f in feats) if r]
+            if rows:
+                _load_parcels(rows, replace=(replace_first and i == 1))
+                loaded_zips += 1
+        except Exception:
+            errors += 1
+    with pool.connection() as c:
+        n = c.execute("SELECT count(*) FROM parcels").fetchone()[0]
+    INGEST_STATUS = {"state": "done", "mode": "county", "zips_loaded": loaded_zips, "errors": errors, "loaded": n}
+
+def _fetch_page(offset, where, n=1000):
+    params = {"where": where, "outFields": "*", "returnGeometry": "true", "outSR": "4326",
+              "f": "geojson", "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": n}
+    r = requests.get(COUNTY_PARCELS, params=params, timeout=120, headers={"User-Agent": UA})
+    try:
+        return r.json().get("features", [])
+    except Exception:
+        raise RuntimeError(f"county status {r.status_code}: {r.text[:150]}")
+
+def run_ingest_county(include_all=False, chunk=5000, cap=2_000_000):
+    """Page the whole county (no per-ZIP bbox), loading in chunks. Replaces once on
+    the first flush then appends, so it's a clean full rebuild. Handles ~250k
+    vacant/ag parcels, or everything with include_all."""
+    global INGEST_STATUS
+    where = "1=1" if include_all else COUNTY_WHERE
+    INGEST_STATUS = {"state": "running", "mode": "county-all", "fetched": 0, "loaded": 0, "detail": "starting"}
+    offset = 0; loaded = 0; buf = []; replaced = False
+    try:
+        while offset < cap:
+            feats = _fetch_page(offset, where)
+            if not feats:
+                break
+            offset += len(feats)
+            for f in feats:
+                row = _transform_feature(f)
+                if row:
+                    buf.append(row)
+            INGEST_STATUS.update(fetched=offset, detail=f"fetching ({offset})")
+            if len(buf) >= chunk:
+                loaded = _load_parcels(buf, replace=(not replaced)); replaced = True; buf = []
+                INGEST_STATUS.update(loaded=loaded, detail=f"loaded {loaded}")
+            if len(feats) < 1000:
+                break
+        if buf:
+            loaded = _load_parcels(buf, replace=(not replaced))
+        INGEST_STATUS = {"state": "done", "mode": "county-all", "fetched": offset, "loaded": loaded}
+    except Exception as e:
+        INGEST_STATUS = {"state": "error", "detail": str(e)[:200], "fetched": offset, "loaded": loaded}
 
 @app.get("/admin/ingest")
-def admin_ingest(token: str, zip: str = "85326", cap: int = 6000):
+def admin_ingest(token: str, zip: str = "85326", cap: int = 6000, replace: bool = False):
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if INGEST_STATUS.get("state") == "running":
         return {"state": "already_running", "status": INGEST_STATUS}
-    threading.Thread(target=run_ingest, args=(zip, cap), daemon=True).start()
-    return {"state": "started", "zip": zip, "cap": cap, "next": "poll /admin/status?token=YOUR_TOKEN"}
+    threading.Thread(target=run_ingest, args=(zip, cap, replace), daemon=True).start()
+    return {"state": "started", "zip": zip, "cap": cap, "replace": replace, "next": "poll /admin/status?token=YOUR_TOKEN"}
+
+@app.get("/admin/ingest_all")
+def admin_ingest_all(token: str, cap_per_zip: int = 2500, replace_first: bool = True):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if INGEST_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": INGEST_STATUS}
+    threading.Thread(target=run_ingest_all, args=(cap_per_zip, replace_first), daemon=True).start()
+    return {"state": "started", "mode": "county", "cap_per_zip": cap_per_zip,
+            "note": "walks all ZIPs additively; long-running; poll /admin/status?token=YOUR_TOKEN"}
+
+@app.get("/admin/ingest_county")
+def admin_ingest_county(token: str, all: bool = False):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if INGEST_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": INGEST_STATUS}
+    threading.Thread(target=run_ingest_county, kwargs={"include_all": all}, daemon=True).start()
+    return {"state": "started", "mode": "county-all", "include_all": all,
+            "note": "full-county rebuild; pages the whole layer; poll /admin/status?token=YOUR_TOKEN"}
 
 @app.get("/admin/status")
 def admin_status(token: str):
