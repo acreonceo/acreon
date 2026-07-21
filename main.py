@@ -133,7 +133,7 @@ def zones():
         'type','FeatureCollection',
         'features', jsonb_agg(jsonb_build_object(
           'type','Feature',
-          'geometry', ST_AsGeoJSON(geom)::jsonb,
+          'geometry', ST_AsGeoJSON(ST_SimplifyPreserveTopology(geom, 0.002))::jsonb,
           'properties', jsonb_build_object('zcta',zcta,'growth',growth_default,
                                            'water_status',water_status,'signals',signals)))
       ) FROM zones""")
@@ -498,6 +498,65 @@ def run_ingest_county(include_all=False, chunk=5000, cap=2_000_000):
     except Exception as e:
         INGEST_STATUS = {"state": "error", "detail": str(e)[:200], "fetched": offset, "loaded": loaded}
 
+# --- ZONE REBUILD: precise, complete Census ZIP boundaries -----------------
+ZCTA_URL = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/PUMA_TAD_TAZ_UGA_ZCTA/MapServer/7/query"
+MARICOPA_BBOX = (-113.35, 32.5, -111.0, 34.05)
+DEFAULT_SIGNALS = {"developable_land": 50, "permit_velocity": 50, "zoning_activity": 50,
+                   "infra_transport": 50, "infra_water": 50, "migration": 50, "schools": 50,
+                   "water_status": "groundwater_constrained"}
+
+def _fetch_zctas(bbox):
+    params = {"where": "1=1", "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+              "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
+              "spatialRel": "esriSpatialRelIntersects", "outFields": "ZCTA5,GEOID",
+              "returnGeometry": "true", "f": "geojson", "resultRecordCount": 4000}
+    r = requests.get(ZCTA_URL, params=params, timeout=180, headers={"User-Agent": UA})
+    try:
+        feats = r.json().get("features", [])
+    except Exception:
+        raise RuntimeError(f"tigerweb status {r.status_code}: {r.text[:150]}")
+    out = []
+    for f in feats:
+        p = f.get("properties") or {}
+        z = (p.get("ZCTA5") or p.get("GEOID") or "").strip()
+        g = f.get("geometry")
+        if z and g:
+            out.append((z, json.dumps(g)))
+    return out
+
+def run_rebuild_zones():
+    """Replace coarse zone shapes with precise Census ZIP boundaries and add any
+    missing ones, keeping existing zones' signals. Then re-assign every parcel to
+    its containing zone so nothing falls in a gap."""
+    global INGEST_STATUS
+    INGEST_STATUS = {"state": "running", "mode": "zones", "detail": "fetching ZIP boundaries"}
+    try:
+        zctas = _fetch_zctas(MARICOPA_BBOX)
+        if not zctas:
+            INGEST_STATUS = {"state": "error", "detail": "tigerweb returned 0 ZCTAs"}; return
+        INGEST_STATUS.update(detail=f"loading {len(zctas)} zones")
+        with pool.connection() as c:
+            with c.cursor() as cur:
+                for z, gj in zctas:
+                    cur.execute("""
+                      INSERT INTO zones (zcta, geom, signals, water_status, growth_default)
+                      VALUES (%s, ST_Multi(ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326))), %s::jsonb, %s, NULL)
+                      ON CONFLICT (zcta) DO UPDATE SET geom = EXCLUDED.geom
+                    """, (z, gj, json.dumps(DEFAULT_SIGNALS), DEFAULT_SIGNALS["water_status"]))
+                INGEST_STATUS.update(detail="re-assigning parcels to zones")
+                cur.execute("""
+                  UPDATE parcels p SET zcta = z.zcta FROM zones z
+                  WHERE ST_Contains(z.geom, p.centroid) AND p.zcta IS DISTINCT FROM z.zcta
+                """)
+                cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
+                cur.execute(RESCORE_SQL)
+            c.commit()
+            n = c.execute("SELECT count(*) FROM zones").fetchone()[0]
+            orphans = c.execute("SELECT count(*) FROM parcels WHERE zcta IS NULL").fetchone()[0]
+        INGEST_STATUS = {"state": "done", "mode": "zones", "zones": n, "orphan_parcels": orphans}
+    except Exception as e:
+        INGEST_STATUS = {"state": "error", "detail": str(e)[:200]}
+
 @app.get("/admin/ingest")
 def admin_ingest(token: str, zip: str = "85326", cap: int = 6000, replace: bool = False):
     if token != os.environ.get("ADMIN_TOKEN", ""):
@@ -526,6 +585,16 @@ def admin_ingest_county(token: str, all: bool = False):
     threading.Thread(target=run_ingest_county, kwargs={"include_all": all}, daemon=True).start()
     return {"state": "started", "mode": "county-all", "include_all": all,
             "note": "full-county rebuild; pages the whole layer; poll /admin/status?token=YOUR_TOKEN"}
+
+@app.get("/admin/rebuild_zones")
+def admin_rebuild_zones(token: str):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if INGEST_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": INGEST_STATUS}
+    threading.Thread(target=run_rebuild_zones, daemon=True).start()
+    return {"state": "started", "mode": "zones",
+            "note": "pulls precise ZIP boundaries, re-assigns parcels; then re-run the signals; poll /admin/status?token=YOUR_TOKEN"}
 
 @app.get("/admin/status")
 def admin_status(token: str):
