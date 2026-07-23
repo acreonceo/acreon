@@ -244,6 +244,7 @@ def _candidates(where_sql, params):
              p.owner, p.owner_type, p.absentee, p.tenure, p.acquired, p.paid,
              p.mail_address, COALESCE(p.water_state,'C') AS water_state,
              p.carry_rate, p.hazard_fitted, p.landlocked, p.flood_zone, p.edge_miles,
+             p.zoning, p.jurisdiction,
              z.signals AS signals, z.dev_value_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
@@ -303,6 +304,7 @@ def _valued(rows, p, horizon=10):
 def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
             min_tenure: int = 0, water_state: str = "", include_public: bool = False,
             absentee: bool = False, city: str = "", zcta: str = "",
+            include_builders: bool = False,
             max_price_per_acre: float = 0, max_total_price: float = 0,
             min_score: int = 0, max_years: int = 0,
             min_ratio: float = 0, horizon: int = 10,
@@ -321,6 +323,11 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres
     if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
     if not include_public:
         where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
+    if not include_builders:
+        # A homebuilder that already assembled the site is not a seller: they
+        # bought it to build on. Their land is real and stays on the map, but it
+        # does not belong in an acquisition list.
+        where.append("coalesce(p.owner_type,'') <> 'Builder/Developer'")
     rows = _candidates(" AND ".join(where), tuple(args))
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
@@ -383,6 +390,11 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
     if not include_public:
         where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
+    if not include_builders:
+        # A homebuilder that already assembled the site is not a seller: they
+        # bought it to build on. Their land is real and stays on the map, but it
+        # does not belong in an acquisition list.
+        where.append("coalesce(p.owner_type,'') <> 'Builder/Developer'")
     rows = _candidates(" AND ".join(where), tuple(args))
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
@@ -586,22 +598,29 @@ def _transform_feature(ft):
         sub, lot = (a.get("SUBNAME") or "").strip(), (a.get("LOT_NUM") or "").strip()
         addr = f"{sub} Lot {lot}".strip() if sub else f"Parcel {apn}"
     mail = (a.get("MAIL_ADDRESS") or "").strip()
+    zoning = (a.get("CITY_ZONING") or "").strip()
+    juris = (a.get("JURISDICTION") or "").strip()
+    if zoning.upper().startswith("CONTACT"):
+        zoning = ""                      # placeholder text, not a zoning code
     return (apn, json.dumps(geom), addr, city, use, acres, int(est), int(assessed),
-            owner, owner_type, absentee, acquired, tenure, paid, "Off-market", None, mail)
+            owner, owner_type, absentee, acquired, tenure, paid, "Off-market", None, mail,
+            zoning, juris)
 
 STAGE_DDL = """
 DROP TABLE IF EXISTS parcels_stage;
 CREATE TEMP TABLE parcels_stage (
   apn text, geom_geojson text, situs_address text, city text, use text, acres numeric,
   est bigint, assessed bigint, owner text, owner_type text, absentee boolean,
-  acquired int, tenure int, paid bigint, status text, list_price bigint, mail_address text);
+  acquired int, tenure int, paid bigint, status text, list_price bigint, mail_address text,
+  zoning text, jurisdiction text);
 """
 STAGE_UPSERT = """
 INSERT INTO parcels AS p (apn, geom, zcta, situs_address, city, use, acres, est, assessed,
-  owner, owner_type, absentee, acquired, tenure, paid, status, list_price, mail_address, growth_score, target_score, updated_at)
+  owner, owner_type, absentee, acquired, tenure, paid, status, list_price, mail_address,
+   zoning, jurisdiction, growth_score, target_score, updated_at)
 SELECT s.apn, ST_SimplifyPreserveTopology(ST_SetSRID(ST_GeomFromGeoJSON(s.geom_geojson),4326), 0.00003), z.zcta, s.situs_address, s.city, s.use,
   s.acres, s.est, s.assessed, s.owner, s.owner_type, s.absentee, s.acquired, s.tenure, s.paid, s.status, s.list_price, s.mail_address,
-  z.growth_default,
+  s.zoning, s.jurisdiction, z.growth_default,
   round(0.5*coalesce(z.growth_default,0)
       + 0.3*greatest(0,least(100,(coalesce(s.tenure,0)-2)*4.2))
             * CASE s.owner_type WHEN 'Builder/Developer' THEN 0.35 WHEN 'Investor' THEN 0.8 ELSE 1.0 END
@@ -615,7 +634,8 @@ ON CONFLICT (apn) DO UPDATE SET
   geom=EXCLUDED.geom, zcta=EXCLUDED.zcta, situs_address=EXCLUDED.situs_address, city=EXCLUDED.city,
   use=EXCLUDED.use, acres=EXCLUDED.acres, est=EXCLUDED.est, assessed=EXCLUDED.assessed, owner=EXCLUDED.owner,
   owner_type=EXCLUDED.owner_type, absentee=EXCLUDED.absentee, acquired=EXCLUDED.acquired, tenure=EXCLUDED.tenure,
-  paid=EXCLUDED.paid, status=EXCLUDED.status, list_price=EXCLUDED.list_price, mail_address=EXCLUDED.mail_address, growth_score=EXCLUDED.growth_score,
+  paid=EXCLUDED.paid, status=EXCLUDED.status, list_price=EXCLUDED.list_price, mail_address=EXCLUDED.mail_address,
+  zoning=EXCLUDED.zoning, jurisdiction=EXCLUDED.jurisdiction, growth_score=EXCLUDED.growth_score,
   target_score=EXCLUDED.target_score, updated_at=now();
 """
 
@@ -645,7 +665,7 @@ def _load_parcels(rows, replace=False):
     with pool.connection() as c:
         with c.cursor() as cur:
             cur.execute(STAGE_DDL)
-            with cur.copy("COPY parcels_stage (apn,geom_geojson,situs_address,city,use,acres,est,assessed,owner,owner_type,absentee,acquired,tenure,paid,status,list_price,mail_address) FROM STDIN") as cp:
+            with cur.copy("COPY parcels_stage (apn,geom_geojson,situs_address,city,use,acres,est,assessed,owner,owner_type,absentee,acquired,tenure,paid,status,list_price,mail_address,zoning,jurisdiction) FROM STDIN") as cp:
                 for row in rows:
                     cp.write_row(row)
             if replace:
@@ -1128,14 +1148,30 @@ def run_all_signals():
             return
     SIGNAL_STATUS = {"state": "done", "kind": "all", "ran": ran}
 
-def run_full_refresh(parcels=False):
-    """Optionally re-pull all parcels, then run every signal. Used by the quarterly
-    scheduled job and the manual full refresh."""
+def run_full_refresh(parcels=False, history=False):
+    """Quarterly job. Optionally re-pull every parcel and the construction
+    history, refit the conversion hazard, and rerun the parcel screens, then
+    refresh all growth signals.
+
+    The hazard fit and the built-parcel history were previously manual only, so a
+    scheduled refresh silently left the fitted conversion odds stale while every
+    other input moved. They belong on the same cadence as the parcels they are
+    fitted on.
+    """
     if parcels:
         run_ingest_county()
         if INGEST_STATUS.get("state") == "error":
             return
+    if history:
+        run_ingest_built()
+        if INGEST_STATUS.get("state") == "error":
+            return
+        run_fit_hazard()
     run_all_signals()
+    try:
+        run_screens(do_flood=False)      # frontage only; flood has no working source
+    except Exception:
+        pass
 
 @app.get("/admin/signals")
 def admin_signals(token: str, kind: str = "migration"):
@@ -1148,13 +1184,13 @@ def admin_signals(token: str, kind: str = "migration"):
     return {"state": "started", "kind": kind, "next": "poll /admin/signals_status?token=YOUR_TOKEN"}
 
 @app.get("/admin/refresh")
-def admin_refresh(token: str, parcels: bool = False):
+def admin_refresh(token: str, parcels: bool = False, history: bool = False):
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if INGEST_STATUS.get("state") == "running" or SIGNAL_STATUS.get("state") == "running":
         return {"state": "already_running"}
-    threading.Thread(target=run_full_refresh, kwargs={"parcels": parcels}, daemon=True).start()
-    return {"state": "started", "parcels": parcels,
+    threading.Thread(target=run_full_refresh, kwargs={"parcels": parcels, "history": history}, daemon=True).start()
+    return {"state": "started", "parcels": parcels, "history": history,
             "note": "parcels=false runs all signals; parcels=true also re-pulls the county first. Poll /admin/status then /admin/signals_status"}
 
 @app.get("/admin/signals_status")

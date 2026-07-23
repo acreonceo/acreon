@@ -422,6 +422,7 @@ function renderDetail(p){
   document.getElementById("detailBody").innerHTML=`
     <h2>${p.situs_address||p.apn}</h2>
     <div class="sub">${p.city||""} ${p.zcta||""} · ${p.use} · ${(+p.acres||0).toLocaleString()} ac · APN ${p.apn}</div>
+    ${(p.zoning||p.jurisdiction)?`<div class="sub" style="margin-top:2px">Zoning: <b>${p.zoning||"not recorded"}</b>${p.jurisdiction?` · ${p.jurisdiction}`:""}</div>`:""}
     <div class="badges" id="badges"></div>
     <h3>Valuation</h3>
     <div id="valblock"></div>
@@ -448,7 +449,7 @@ function updateValuationUI(){
   if(!curP) return;
   const p=curP, V=valueOf(p);
   if(!V){ document.getElementById("valblock").innerHTML=`<div class="empty">No value or acreage on record for this parcel.</div>`; return; }
-  const H=HZY[horizon], c=V.path, acq=acqOf(p);
+  const H=V.H, c=V.path, acq=acqOf(p);
   const over = V.ratio<0.95, fair = V.ratio>=0.95 && V.ratio<=1.15;
   const verdictTxt = over?"Overpriced at today's ask":(fair?"About fairly priced":"Trading below modelled value");
   const verdictCol = over?"var(--bad)":(fair?"var(--warn)":"var(--good)");
