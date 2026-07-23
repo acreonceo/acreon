@@ -220,6 +220,7 @@ function siteFactor(p){ let f=1;
   if(z==="FLOODWAY") f*=0.10; else if(z) f*=0.75;
   return f; }
 
+const valueScore=r=>{const x=Math.sqrt(Math.max(0,r||0));return Math.round(100*x/(x+1));};
 function valueOf(p){
   const acres=+p.acres||0, est=+p.est||0;
   if(acres<=0||est<=0) return null;
@@ -230,7 +231,8 @@ function valueOf(p){
   const cr=(p.carry_rate!==null&&p.carry_rate!==undefined)?+p.carry_rate:0.003;
   const site=siteFactor(p);
   const v=c.payoff*d0*site+c.floor*price-c.carry*cr*price;
-  return {gi,state:st,price,d0,carry:cr,v,ratio:price>0?v/price:0,path:c,acres,est,site,
+  const ratio=price>0?v/price:0;
+  return {gi,state:st,price,d0,carry:cr,v,ratio,score:valueScore(ratio),path:c,acres,est,site,
           fitted:hf!==null}; }
 
 function acqOf(p){
@@ -243,8 +245,8 @@ function acqOf(p){
   return 100/(1+Math.exp(-z)); }
 
 // Colour by value/price: 1.0 is fair, below is overpriced, above is a discount.
-function ratioRamp(r){
-  const v=Math.max(0,Math.min(100,(Math.max(0,Math.min(3,r||0))/3)*100));
+function ratioRamp(r){          // accepts a ratio, colours by the 0-100 score
+  const v=valueScore(r||0);
   const s=[[0,"#d73027"],[33,"#fc8d59"],[50,"#fee08b"],[70,"#a6d96a"],[100,"#1a9850"]];
   const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
   for(let i=0;i<s.length-1;i++){ if(v<=s[i+1][0]){ const t=(v-s[i][0])/(s[i+1][0]-s[i][0]),a=hex(s[i][1]),b=hex(s[i+1][1]);
@@ -401,7 +403,7 @@ function updateValuationUI(){
 
   document.getElementById("badges").innerHTML=
      `<span class="pill" style="background:${ratioRamp(V.ratio)}" data-tip="${escAttr(
-        `Value to price ${V.ratio.toFixed(2)}x. Modelled value per acre divided by the current asking or assessed price per acre. Above 1 means the model thinks it is cheap; below 1 means dear. This is what the map colours by.`)}">Value ${V.ratio.toFixed(2)}×</span>`
+        `Value score ${V.score} of 100. 50 means the modelled value per acre equals what the parcel costs per acre. Above 50 the model reckons it is cheap, below 50 dear. Here: modelled ${money(V.v)}/ac against ${money(V.price)}/ac asking.`)}">Value ${V.score}</span>`
     +`<span class="pill" style="background:${WSCOL[V.state]}" data-tip="${escAttr(
         `${WSLBL[V.state]}. A: inside a designated provider or holding an assured-supply certificate, developable now. B: irrigated agricultural land whose grandfathered irrigation right can be relinquished under SB1611 (2025) for groundwater savings credits usable within one mile. C: raw groundwater-dependent land, blocked for subdivision since ADWR halted groundwater-based assured-supply applications in 2023, and dependent on being absorbed by a provider or on policy change.`)}">${WSLBL[V.state]}</span>`
     +`<span class="pill" style="background:#5b564d" data-tip="${escAttr(
@@ -535,7 +537,7 @@ async function loadTargets(){
   if(!rows.length){ el.innerHTML=`<div class="empty">No parcels match these filters.</div>`; return; }
   el.innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
-      <div class="r1"><span>${r.situs_address||r.apn}</span><span class="pill" style="background:${ratioRamp(r.value_ratio)}">${(r.value_ratio||0).toFixed(2)}×</span></div>
+      <div class="r1"><span>${r.situs_address||r.apn}</span><span class="pill" style="background:${ratioRamp(r.value_ratio)}">${r.value_score ?? valueScore(r.value_ratio||0)}</span></div>
       <div class="r2"><span>${r.use} · ${(+r.acres).toLocaleString()} ac · <b>${money(r.price_per_acre)}/ac</b></span><span>${money(r.value_per_acre)}/ac value</span></div>
       <div class="r2"><span style="color:${WSCOL[r.water_state]}">${WSLBL[r.water_state]}</span><span>${r.p50_years?("even odds "+r.p50_years+"y"):">60y"} · held ${r.tenure??"?"}y</span></div>
     </div>`).join("");
@@ -595,7 +597,7 @@ function showTab(t){
   document.getElementById("pane-blocks").style.display=t==="blocks"?"block":"none";
   document.getElementById("pane-map").style.display=t==="map"?"block":"none";
   const lm=document.getElementById("legMode");
-  if(lm) lm.textContent=t==="targets"?"parcels by value vs price":(t==="blocks"?"owner land blocks":"zones by frontier heat");
+  if(lm) lm.textContent=t==="targets"?"parcels by value score":(t==="blocks"?"owner land blocks":"zones by frontier heat");
   if(t==="targets"){ if(targetsDirty||!document.getElementById("targetList").children.length) loadTargets(); }
   else if(t==="blocks"){ if(blocksDirty||!document.getElementById("blockList").children.length) loadBlocks(); }
   else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }

@@ -272,7 +272,16 @@ def _valued(rows, p, horizon=10):
         r["dev_price_per_acre"] = round(d0)
         r["value_per_acre"] = round(v_ac)
         r["value_total"] = round(v_ac * acres)
-        r["value_ratio"] = round(v_ac / price_ac, 2) if price_ac > 0 else None
+        ratio = (v_ac / price_ac) if price_ac > 0 else 0
+        r["value_ratio"] = round(ratio, 2)
+        # 0-100, saturating: 50 means modelled value equals the asking price,
+        # above 50 is a discount to model, below is a premium. A raw multiple
+        # was unreadable once a ratio ran into the thousands.
+        # sqrt keeps 50 = "worth what it costs" while spreading the useful range:
+        # 1x->50, 2x->59, 4x->67, 9x->75, 16x->80. A plain ratio/(ratio+1) put
+        # nearly every fringe parcel between 88 and 92.
+        _r = max(0.0, ratio) ** 0.5
+        r["value_score"] = round(100 * _r / (_r + 1))
         r["p50_years"] = c["p50_years"]
         r["p_convert"] = c["p_convert"].get(horizon)
         r["carry_pct"] = round(cr * 100, 2)
@@ -304,6 +313,7 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
     if min_ratio:
         vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
     keyf = {"value_ratio": lambda r: r["value_ratio"] or 0,
+            "value_score": lambda r: r["value_score"] or 0,
             "value_total": lambda r: r["value_total"] or 0,
             "acq_score":   lambda r: r["acq_score"] or 0,
             "soonest":     lambda r: -(r["p50_years"] or 999)}.get(sort,
@@ -340,7 +350,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     WS = {"A": "A served/assured", "B": "B irrigated ag (SB1611 path)", "C": "C raw groundwater"}
     buf = io.StringIO(); w = csv.writer(buf)
     w.writerow(["APN", "Situs Address", "City", "ZIP", "Use", "Acres",
-                "Price $/Acre", "Modeled Value $/Acre", "Value/Price",
+                "Price $/Acre", "Modeled Value $/Acre", "Value Score (0-100)", "Value/Price",
                 "Developer $/Acre", "Water State", "P50 Yrs to Convert",
                 f"P(convert<={horizon}y)", "Carry %/yr",
                 "Owner", "Owner Type", "Absentee", "Years Held", "Acquired", "Paid",
@@ -348,7 +358,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
                 "Landlocked", "Flood Zone", "Site Factor", "Hazard Source"])
     for r in vals:
         w.writerow([r["apn"], r["situs_address"], r["city"], r["zcta"], r["use"], r["acres"],
-                    r["price_per_acre"], r["value_per_acre"], r["value_ratio"],
+                    r["price_per_acre"], r["value_per_acre"], r["value_score"], r["value_ratio"],
                     r["dev_price_per_acre"], WS.get(r["water_state"], r["water_state"]),
                     r["p50_years"] if r["p50_years"] else ">60",
                     round(r["p_convert"], 3) if r["p_convert"] is not None else "",
@@ -359,6 +369,42 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
                     r.get("hazard_source")])
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=acreon_targets.csv"})
+
+
+# --- ASSEMBLAGE DETECTION --------------------------------------------------
+# Owners holding several touching parcels. A contiguous block is one negotiation
+# for developable scale, and it is invisible parcel by parcel.
+ASSEMBLAGE_SQL = """
+WITH land AS (
+  SELECT apn, owner, owner_type, zcta, city, acres, est, tenure, growth_score, geom, centroid
+  FROM parcels
+  WHERE use IN ('Vacant','Agricultural') AND status='Off-market'
+    AND owner IS NOT NULL AND acres IS NOT NULL
+    AND NOT (coalesce(owner,'') ILIKE ANY(%(pub)s))
+    AND ({ZFILTER})
+),
+clustered AS (
+  SELECT *, ST_ClusterDBSCAN(geom, eps := %(eps)s, minpoints := 2)
+             OVER (PARTITION BY owner) AS cid
+  FROM land
+)
+SELECT owner, owner_type, min(zcta) AS zcta, min(city) AS city,
+       count(*) AS parcel_count,
+       round(sum(acres)::numeric,1) AS total_acres,
+       sum(est) AS total_est,
+       CASE WHEN sum(acres) > 0 THEN round(sum(est)/sum(acres)) ELSE NULL END AS per_acre,
+       max(tenure) AS max_tenure,
+       round(avg(growth_score),1) AS avg_growth,
+       ST_X(ST_Centroid(ST_Collect(centroid))) AS lon,
+       ST_Y(ST_Centroid(ST_Collect(centroid))) AS lat,
+       array_agg(apn ORDER BY acres DESC) AS apns
+FROM clustered
+WHERE cid IS NOT NULL
+GROUP BY owner, owner_type, cid
+HAVING count(*) >= %(minp)s AND sum(acres) >= %(minac)s
+ORDER BY sum(acres) DESC
+LIMIT %(lim)s
+"""
 
 @app.get("/assemblages")
 def assemblages(min_parcels: int = 2, min_acres: float = 10, zcta: str = "",
@@ -824,19 +870,30 @@ FROM cov c WHERE z.zcta = c.zcta;
 # nearest zones that do, so far-fringe zones do not silently pick up metro-core
 # prices, which would wildly overvalue deep desert.
 DEV_VALUE_SQL = """
-WITH own AS (
+WITH base AS (
+  SELECT zcta, percentile_cont(0.5) WITHIN GROUP (ORDER BY est/acres) AS med_all
+  FROM parcels WHERE acres >= 1 AND est > 0 AND zcta IS NOT NULL GROUP BY zcta
+),
+own AS (
   SELECT zcta, percentile_cont(0.5) WITHIN GROUP (ORDER BY est/acres) AS v
   FROM parcels
-  WHERE water_state = 'A' AND acres > 0 AND est > 0
+  WHERE water_state = 'A' AND acres >= 1 AND est > 0
   GROUP BY zcta HAVING count(*) >= 3
 )
-UPDATE zones z SET dev_value_per_acre = COALESCE(
-  (SELECT v FROM own WHERE own.zcta = z.zcta),
-  (SELECT avg(t.v) FROM (
-      SELECT o.v FROM own o JOIN zones zz ON zz.zcta = o.zcta
-      ORDER BY ST_Distance(z.geom, zz.geom) LIMIT 3) t)
+UPDATE zones z SET dev_value_per_acre = LEAST(
+  COALESCE(
+    (SELECT v FROM own WHERE own.zcta = z.zcta),
+    (SELECT avg(t.v) FROM (
+        SELECT o.v FROM own o JOIN zones zz ON zz.zcta = o.zcta
+        ORDER BY ST_Distance(z.geom, zz.geom) LIMIT 3) t)),
+  20 * COALESCE((SELECT med_all FROM base WHERE base.zcta = z.zcta), 1e12)
 );
 """
+# Sub-acre parcels were the problem: an infill lot worth $80k on a tenth of an
+# acre reads as $800k/acre and dragged zone medians to seven figures, which then
+# valued cheap rural land at thousands of times its price. Only parcels of an
+# acre or more inform the developer price, and it is capped at 20x whatever land
+# actually trades for in that zone.
 
 def _fetch_aaws(bbox, cap=15000):
     geoms, offset = [], 0
