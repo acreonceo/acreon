@@ -120,6 +120,10 @@ def _investor_body(rows, tot):
     {money(tot['ask'])}, or {money(tot['per_acre'])} per acre. Against a modelled
     value of {money(tot['value'])}, the position screens at an average value score of
     {tot['score']} out of 100, where 50 means an asset is worth what it costs.</p>
+    <p>Figures are stated for a {tot['horizon']}-year holding period. That matters:
+    the same multiple on capital is a very different investment over five years
+    than over thirty, so every parcel here is scored on return per year over that
+    period, not on value accumulated across an arbitrary window.</p>
     <p>The thesis is not that raw land appreciates steadily. It does not. Fringe land
     sits close to its holding value for years and then steps up sharply when it
     becomes developable. What is being bought is the probability of that conversion,
@@ -144,7 +148,7 @@ def _investor_body(rows, tot):
         <div class="kpis">
           <div class="kpi"><div class="k">Asking / assessed</div><div class="v">{money(r.get('price_per_acre'))}</div><div class="n">per acre</div></div>
           <div class="kpi"><div class="k">Modelled value</div><div class="v">{money(r.get('value_per_acre'))}</div><div class="n">per acre</div></div>
-          <div class="kpi"><div class="k">Value score</div><div class="v">{r.get('value_score')}</div><div class="n">50 = fairly priced</div></div>
+          <div class="kpi"><div class="k">Return</div><div class="v">{_num(r.get('annual_return_pct'),1)}%</div><div class="n">per year, {tot['horizon']}-yr hold</div></div>
           <div class="kpi"><div class="k">Even odds by</div><div class="v">{r.get('p50_years') or '30+'}</div><div class="n">years to convert</div></div>
         </div>
         <p><b>Water.</b> {WS_INVESTOR.get(ws, '')}</p>
@@ -245,8 +249,9 @@ def _readiness(r):
     return " ".join(bits)
 
 
-def build(rows, audience="investor"):
+def build(rows, audience="investor", horizon=10):
     tot = _portfolio(rows)
+    tot["horizon"] = horizon
     investor = audience != "developer"
     title = "Investment Brief" if investor else "Development Opportunity Brief"
     body = _investor_body(rows, tot) if investor else _developer_body(rows, tot)

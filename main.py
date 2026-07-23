@@ -227,6 +227,9 @@ PUBLIC_OWNER_PATTERNS = [
     '%COMMUNITY ASSOCIATION%', '%COMMON AREA%',
 ]
 
+def _snap_horizon(h):
+    return min(MODEL.HORIZONS, key=lambda x: abs(x - (h or 10)))
+
 def _model_params(lambda_p=None, h_max=None, g_d=None, rho=None, horizon=None):
     p = dict(MODEL.DEFAULTS)
     if lambda_p is not None: p["lambda_p"] = max(0.0, min(0.10, lambda_p))
@@ -268,22 +271,23 @@ def _valued(rows, p, horizon=10):
         price_ac = est / acres
         d0 = float(r["dev_value_per_acre"] or 0) or price_ac * 3.0
         cr = float(r["carry_rate"]) if r["carry_rate"] is not None else MODEL.carry_rate(est, r["assessed"])
-        v_ac = MODEL.value_per_acre(c, d0, price_ac, cr, site)
+        v_ac = MODEL.value_at_horizon(c, horizon, d0, price_ac, cr, site, p)
+        ann = MODEL.annualised_return(v_ac, price_ac, horizon, p)
         r["growth_index"] = round(gi, 1)
         r["price_per_acre"] = round(price_ac)
         r["dev_price_per_acre"] = round(d0)
         r["value_per_acre"] = round(v_ac)
         r["value_total"] = round(v_ac * acres)
-        ratio = (v_ac / price_ac) if price_ac > 0 else 0
+        ratio = (v_ac / price_ac) if (price_ac > 0 and v_ac) else 0
         r["value_ratio"] = round(ratio, 2)
-        # 0-100, saturating: 50 means modelled value equals the asking price,
-        # above 50 is a discount to model, below is a premium. A raw multiple
-        # was unreadable once a ratio ran into the thousands.
-        # sqrt keeps 50 = "worth what it costs" while spreading the useful range:
-        # 1x->50, 2x->59, 4x->67, 9x->75, 16x->80. A plain ratio/(ratio+1) put
-        # nearly every fringe parcel between 88 and 92.
-        _r = max(0.0, ratio) ** 0.5
-        r["value_score"] = round(100 * _r / (_r + 1))
+        r["annual_return"] = round(ann, 4) if ann is not None else None
+        r["annual_return_pct"] = round(ann * 100, 1) if ann is not None else None
+        # Scored on return per year over the chosen holding period, not on present
+        # value across a fixed window. 50 means it hits the target annual return.
+        # A long window let almost any parcel look positive; annualising makes a
+        # slow conversion cost you, which is how land is actually judged.
+        r["value_score"] = MODEL.return_score(ann)
+        r["horizon"] = horizon
         r["p50_years"] = c["p50_years"]
         r["p_convert"] = c["p_convert"].get(horizon)
         r["carry_pct"] = round(cr * 100, 2)
@@ -319,7 +323,7 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres
         where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
     rows = _candidates(" AND ".join(where), tuple(args))
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
-    vals = _valued(rows, p, horizon)
+    vals = _valued(rows, p, _snap_horizon(horizon))
     if min_ratio:
         vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
     if max_price_per_acre:
@@ -330,6 +334,7 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres
         vals = [r for r in vals if r["p50_years"] and r["p50_years"] <= max_years]
     keyf = {"value_ratio": lambda r: r["value_ratio"] or 0,
             "value_score": lambda r: r["value_score"] or 0,
+            "annual_return": lambda r: r["annual_return"] or -1,
             "value_total": lambda r: r["value_total"] or 0,
             "acq_score":   lambda r: r["acq_score"] or 0,
             "soonest":     lambda r: -(r["p50_years"] or 999)}.get(sort,
@@ -352,9 +357,9 @@ def report(apns: str, audience: str = "investor", horizon: int = 10,
     if not rows:
         raise HTTPException(404, "no parcels found")
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
-    vals = _valued(rows, p, horizon)
+    vals = _valued(rows, p, _snap_horizon(horizon))
     vals.sort(key=lambda r: r["value_score"] or 0, reverse=True)
-    html = REPORT.build(vals, audience)
+    html = REPORT.build(vals, audience, _snap_horizon(horizon))
     return Response(html, media_type="text/html")
 
 @app.get("/targets/export")
@@ -380,7 +385,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
         where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
     rows = _candidates(" AND ".join(where), tuple(args))
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
-    vals = _valued(rows, p, horizon)
+    vals = _valued(rows, p, _snap_horizon(horizon))
     if min_ratio:
         vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
     if max_price_per_acre:
@@ -395,7 +400,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     WS = {"A": "A served/assured", "B": "B irrigated ag (SB1611 path)", "C": "C raw groundwater"}
     buf = io.StringIO(); w = csv.writer(buf)
     w.writerow(["APN", "Situs Address", "City", "ZIP", "Use", "Acres",
-                "Price $/Acre", "Modeled Value $/Acre", "Value Score (0-100)", "Value/Price",
+                "Price $/Acre", "Modeled Value $/Acre", "Annual Return %", "Score (0-100)", "Value/Price",
                 "Developer $/Acre", "Water State", "P50 Yrs to Convert",
                 f"P(convert<={horizon}y)", "Carry %/yr",
                 "Owner", "Owner Type", "Absentee", "Years Held", "Acquired", "Paid",
@@ -403,7 +408,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
                 "Landlocked", "Flood Zone", "Site Factor", "Hazard Source"])
     for r in vals:
         w.writerow([r["apn"], r["situs_address"], r["city"], r["zcta"], r["use"], r["acres"],
-                    r["price_per_acre"], r["value_per_acre"], r["value_score"], r["value_ratio"],
+                    r["price_per_acre"], r["value_per_acre"], r["annual_return_pct"], r["value_score"], r["value_ratio"],
                     r["dev_price_per_acre"], WS.get(r["water_state"], r["water_state"]),
                     r["p50_years"] if r["p50_years"] else ">60",
                     round(r["p_convert"], 3) if r["p_convert"] is not None else "",

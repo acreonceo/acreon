@@ -57,7 +57,16 @@ DEFAULTS = {
     "horizon":   30,      # years of simulation
 }
 
-HORIZON_MARKS = (5, 10, 20, 30)
+HORIZON_MARKS = (1, 3, 5, 10, 20, 30)
+HORIZONS = (1, 3, 5, 10, 20, 30)
+
+# What an investor is actually comparing. A parcel is not judged by present value
+# over an arbitrary window: it is judged by what it returns per year over the
+# period capital is tied up. Two parcels can carry the same value-to-price and be
+# completely different investments if one pays in three years and the other in
+# twenty-eight.
+TARGET_RETURN = 0.12      # annual return that scores 50 (judgment, adjustable)
+G_RAW = 0.025             # drift of land that has NOT converted, real terms
 
 
 def water_w(state, t, p, zone_heat=1.0):
@@ -112,6 +121,15 @@ def site_factor(landlocked, flood_zone):
 
 
 def path(growth_index, state, p=None, hazard_override=None):
+    """Hazard path plus HORIZON-LIMITED coefficients.
+
+    coefs["by_h"][H] holds the present-value coefficients counting only what
+    happens inside H years, plus the probability of still holding at H. That is
+    what makes a one-year view and a thirty-year view genuinely different models
+    rather than the same model with different labels: a parcel that will not
+    convert for twenty years contributes nothing to a five-year valuation except
+    the residual value of unconverted dirt.
+    """
     """Precompute the (zone, state) hazard path. Returns the three coefficients
     that make per-parcel valuation two multiplications, plus timing outputs.
 
@@ -132,6 +150,7 @@ def path(growth_index, state, p=None, hazard_override=None):
     carry = 0.0
     p50 = None
     marks = {}
+    by_h = {}
     for t in range(1, T + 1):
         h = h0 * water_w(state, t, p, heat)
         h = max(0.0, min(0.9, h))
@@ -146,7 +165,11 @@ def path(growth_index, state, p=None, hazard_override=None):
             p50 = t
         if t in HORIZON_MARKS:
             marks[t] = converted
+        if t in HORIZONS:
+            by_h[t] = {"payoff": payoff, "carry": carry,
+                       "survive": S, "disc": exp(-p["rho"] * t)}
     return {
+        "by_h": by_h,
         "payoff_coef": payoff,
         "carry_coef": carry,
         "floor_coef": S * exp(-p["rho"] * T),
@@ -154,6 +177,55 @@ def path(growth_index, state, p=None, hazard_override=None):
         "p_convert": marks,               # {5: .., 10: .., 20: .., 30: ..}
         "hazard0": h0,
     }
+
+
+def value_at_horizon(coefs, horizon, d0_per_acre, price_per_acre, carry_rate,
+                     site=1.0, p=None):
+    """Present value per acre of holding for at most `horizon` years.
+
+    Three components: the discounted payoff from conversions occurring inside the
+    window; the residual value of the parcel if it has NOT converted by then,
+    which is simply raw land that has drifted; and the carry paid while waiting.
+    Selling unconverted land at the horizon is what makes a short view punishing:
+    you recover dirt, not a development site.
+    """
+    p = {**DEFAULTS, **(p or {})}
+    h = min(HORIZONS, key=lambda x: abs(x - horizon))
+    c = coefs["by_h"].get(h)
+    if not c:
+        return None
+    d0 = max(0.0, d0_per_acre or 0.0)
+    px = max(0.0, price_per_acre or 0.0)
+    residual = px * exp(G_RAW * h)              # unconverted: still just land
+    return (c["payoff"] * d0 * site
+            + c["survive"] * residual * c["disc"]
+            - c["carry"] * carry_rate * px)
+
+
+def annualised_return(value_pv, price, horizon, p=None):
+    """Expected return per year on capital tied up for `horizon` years.
+
+    value_pv is a present value at the discount rate, so a ratio of 1.0 means the
+    parcel exactly earns that rate. Converting to an annual figure is what
+    separates a quick conversion from a long land bank: the same 2x on capital is
+    about 21%/yr over five years and 8%/yr over thirty.
+    """
+    p = {**DEFAULTS, **(p or {})}
+    if not price or price <= 0 or value_pv is None or horizon <= 0:
+        return None
+    ratio = value_pv / price
+    if ratio <= 0:
+        return -1.0
+    return (1.0 + p["rho"]) * (ratio ** (1.0 / horizon)) - 1.0
+
+
+def return_score(annual, target=TARGET_RETURN):
+    """0-100 on annual return. 50 means it hits the target return; below that it
+    is not worth the capital and the risk."""
+    if annual is None:
+        return 0
+    a = max(0.0, annual)
+    return round(100.0 * a / (a + target))
 
 
 def value_per_acre(coefs, d0_per_acre, hold_value_per_acre, carry_rate, site=1.0):
