@@ -54,7 +54,7 @@ DEFAULTS = {
     "wB0":       0.60,    # State B feasibility today                         (judgment)
     "wB1":       0.90,    # State B feasibility once the program matures      (judgment)
     "lambda_B":  0.15,    # speed State B approaches wB1                      (judgment)
-    "horizon":   60,      # years of simulation
+    "horizon":   30,      # years of simulation
 }
 
 HORIZON_MARKS = (5, 10, 20, 30)

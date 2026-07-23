@@ -163,7 +163,8 @@ def search(q: str = Query(..., min_length=2), limit: int = 12):
 @app.get("/parcels/{apn}")
 def parcel(apn: str):
     rows = qall("""
-      SELECT p.*, z.signals AS zone_signals, z.dev_value_per_acre
+      SELECT p.*, z.signals AS zone_signals, z.dev_value_per_acre,
+             ST_X(p.centroid) AS lon, ST_Y(p.centroid) AS lat
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
       WHERE p.apn = %s
     """, (apn,))

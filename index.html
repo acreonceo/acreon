@@ -71,6 +71,10 @@
   .track:after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.15s}
   .switch input:checked+.track{background:var(--teal)}.switch input:checked+.track:after{transform:translateX(16px)}
   #map{position:relative}
+  .modelbtn{position:absolute;right:12px;top:12px;z-index:6;background:rgba(251,250,246,.97);border:1px solid var(--line-strong);border-radius:9px;padding:7px 12px;font:inherit;font-size:12.5px;font-weight:650;cursor:pointer;box-shadow:0 8px 22px -14px rgba(0,0,0,.5)}
+  .modelbtn[aria-expanded=true]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+  .modelpanel{position:absolute;right:12px;top:50px;z-index:6;width:308px;max-height:calc(100vh - 84px);overflow:auto;background:rgba(251,250,246,.97);border:1px solid var(--line-strong);border-radius:10px;padding:4px 14px 14px;display:none;box-shadow:0 16px 40px -18px rgba(0,0,0,.55)}
+  .modelpanel.on{display:block}
   .legend{position:absolute;left:12px;bottom:12px;z-index:5;background:rgba(251,250,246,.96);border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:11px;box-shadow:0 10px 30px -18px rgba(0,0,0,.4)}
   .legend .bar{width:150px;height:10px;border-radius:3px;background:linear-gradient(90deg,#d73027,#fc8d59,#fee08b,#a6d96a,#1a9850)}
   .legend .row{display:flex;align-items:center;gap:8px}.legend .lbls{display:flex;justify-content:space-between;margin-top:2px;color:var(--ink-soft)}
@@ -88,7 +92,6 @@
       <button data-t="detail" aria-selected="true">Parcel</button>
       <button data-t="targets" aria-selected="false">Targets</button>
       <button data-t="blocks" aria-selected="false">Blocks</button>
-      <button data-t="map" aria-selected="false">Model</button>
     </div>
 
     <div class="body" id="pane-detail">
@@ -116,7 +119,11 @@
       <div id="blockList"></div>
     </div>
 
-    <div class="body" id="pane-map" style="display:none">
+  </aside>
+
+  <div id="map"><div class="tip" id="tip"></div><div class="htip" id="htip"></div>
+    <button class="modelbtn" id="modelBtn" aria-expanded="false">Model assumptions</button>
+    <div class="modelpanel" id="modelPanel">
       <h3>Horizon</h3>
       <div class="seg" id="hzSeg"><button data-h="near">5-yr</button><button data-h="mid" aria-pressed="true">10-yr</button><button data-h="long">30-yr</button></div>
       <h3>Frontier signals</h3>
@@ -128,9 +135,7 @@
       <div id="wparams"></div>
       <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin-top:10px">Water is no longer a flat multiplier. It is a probability that rises with time: served land is feasible now, irrigated ag has a path under SB1611, and raw groundwater land depends on being absorbed by a provider or on policy change.</p>
     </div>
-  </aside>
 
-  <div id="map"><div class="tip" id="tip"></div><div class="htip" id="htip"></div>
     <div class="legend">
       <div style="font-weight:700;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:4px">Growth outlook</div>
       <div class="row"><span>Lower</span><div class="bar"></div><span>Higher</span></div>
@@ -258,8 +263,10 @@ const escAttr=s=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(
 /* ===================== MAP ====================================== */
 let zonesGeo=null;
 const map=new maplibregl.Map({container:"map",center:[-112.2,33.5],zoom:8.2,
-  style:{version:8,sources:{carto:{type:"raster",tiles:["https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"],tileSize:256,attribution:"CARTO, OpenStreetMap"}},
-    layers:[{id:"bg",type:"raster",source:"carto"}]}});
+  style:{version:8,sources:{
+      sat:{type:"raster",tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],tileSize:256,attribution:"Esri, Maxar, Earthstar Geographics"},
+      labels:{type:"raster",tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"],tileSize:256,attribution:"Esri"}},
+    layers:[{id:"bg",type:"raster",source:"sat"}]}});
 const tip=document.getElementById("tip"), htip=document.getElementById("htip");
 function showTip(e,html){tip.innerHTML=html;const r=map.getContainer().getBoundingClientRect();
   tip.style.left=Math.min(e.point.x+12,r.width-236)+"px";tip.style.top=(e.point.y+12)+"px";tip.style.opacity=1;}
@@ -333,18 +340,24 @@ map.on("load",()=>{
     map.addSource("zones",{type:"geojson",data:gj});
     const below=map.getLayer("parcels-fill")?"parcels-fill":undefined;
     map.addLayer({id:"zones-fill",type:"fill",source:"zones",
-      paint:{"fill-color":["get","c"],"fill-opacity":zoneOpacityExpr(0.55)}},below);
-    map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#fff","line-width":.6,"line-opacity":.7}},below);
+      paint:{"fill-color":["get","c"],"fill-opacity":zoneOpacityExpr(0.38)}},below);
+    map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#fff","line-width":.7,"line-opacity":.5}},below);
     map.on("mousemove","zones-fill",e=>{const p=e.features[0].properties;
       showTip(e,`<b>${p.zcta}</b><br>frontier heat ${Math.round(p.g)}<br>developer land ${p.dev_value_per_acre?money(p.dev_value_per_acre)+"/ac":"n/a"}`);});
     map.on("mouseleave","zones-fill",hideTip);
   });
   map.addSource("parcels",{type:"vector",tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt"],minzoom:6,maxzoom:16});
   map.addLayer({id:"parcels-fill",type:"fill",source:"parcels","source-layer":"parcels",
-    paint:{"fill-color":parcelColorExpr(),"fill-opacity":.85,"fill-outline-color":"#fff"}});
+    paint:{"fill-color":parcelColorExpr(),"fill-opacity":.55,"fill-outline-color":"#fff"}});
   map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",filter:["==","$type","Point"],
     paint:{"circle-radius":["interpolate",["linear"],["zoom"],8,2.4,14,6],
       "circle-color":parcelColorExpr(),"circle-stroke-color":"#fff","circle-stroke-width":.7}});
+  map.addLayer({id:"labels",type:"raster",source:"labels",paint:{"raster-opacity":0.85}});
+  map.addSource("selected",{type:"geojson",data:{type:"FeatureCollection",features:[]}});
+  map.addLayer({id:"selected-ring",type:"circle",source:"selected",
+    paint:{"circle-radius":9,"circle-color":"#000","circle-opacity":0,"circle-stroke-color":"#fff","circle-stroke-width":2.5}});
+  map.addLayer({id:"selected-dot",type:"circle",source:"selected",
+    paint:{"circle-radius":5,"circle-color":"#000","circle-stroke-color":"#fff","circle-stroke-width":1.5}});
   map.addSource("targets",{type:"geojson",data:{type:"FeatureCollection",features:[]}});
   map.addLayer({id:"targets-halo",type:"circle",source:"targets",paint:{"circle-radius":12,"circle-color":"#1b1915","circle-opacity":.08}});
   map.addLayer({id:"targets-dot",type:"circle",source:"targets",
@@ -366,7 +379,16 @@ map.on("load",()=>{
 
 /* ===================== PARCEL DETAIL ============================ */
 async function openParcel(apn){ showTab("detail"); selApn=apn;
-  const p=await (await fetch(API+"/parcels/"+apn)).json(); renderDetail(p); }
+  const p=await (await fetch(API+"/parcels/"+apn)).json();
+  markSelected(p); renderDetail(p); }
+
+function markSelected(p){
+  const src=map.getSource("selected"); if(!src) return;
+  if(p && p.lon!=null && p.lat!=null){
+    src.setData({type:"FeatureCollection",features:[{type:"Feature",
+      geometry:{type:"Point",coordinates:[+p.lon,+p.lat]},properties:{apn:p.apn}}]});
+  } else src.setData({type:"FeatureCollection",features:[]});
+}
 
 function renderDetail(p){
   curP=p;
@@ -432,7 +454,7 @@ function updateValuationUI(){
     <div class="sub" style="margin-top:6px">Value is the discounted expectation of one conversion payoff, not compounded appreciation. Land sits flat, then steps up.</div>`;
 
   drawConversion(c);
-  const p50=c.p50?`${c.p50} yrs`:"beyond 60 yrs";
+  const p50=c.p50?`${c.p50} yrs`:"beyond 30 yrs";
   document.getElementById("timing").innerHTML=`
     <div class="kv"><span class="k">Even odds of converting</span><span class="v">${p50}</span>
       <span class="k">Chance within ${H} yrs</span><span class="v">${pct(c.marks[H]||0)}</span>
@@ -461,7 +483,7 @@ function drawConversion(c){
   const X=t=>PL+(t/T)*(W-PL-PR), Y=v=>PT+(1-v)*(H-PT-PB);
   let d="";for(let t=0;t<T;t++) d+=(t?"L":"M")+X(t+1).toFixed(1)+" "+Y(c.curve[t]).toFixed(1);
   let gl="";[0.25,0.5,0.75,1].forEach(v=>{gl+=`<line x1="${PL}" y1="${Y(v).toFixed(1)}" x2="${W-PR}" y2="${Y(v).toFixed(1)}" stroke="#e6dfcf"/><text x="${PL-4}" y="${(Y(v)+3).toFixed(1)}" text-anchor="end" font-size="8.5" fill="#8b8579">${v*100}%</text>`;});
-  let xl="";[10,20,30,40,60].forEach(t=>{xl+=`<text x="${X(t).toFixed(1)}" y="${H-7}" text-anchor="middle" font-size="8.5" fill="#8b8579">${t}y</text>`;});
+  let xl="";[5,10,15,20,25,30].forEach(t=>{xl+=`<text x="${X(t).toFixed(1)}" y="${H-7}" text-anchor="middle" font-size="8.5" fill="#8b8579">${t}y</text>`;});
   const marker=c.p50?`<line x1="${X(c.p50).toFixed(1)}" y1="${PT}" x2="${X(c.p50).toFixed(1)}" y2="${H-PB}" stroke="#2f6f6a" stroke-dasharray="4 3"/><text x="${(X(c.p50)+4).toFixed(1)}" y="${PT+10}" font-size="9" fill="#2f6f6a">even odds ${c.p50}y</text>`:"";
   document.getElementById("chart").innerHTML=
     `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${gl}${xl}${marker}<path d="${d}" fill="none" stroke="#8c2d1a" stroke-width="2.2"/></svg>
@@ -539,7 +561,7 @@ async function loadTargets(){
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
       <div class="r1"><span>${r.situs_address||r.apn}</span><span class="pill" style="background:${ratioRamp(r.value_ratio)}">${r.value_score ?? valueScore(r.value_ratio||0)}</span></div>
       <div class="r2"><span>${r.use} · ${(+r.acres).toLocaleString()} ac · <b>${money(r.price_per_acre)}/ac</b></span><span>${money(r.value_per_acre)}/ac value</span></div>
-      <div class="r2"><span style="color:${WSCOL[r.water_state]}">${WSLBL[r.water_state]}</span><span>${r.p50_years?("even odds "+r.p50_years+"y"):">60y"} · held ${r.tenure??"?"}y</span></div>
+      <div class="r2"><span style="color:${WSCOL[r.water_state]}">${WSLBL[r.water_state]}</span><span>${r.p50_years?("even odds "+r.p50_years+"y"):">30y"} · held ${r.tenure??"?"}y</span></div>
     </div>`).join("");
   targetsDirty=false;
   el.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{
@@ -595,14 +617,24 @@ function showTab(t){
   document.getElementById("pane-detail").style.display=t==="detail"?"block":"none";
   document.getElementById("pane-targets").style.display=t==="targets"?"block":"none";
   document.getElementById("pane-blocks").style.display=t==="blocks"?"block":"none";
-  document.getElementById("pane-map").style.display=t==="map"?"block":"none";
   const lm=document.getElementById("legMode");
-  if(lm) lm.textContent=t==="targets"?"parcels by value score":(t==="blocks"?"owner land blocks":"zones by frontier heat");
+  if(lm) lm.textContent=t==="targets"?"parcels by value score":(t==="blocks"?"owner land blocks":"parcels by value score");
   if(t==="targets"){ if(targetsDirty||!document.getElementById("targetList").children.length) loadTargets(); }
   else if(t==="blocks"){ if(blocksDirty||!document.getElementById("blockList").children.length) loadBlocks(); }
   else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
 }
 document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.t)));
+
+// Model assumptions live over the map rather than in a tab, so weights and
+// water parameters can be moved while a parcel or the target list is open and
+// the numbers update underneath.
+const mBtn=document.getElementById("modelBtn"), mPanel=document.getElementById("modelPanel");
+mBtn.addEventListener("click",()=>{
+  const on=mPanel.classList.toggle("on");
+  mBtn.setAttribute("aria-expanded",on);
+});
+document.addEventListener("keydown",e=>{ if(e.key==="Escape" && mPanel.classList.contains("on")){
+  mPanel.classList.remove("on"); mBtn.setAttribute("aria-expanded","false"); }});
 
 document.getElementById("assumeBox").innerHTML='<h3 style="margin:4px 0 6px">Assumptions</h3><div id="asld"></div>';
 buildAssume(); buildWaterParams(); buildWeights();
