@@ -25,16 +25,37 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # fails the API still starts and simply serves an empty map.
 _here = pathlib.Path(__file__).resolve().parent
 
+SCHEMA_STATUS = {"state": "not run"}
+
+def _apply_schema():
+    """Apply schema.sql statement by statement, each in its own transaction.
+
+    Previously every statement shared one transaction, so a single failure rolled
+    back the whole file and any newly added ALTER TABLE lines never landed. The
+    startup handler then swallowed the error, so a migration could silently not
+    happen and only surface later as a missing column mid-ingest. Each statement
+    now stands alone and failures are recorded rather than hidden.
+    """
+    global SCHEMA_STATUS
+    ddl = (_here / "schema.sql").read_text()
+    body = "\n".join(l for l in ddl.splitlines() if not l.strip().startswith("--"))
+    stmts = [x.strip() for x in body.split(";") if x.strip()]
+    ok, failed = 0, []
+    for st in stmts:
+        try:
+            with pool.connection() as c:
+                c.execute(st)
+                c.commit()
+            ok += 1
+        except Exception as e:
+            failed.append({"sql": st[:90].replace("\n", " "), "error": str(e)[:140]})
+    SCHEMA_STATUS = {"state": "done", "applied": ok, "failed": len(failed), "errors": failed[:8]}
+    return SCHEMA_STATUS
+
 def _init_db():
     import transform as T
-    ddl = (_here / "schema.sql").read_text()
-    stmts = [s.strip() for s in "\n".join(
-        l for l in ddl.splitlines() if not l.strip().startswith("--")
-    ).split(";") if s.strip()]
+    _apply_schema()
     with pool.connection() as c:
-        for s in stmts:
-            c.execute(s)
-        c.commit()
         zn = c.execute("SELECT count(*) FROM zones").fetchone()[0]
         if zn == 0:
             zones = json.load(open(_here / "scored_zctas.json"))["features"]
@@ -51,7 +72,7 @@ def _init_db():
         pn = c.execute("SELECT count(*) FROM parcels").fetchone()[0]
         if pn == 0 and (_here / "parcels.json").exists():
             parcels = json.load(open(_here / "parcels.json"))
-            zsig = {z: json.loads(s) for z, s in
+            zsig = {z: json.loads(sg) for z, sg in
                     c.execute("SELECT zcta, signals::text FROM zones").fetchall()}
             with c.cursor() as cur:
                 for p in parcels:
@@ -500,6 +521,18 @@ def _zip_bbox(zcta):
             walk(x)
     walk(f["geometry"]["coordinates"])
     return (min(xs), min(ys), max(xs), max(ys))
+
+@app.get("/admin/migrate")
+def admin_migrate(token: str):
+    """Force schema.sql to be applied and report exactly what landed and what did
+    not. Run this after any deploy that adds columns."""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    res = _apply_schema()
+    cols = qall("""SELECT column_name FROM information_schema.columns
+                   WHERE table_name='parcels' ORDER BY column_name""")
+    res["parcel_columns"] = [c["column_name"] for c in cols]
+    return res
 
 @app.get("/admin/probe")
 def admin_probe(token: str, zip: str = "85326"):
