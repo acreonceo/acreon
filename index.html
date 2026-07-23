@@ -176,25 +176,39 @@ const zoneOpacityExpr=(m)=>["interpolate",["linear"],["zoom"],8,m,11.5,m*0.55,13
 // + 0.2*land type, evaluated in the style expression (GPU-side) so it stays fast
 // with the whole county loaded. Zone growth is injected as a zcta->growth match.
 function liveTargetExpr(){
-  const m=["match",["get","zcta"]];
+  const pairs=[];
   if(zonesGeo){
     const seen=new Set();
-    zonesGeo.features.forEach(f=>{const z=f.properties.zcta;
-      if(z&&!seen.has(z)){seen.add(z); m.push(z, +growthOf(f.properties.signals).toFixed(1));}});
+    zonesGeo.features.forEach(f=>{const z=f.properties&&f.properties.zcta;
+      if(z!=null){const k=String(z); if(!seen.has(k)){seen.add(k); pairs.push(k, +growthOf(f.properties.signals).toFixed(1));}}});
   }
-  m.push(0);                                   // default when zone unknown
-  const growth=m;
+  // "match" needs at least one label; with none, fall back to the stored score
+  const growth = pairs.length ? ["match",["to-string",["get","zcta"]],...pairs,0]
+                              : ["to-number",["get","growth_score"],0];
   const tenureBase=["min",100,["max",0,["*",["-",["to-number",["get","tenure"],0],2],4.2]]];
-  const ownerF=["match",["get","owner_type"],"Builder/Developer",0.35,"Investor",0.8,1.0];
-  const useS=["match",["get","use"],"Vacant",100,"Agricultural",85,25];
+  const ownerF=["match",["to-string",["get","owner_type"]],"Builder/Developer",0.35,"Investor",0.8,1.0];
+  const useS=["match",["to-string",["get","use"]],"Vacant",100,"Agricultural",85,25];
   return ["+",["*",0.5,growth],["*",0.3,["*",tenureBase,ownerF]],["*",0.2,useS]];
 }
 const PARCEL_RAMP=[0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"];
-function parcelColorExpr(){ return ["interpolate",["linear"],liveTargetExpr(),...PARCEL_RAMP]; }
+// If the live expression is ever invalid, fall back to the server's stored score
+// so parcels always render instead of silently disappearing.
+const FALLBACK_COLOR=["interpolate",["linear"],["to-number",["get","target_score"],0],...PARCEL_RAMP];
+function parcelColorExpr(){
+  try{ return ["interpolate",["linear"],liveTargetExpr(),...PARCEL_RAMP]; }
+  catch(e){ console.warn("live color expr failed; using stored score",e); return FALLBACK_COLOR; }
+}
 const weightsParam=()=>SIGS.map(k=>k+":"+weights[k]).join(",");
 function repaintParcels(){
-  if(map.getLayer("parcels-fill")) map.setPaintProperty("parcels-fill","fill-color",parcelColorExpr());
-  if(map.getLayer("parcels-pt"))   map.setPaintProperty("parcels-pt","circle-color",parcelColorExpr());
+  const expr=parcelColorExpr();
+  try{
+    if(map.getLayer("parcels-fill")) map.setPaintProperty("parcels-fill","fill-color",expr);
+    if(map.getLayer("parcels-pt"))   map.setPaintProperty("parcels-pt","circle-color",expr);
+  }catch(e){
+    console.warn("repaint failed; reverting to stored score",e);
+    if(map.getLayer("parcels-fill")) map.setPaintProperty("parcels-fill","fill-color",FALLBACK_COLOR);
+    if(map.getLayer("parcels-pt"))   map.setPaintProperty("parcels-pt","circle-color",FALLBACK_COLOR);
+  }
 }
 
 function forecast(p){
