@@ -158,6 +158,7 @@ const PRESETS={near:{developable_land:20,permit_velocity:85,zoning_activity:70,i
 const GATE={assured:1.0,alternative_pending:0.7,groundwater_constrained:0.3};
 const HZY={near:5,mid:10,long:20};
 let weights={...PRESETS.mid}, horizon="mid", gateOn=true, selApn=null;
+let targetsDirty=false, blocksDirty=false;   // server-ranked lists need reload after weight changes
 const ASM={base:.035,opt:1.0,hurdle:.07,sell:.08,carry:.007}, SP=.07, JUMP=.5;
 
 function growthOf(sig){ if(!sig) return 0; let n=0,d=0; for(const k of SIGS){const v=Number(sig[k])||0; n+=weights[k]*v; d+=weights[k];}
@@ -417,6 +418,7 @@ async function loadTargets(){
       <div class="r1"><span>${r.situs_address}</span><span class="pill" style="background:${ramp(r.target_score)}">${Math.round(r.target_score)}</span></div>
       <div class="r2"><span>${r.use} &middot; ${r.acres} ac &middot; <b>${r.acres?money(r.est/r.acres)+"/ac":"n/a"}</b> &middot; held ${r.tenure??"?"}y</span><span>${money(r.est)}</span></div></div>`).join("")
     ||`<div class="empty">No targets match these filters.</div>`;
+  targetsDirty=false;
   document.querySelectorAll("#targetList .card").forEach(c=>c.addEventListener("click",()=>{openParcel(c.dataset.apn);map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
   const src=map.getSource("targets");
   if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
@@ -439,7 +441,11 @@ function buildWeights(){
   document.getElementById("gate").addEventListener("change",e=>{gateOn=e.target.checked;afterWeights();});
   document.getElementById("heatOp").addEventListener("input",e=>{if(map.getLayer("zones-fill"))map.setPaintProperty("zones-fill","fill-opacity",zoneOpacityExpr(+e.target.value/100));});
 }
+// Weight changes invalidate the server-ranked lists. The sliders live on the
+// Heatmap tab, so the lists are usually hidden when they change: mark them dirty
+// and reload on the next view, or immediately if already showing.
 function afterWeights(){ recolorZones(); repaintParcels(); if(selApn) refreshDetail();
+  targetsDirty=true; blocksDirty=true;
   if(document.getElementById("pane-targets").style.display!=="none") loadTargets();
   if(document.getElementById("pane-blocks").style.display!=="none") loadBlocks(); }
 
@@ -451,8 +457,8 @@ function showTab(t){
   document.getElementById("pane-blocks").style.display=t==="blocks"?"block":"none";
   document.getElementById("pane-map").style.display=t==="map"?"block":"none";
   document.getElementById("legMode").textContent=t==="targets"?"by target score":(t==="blocks"?"owner land blocks":"shaded by ZIP region");
-  if(t==="targets"){ if(!document.getElementById("targetList").children.length) loadTargets(); }
-  else if(t==="blocks"){ if(!document.getElementById("blockList").children.length) loadBlocks(); }
+  if(t==="targets"){ if(targetsDirty || !document.getElementById("targetList").children.length) loadTargets(); }
+  else if(t==="blocks"){ if(blocksDirty || !document.getElementById("blockList").children.length) loadBlocks(); }
   else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
 }
 
@@ -469,6 +475,7 @@ async function loadBlocks(){
       <div class="r2"><span><b>${r.parcel_count} parcels</b> &middot; ${(+r.total_acres).toLocaleString()} ac &middot; <b>${r.per_acre?money(r.per_acre)+"/ac":"n/a"}</b></span><span>${money(r.total_est)}</span></div>
       <div class="r2"><span>${r.city||""} ${r.zcta||""} &middot; held up to ${r.max_tenure??"?"}y</span><span>${r.owner_type}</span></div>
     </div>`).join("");
+  blocksDirty=false;
   el.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{
     map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});
     if(c.dataset.apn) openParcel(c.dataset.apn);
