@@ -259,12 +259,15 @@ function valueOf(p){
   const cr=(p.carry_rate!==null&&p.carry_rate!==undefined)?+p.carry_rate:0.003;
   const site=siteFactor(p), H=holdYears, k=c.byH[H];
   if(!k) return null;
+  const zmed=+p.median_price_per_acre||0;
+  const priceOK = price>=250 && (zmed<=0 || price>=0.15*zmed);
   const residual=price*Math.exp(G_RAW*H);
   const v=k.payoff*d0*site + k.survive*residual*k.disc - k.carry*cr*price;
   const ratio=price>0?v/price:0;
-  const ann=(price>0&&ratio>0)?(1+ASM.rho)*Math.pow(ratio,1/H)-1:-1;
+  let ann=(price>0&&ratio>0)?(1+ASM.rho)*Math.pow(ratio,1/H)-1:-1;
+  ann=Math.min(ann,2.0);                       // 200%/yr display ceiling
   return {gi,state:st,price,d0,carry:cr,v,ratio,ann,score:returnScore(ann),H,
-          path:c,acres,est,site,fitted:hf!==null}; }
+          path:c,acres,est,site,fitted:hf!==null,priceOK}; }
 
 function acqOf(p){
   let z=-1.20+0.045*Math.min(40,p.tenure||0);
@@ -350,6 +353,35 @@ function parcelColorExpr(){
     return ["interpolate",["linear"],ratioE,...stops];
   }catch(e){ console.warn("value colour expression failed; using stored score",e); return FALLBACK_COLOR; }
 }
+// The map shows the same population the Targets list does. Filtering the list
+// without filtering the map left you reading two different universes.
+function mapFilterExpr(){
+  const f=["all"];
+  const use=val("fUse");        if(use) f.push(["==",["get","use"],use]);
+  const ot=val("fOwner");       if(ot)  f.push(["==",["get","owner_type"],ot]);
+  const ws=val("fWater");       if(ws)  f.push(["==",["get","water_state"],ws]);
+  const mn=+val("fAcres")||0;   if(mn)  f.push([">=",["to-number",["get","acres"],0],mn]);
+  const mx=+val("fAcresMax")||0;if(mx)  f.push(["<=",["to-number",["get","acres"],0],mx]);
+  const tn=+val("fTen")||0;     if(tn)  f.push([">=",["to-number",["get","tenure"],0],tn]);
+  const tot=+val("fTotal")||0;  if(tot) f.push(["<=",["to-number",["get","est"],0],tot]);
+  const ppa=+val("fPpa")||0;
+  const perAcre=["/",["to-number",["get","est"],0],["max",0.01,["to-number",["get","acres"],1]]];
+  if(ppa) f.push(["<=",perAcre,ppa]);
+  if(val("fAbs")) f.push(["==",["get","absentee"],true]);
+  // same two exclusions the list applies: builders are not sellers, and
+  // nominal assessments are not prices
+  f.push(["!=",["get","owner_type"],"Builder/Developer"]);
+  f.push(["==",["to-number",["get","price_ok"],0],1]);
+  return f;
+}
+function applyMapFilter(){
+  const f=mapFilterExpr();
+  try{
+    if(map.getLayer("parcels-fill")) map.setFilter("parcels-fill",f);
+    if(map.getLayer("parcels-pt"))   map.setFilter("parcels-pt",["all",["==","$type","Point"],...f.slice(1)]);
+  }catch(e){ console.warn("map filter failed",e); }
+}
+
 function repaintParcels(){
   const expr=parcelColorExpr();
   try{
@@ -384,6 +416,7 @@ map.on("load",()=>{
     paint:{"circle-radius":9,"circle-color":"#000","circle-opacity":0,"circle-stroke-color":"#fff","circle-stroke-width":2.5}});
   map.addLayer({id:"selected-dot",type:"circle",source:"selected",
     paint:{"circle-radius":5,"circle-color":"#000","circle-stroke-color":"#fff","circle-stroke-width":1.5}});
+  setTimeout(applyMapFilter,0);
   map.addSource("targets",{type:"geojson",data:{type:"FeatureCollection",features:[]}});
   map.addLayer({id:"targets-halo",type:"circle",source:"targets",paint:{"circle-radius":12,"circle-color":"#1b1915","circle-opacity":.08}});
   map.addLayer({id:"targets-dot",type:"circle",source:"targets",
@@ -455,8 +488,11 @@ function updateValuationUI(){
   const verdictCol = over?"var(--bad)":(fair?"var(--warn)":"var(--good)");
 
   document.getElementById("badges").innerHTML=
-     `<span class="pill" style="background:${ratioRamp(V.ann)}" data-tip="${escAttr(
+     (V.priceOK
+      ? `<span class="pill" style="background:${ratioRamp(V.ann)}" data-tip="${escAttr(
         `${(V.ann*100).toFixed(1)}% per year over a ${V.H}-year hold, scoring ${V.score} of 100 where 50 is a ${(TARGET_RETURN*100).toFixed(0)}% target. Modelled ${money(V.v)}/ac against ${money(V.price)}/ac asking. Change the holding period in Model assumptions and this moves: a parcel that will not convert for twenty years earns little on a five-year view, because you would be selling unconverted dirt.`)}">${(V.ann*100).toFixed(0)}%/yr &middot; ${V.score}</span>`
+      : `<span class="pill" style="background:#7a2718" data-tip="${escAttr(
+          `The assessed value on this parcel is ${money(V.price)} per acre, far below what land trades for in this ZIP. That is a nominal or remnant assessment, not a market price, so any return computed against it would be meaningless. The parcel is excluded from rankings until a real price is known.`)}">No credible price</span>`)
     +`<span class="pill" style="background:${WSCOL[V.state]}" data-tip="${escAttr(
         `${WSLBL[V.state]}. A: inside a designated provider or holding an assured-supply certificate, developable now. B: irrigated agricultural land whose grandfathered irrigation right can be relinquished under SB1611 (2025) for groundwater savings credits usable within one mile. C: raw groundwater-dependent land, blocked for subdivision since ADWR halted groundwater-based assured-supply applications in 2023, and dependent on being absorbed by a provider or on policy change.`)}">${WSLBL[V.state]}</span>`
     +`<span class="pill" style="background:#5b564d" data-tip="${escAttr(
@@ -624,7 +660,7 @@ async function loadTargets(){
     geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.value_ratio||0}}))});
 }
 ["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fSort"]
-  .forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
+  .forEach(id=>document.getElementById(id).addEventListener("change",()=>{ applyMapFilter(); loadTargets(); }));
 document.getElementById("selAll").addEventListener("change",e=>{
   document.querySelectorAll("#targetList .selbox").forEach(b=>{
     b.checked=e.target.checked;

@@ -27,6 +27,12 @@ _here = pathlib.Path(__file__).resolve().parent
 
 SCHEMA_STATUS = {"state": "not run"}
 
+# Assessments below this, or far below what neighbouring land carries, are
+# nominal or remnant values rather than market prices. They are excluded from
+# rankings because a near-zero denominator sends them straight to the top.
+MIN_CREDIBLE_PPA = 250.0
+MAX_REPORTED_RETURN = 2.0        # 200%/yr display ceiling
+
 # Columns the code writes to. Declared here rather than relying on schema.sql
 # having been uploaded, because a stale schema file means a job fails thousands
 # of rows into a long ingest with a missing-column error. Every job that writes
@@ -36,7 +42,7 @@ REQUIRED_PARCEL_COLUMNS = {
     "edge_miles": "numeric", "hazard_fitted": "numeric", "landlocked": "boolean",
     "flood_zone": "text", "zoning": "text", "jurisdiction": "text",
 }
-REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric"}
+REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric", "median_price_per_acre": "numeric"}
 
 def _ensure_columns():
     added = []
@@ -163,6 +169,11 @@ TILE_SQL = """
 WITH b AS (SELECT ST_TileEnvelope(%(z)s,%(x)s,%(y)s) g)
 SELECT ST_AsMVT(t,'parcels') FROM (
   SELECT p.apn, p.use, p.status, p.acres, p.zcta,
+         (CASE WHEN p.acres > 0 AND p.est > 0
+                AND p.est / p.acres >= 250
+                AND (z.median_price_per_acre IS NULL
+                     OR p.est / p.acres >= 0.15 * z.median_price_per_acre)
+               THEN 1 ELSE 0 END) AS price_ok,
          coalesce(p.tenure,0)::int AS tenure,
          p.owner_type,
          p.est::bigint AS est,
@@ -173,7 +184,7 @@ SELECT ST_AsMVT(t,'parcels') FROM (
          round(p.target_score)::int AS target_score,
          round(p.growth_score)::int AS growth_score,
          ST_AsMVTGeom(ST_Transform(p.geom,3857), b.g) geom
-  FROM parcels p, b
+  FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta, b
   WHERE ST_Transform(p.geom,3857) && b.g
     AND ( %(z)s >= 13
           OR (p.use IN ('Vacant','Agricultural')
@@ -298,7 +309,7 @@ def _candidates(where_sql, params):
              p.mail_address, COALESCE(p.water_state,'C') AS water_state,
              p.carry_rate, p.hazard_fitted, p.landlocked, p.flood_zone, p.edge_miles,
              p.zoning, p.jurisdiction,
-             z.signals AS signals, z.dev_value_per_acre,
+             z.signals AS signals, z.dev_value_per_acre, z.median_price_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
       WHERE {where_sql}
@@ -325,6 +336,8 @@ def _valued(rows, p, horizon=10):
         price_ac = est / acres
         d0 = float(r["dev_value_per_acre"] or 0) or price_ac * 3.0
         cr = float(r["carry_rate"]) if r["carry_rate"] is not None else MODEL.carry_rate(est, r["assessed"])
+        zmed = float(r.get("median_price_per_acre") or 0)
+        price_ok = price_ac >= MIN_CREDIBLE_PPA and (zmed <= 0 or price_ac >= 0.15 * zmed)
         v_ac = MODEL.value_at_horizon(c, horizon, d0, price_ac, cr, site, p)
         ann = MODEL.annualised_return(v_ac, price_ac, horizon, p)
         r["growth_index"] = round(gi, 1)
@@ -334,13 +347,20 @@ def _valued(rows, p, horizon=10):
         r["value_total"] = round(v_ac * acres)
         ratio = (v_ac / price_ac) if (price_ac > 0 and v_ac) else 0
         r["value_ratio"] = round(ratio, 2)
-        r["annual_return"] = round(ann, 4) if ann is not None else None
-        r["annual_return_pct"] = round(ann * 100, 1) if ann is not None else None
+        r["price_reliable"] = price_ok
+        # An unreliable denominator makes the ratio meaningless, so the return is
+        # withheld rather than printed as a headline number.
+        if ann is not None and price_ok:
+            r["annual_return"] = round(min(ann, MAX_REPORTED_RETURN), 4)
+            r["annual_return_pct"] = round(min(ann, MAX_REPORTED_RETURN) * 100, 1)
+        else:
+            r["annual_return"] = None
+            r["annual_return_pct"] = None
         # Scored on return per year over the chosen holding period, not on present
         # value across a fixed window. 50 means it hits the target annual return.
         # A long window let almost any parcel look positive; annualising makes a
         # slow conversion cost you, which is how land is actually judged.
-        r["value_score"] = MODEL.return_score(ann)
+        r["value_score"] = MODEL.return_score(min(ann, MAX_REPORTED_RETURN)) if (ann is not None and price_ok) else None
         r["horizon"] = horizon
         r["p50_years"] = c["p50_years"]
         r["p_convert"] = c["p_convert"].get(horizon)
@@ -357,7 +377,7 @@ def _valued(rows, p, horizon=10):
 def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
             min_tenure: int = 0, water_state: str = "", include_public: bool = False,
             absentee: bool = False, city: str = "", zcta: str = "",
-            include_builders: bool = False,
+            include_builders: bool = False, include_unpriced: bool = False,
             max_price_per_acre: float = 0, max_total_price: float = 0,
             min_score: int = 0, max_years: int = 0,
             min_ratio: float = 0, horizon: int = 10,
@@ -384,6 +404,8 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres
     rows = _candidates(" AND ".join(where), tuple(args))
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
+    if not include_unpriced:
+        vals = [r for r in vals if r.get("price_reliable")]
     if min_ratio:
         vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
     if max_price_per_acre:
@@ -451,6 +473,8 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     rows = _candidates(" AND ".join(where), tuple(args))
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
+    if not include_unpriced:
+        vals = [r for r in vals if r.get("price_reliable")]
     if min_ratio:
         vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
     if max_price_per_acre:
@@ -1051,7 +1075,9 @@ own AS (
   WHERE water_state = 'A' AND acres >= 1 AND est > 0
   GROUP BY zcta HAVING count(*) >= 3
 )
-UPDATE zones z SET dev_value_per_acre = LEAST(
+UPDATE zones z SET
+  median_price_per_acre = (SELECT med_all FROM base WHERE base.zcta = z.zcta),
+  dev_value_per_acre = LEAST(
   COALESCE(
     (SELECT v FROM own WHERE own.zcta = z.zcta),
     (SELECT avg(t.v) FROM (
