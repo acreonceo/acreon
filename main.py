@@ -1206,11 +1206,12 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
             SIGNAL_STATUS = {"state": "error", "kind": "hazard", "detail": f"panel too small ({len(rows)} rows)"}
             return
         SIGNAL_STATUS["detail"] = f"fitting on {len(rows):,} parcel-periods"
-        X = [HZ.design_row(int(p), float(d), float(a) if a else 1.0) for p, e, a, d in rows]
+        bins, counts, exposure = HZ.pool_bins(rows)
+        X = [HZ.design_row(int(p), float(d), float(a) if a else 1.0, bins) for p, e, a, d in rows]
         y = [int(e) for p, e, a, d in rows]
         coefs = HZ.fit_logit(X, y)
         events = sum(y)
-        summary = HZ.summarize(coefs)
+        summary = HZ.summarize(coefs, bins, counts, exposure)
 
         SIGNAL_STATUS["detail"] = "scoring parcels with the fitted hazard"
         cur_year = 2025
@@ -1226,11 +1227,12 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
                 cur.execute("INSERT INTO model_fit(key,payload) VALUES('hazard',%s::jsonb) "
                             "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, fitted_at=now()",
                             (json.dumps({"coefs": coefs, "summary": summary, "n": len(rows),
-                                         "events": events, "periods": HZ.PERIODS}),))
+                                         "events": events, "periods": HZ.PERIODS,
+                                         "bins": bins}),))
                 rows2 = cur.execute("SELECT apn, edge_miles, acres FROM parcels WHERE edge_miles IS NOT NULL").fetchall()
                 upd = []
                 for apn, d, ac in rows2:
-                    p5 = HZ.predict_p5(coefs, HZ.PERIODS[-1], float(d), float(ac) if ac else 1.0)
+                    p5 = HZ.predict_p5(coefs, HZ.PERIODS[-1], float(d), float(ac) if ac else 1.0, bins)
                     upd.append((HZ.annual_hazard(p5), apn))
                 cur.executemany("UPDATE parcels SET hazard_fitted=%s WHERE apn=%s", upd)
             c.commit()
@@ -1248,9 +1250,13 @@ LANDLOCK_SQL = """
 UPDATE parcels p SET landlocked = COALESCE(sub.shared, 0) > 0.97
 FROM (
   SELECT p2.apn,
-         ST_Length(ST_Intersection(ST_Boundary(p2.geom),
-                                   ST_Buffer(ST_Union(n.geom), 0.00002))::geography)
-           / NULLIF(ST_Perimeter(p2.geom::geography), 0) AS shared
+         LEAST(1.0,
+           SUM(ST_Length(ST_Intersection(
+                 ST_Boundary(ST_CollectionExtract(ST_MakeValid(p2.geom), 3)),
+                 ST_Buffer(ST_CollectionExtract(ST_MakeValid(n.geom), 3), 0.00002)
+               )::geography))
+           / NULLIF(ST_Perimeter(ST_CollectionExtract(ST_MakeValid(p2.geom), 3)::geography), 0)
+         ) AS shared
   FROM parcels p2
   JOIN parcels n ON n.apn <> p2.apn AND ST_DWithin(p2.geom, n.geom, 0.00002)
   WHERE ST_GeometryType(p2.geom) IN ('ST_Polygon','ST_MultiPolygon')
@@ -1259,6 +1265,12 @@ FROM (
 WHERE p.apn = sub.apn;
 UPDATE parcels SET landlocked = false WHERE landlocked IS NULL;
 """
+# NOTE: county parcel fabrics contain self-intersecting rings and slivers, so
+# every geometry is repaired with ST_MakeValid and reduced to polygons before
+# use. Neighbours are buffered ~2m rather than unioned: ST_Union over a set
+# containing one bad polygon throws a topology exception and kills the whole
+# job, and per-neighbour intersection avoids that entirely. Corner overlaps can
+# double-count a metre or two, which LEAST(1.0, ...) absorbs.
 
 def _fetch_flood(bbox, cap=40000):
     geoms, offset = [], 0

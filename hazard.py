@@ -44,23 +44,54 @@ DIST_BINS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]   # miles; 7 bins including the tai
 PERIODS = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
 
 
-def bin_index(miles):
+MIN_EVENTS_PER_BIN = 40
+
+
+def bin_index(miles, bins=None):
+    bins = DIST_BINS if bins is None else bins
     if miles is None:
-        return len(DIST_BINS)
-    for i, edge in enumerate(DIST_BINS):
+        return len(bins)
+    for i, edge in enumerate(bins):
         if miles < edge:
             return i
-    return len(DIST_BINS)
+    return len(bins)
 
 
-def design_row(period, miles, acres):
+def pool_bins(rows, bins=None, min_events=MIN_EVENTS_PER_BIN):
+    """Merge distance bins that carry too few conversion events to estimate.
+
+    A bin with almost no events drives its coefficient to an extreme value held
+    finite only by the ridge penalty, which then reverses against the next bin
+    and makes remote land look more developable than mid-distance land. Pooling
+    sparse cells is the honest fix: you cannot estimate a cell with no events.
+
+    rows: (period, event, acres, miles)
+    """
+    bins = list(DIST_BINS if bins is None else bins)
+    while True:
+        counts = [0] * (len(bins) + 1)
+        exposure = [0] * (len(bins) + 1)
+        for _, e, _, d in rows:
+            i = bin_index(d, bins)
+            exposure[i] += 1
+            counts[i] += int(e)
+        thin = [i for i, c in enumerate(counts) if c < min_events]
+        if not thin or len(bins) == 1:
+            return bins, counts, exposure
+        i = thin[0]
+        # drop the edge that merges the sparse cell into its neighbour
+        bins.pop(min(i, len(bins) - 1))
+
+
+def design_row(period, miles, acres, bins=None):
     """Intercept, period dummies (first period is the reference), distance-bin
     dummies (first bin is the reference), log acres."""
+    bins = DIST_BINS if bins is None else bins
     row = [1.0]
     for p in PERIODS[1:]:
         row.append(1.0 if period == p else 0.0)
-    b = bin_index(miles)
-    for i in range(1, len(DIST_BINS) + 1):
+    b = bin_index(miles, bins)
+    for i in range(1, len(bins) + 1):
         row.append(1.0 if b == i else 0.0)
     row.append(math.log(max(0.1, acres or 1.0)))
     return row
@@ -93,8 +124,8 @@ def fit_logit(X, y, l2=1e-3, iters=60, tol=1e-9):
     return b.tolist()
 
 
-def predict_p5(coefs, period, miles, acres):
-    z = sum(c * x for c, x in zip(coefs, design_row(period, miles, acres)))
+def predict_p5(coefs, period, miles, acres, bins=None):
+    z = sum(c * x for c, x in zip(coefs, design_row(period, miles, acres, bins)))
     z = max(-30.0, min(30.0, z))
     return 1.0 / (1.0 + math.exp(-z))
 
@@ -108,19 +139,24 @@ def annual_hazard(p5):
     return min(0.5, h * (5.0 / max(1.0, 5.0 - LAG_YEARS)))
 
 
-def summarize(coefs):
+def summarize(coefs, bins=None, counts=None, exposure=None):
     """Readable coefficient report, so the fit can be sanity-checked rather than
     trusted. Distance effects are relative to the nearest bin."""
     out = {"intercept": round(coefs[0], 4), "periods": {}, "distance_bins": {}}
     i = 1
     for p in PERIODS[1:]:
         out["periods"][p] = round(coefs[i], 4); i += 1
-    labels = [f"<{DIST_BINS[0]}mi (reference)"]
-    for j in range(len(DIST_BINS)):
-        hi = DIST_BINS[j + 1] if j + 1 < len(DIST_BINS) else None
-        labels.append(f"{DIST_BINS[j]}-{hi}mi" if hi else f">{DIST_BINS[-1]}mi")
+    b = DIST_BINS if bins is None else bins
+    labels = [f"<{b[0]}mi (reference)"]
+    for j in range(len(b)):
+        hi = b[j + 1] if j + 1 < len(b) else None
+        labels.append(f"{b[j]}-{hi}mi" if hi else f">{b[-1]}mi")
     out["distance_bins"][labels[0]] = 0.0
     for j in range(1, len(labels)):
         out["distance_bins"][labels[j]] = round(coefs[i], 4); i += 1
     out["log_acres"] = round(coefs[i], 4)
+    if counts is not None:
+        out["events_per_bin"] = {labels[k]: counts[k] for k in range(len(labels))}
+        out["rows_per_bin"] = {labels[k]: exposure[k] for k in range(len(labels))}
+        out["bins_pooled"] = (bins is not None and list(bins) != list(DIST_BINS))
     return out
