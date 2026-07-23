@@ -1569,7 +1569,12 @@ def admin_fit_hazard(token: str, sample_vacant: float = 0.06, sample_built: floa
     return {"state": "started", "kind": "hazard", "next": "poll /admin/signals_status"}
 
 @app.get("/admin/screens")
-def admin_screens(token: str, flood: bool = True, flood_source: str = None):
+def admin_screens(token: str, flood: bool = False, flood_source: str = None):
+    """Flood is OFF by default. Neither public source can serve the geometry:
+    FEMA resets on every tiled request from this host, and the county layer is a
+    cached tile service, which answers attribute queries but not shape queries.
+    Loading FEMA's Maricopa county file directly is the remaining route. Pass
+    flood=true (optionally with flood_source) to try again."""
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if SIGNAL_STATUS.get("state") == "running":
