@@ -7,6 +7,7 @@ import os, json, pathlib, requests, csv, io
 import model as MODEL
 import hazard as HZ
 import report as REPORT
+import backtest as BT
 from fastapi import FastAPI, Response, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -577,6 +578,115 @@ def _zip_bbox(zcta):
             walk(x)
     walk(f["geometry"]["coordinates"])
     return (min(xs), min(ys), max(xs), max(ys))
+
+
+# --- BACKTEST --------------------------------------------------------------
+# Panel of parcel-periods that had FINISHED before the vintage year. Anything
+# later would let the scoring model see the outcome it is being tested on.
+BT_TRAIN_SQL = """
+CREATE TEMP TABLE bt_train AS
+WITH universe AS (
+  SELECT apn, centroid, NULL::int AS const_year, acres FROM parcels
+   WHERE centroid IS NOT NULL AND random() < %(s)s
+  UNION ALL
+  SELECT apn, centroid, const_year, acres FROM built WHERE random() < %(s)s
+)
+SELECT u.apn, y.t AS period,
+       (u.const_year IS NOT NULL AND u.const_year >= y.t AND u.const_year < y.t + 5)::int AS event,
+       u.acres,
+       (SELECT ST_Distance(u.centroid::geography, b.centroid::geography) / 1609.34
+          FROM built b WHERE b.const_year <= y.t
+         ORDER BY u.centroid <-> b.centroid LIMIT 1) AS edge_miles
+FROM universe u
+CROSS JOIN (SELECT unnest(%(periods)s::int[]) AS t) y
+WHERE u.const_year IS NULL OR u.const_year > y.t
+"""
+
+# Everything still undeveloped at the vintage year, with the frontier measured
+# as it stood THEN. Outcome (const_year) comes along but is never scored on.
+BT_SCORE_SQL = """
+CREATE TEMP TABLE bt_score AS
+WITH universe AS (
+  SELECT apn, centroid, NULL::int AS const_year, acres FROM parcels
+   WHERE centroid IS NOT NULL AND random() < %(s)s
+  UNION ALL
+  SELECT apn, centroid, const_year, acres FROM built WHERE random() < %(s)s
+)
+SELECT u.apn, u.const_year, u.acres,
+       (SELECT ST_Distance(u.centroid::geography, b.centroid::geography) / 1609.34
+          FROM built b WHERE b.const_year <= %(v)s
+         ORDER BY u.centroid <-> b.centroid LIMIT 1) AS edge_miles
+FROM universe u
+WHERE (u.const_year IS NULL OR u.const_year > %(v)s)
+"""
+
+def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=0.10):
+    """Score parcels as of each vintage using only what existed then, then look
+    at what actually happened afterwards."""
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": "backtest", "detail": "checking history"}
+    try:
+        _ensure_columns()
+        with pool.connection() as c:
+            nb = c.execute("SELECT count(*) FROM built").fetchone()[0]
+        if nb < 50000:
+            SIGNAL_STATUS = {"state": "error", "kind": "backtest",
+                             "detail": f"only {nb} construction records; run /admin/ingest_built first"}
+            return
+        results = []
+        for v in vintages:
+            periods = [p for p in HZ.PERIODS if p + 5 <= v]
+            if len(periods) < 2:
+                results.append({"vintage": v, "error": "not enough completed periods before this year"})
+                continue
+            SIGNAL_STATUS.update(detail=f"{v}: training on periods {periods}")
+            with pool.connection() as c:
+                with c.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS bt_train")
+                    cur.execute(BT_TRAIN_SQL, {"s": sample, "periods": periods})
+                    train = cur.execute(
+                        "SELECT period, event, acres, edge_miles FROM bt_train WHERE edge_miles IS NOT NULL").fetchall()
+                c.commit()
+            rows = [(int(p), int(e), float(a) if a else 1.0, float(d)) for p, e, a, d in train]
+            coefs, bins = BT.fit_pre_vintage(rows)
+            if not coefs:
+                results.append({"vintage": v, "error": f"insufficient training data ({len(rows)} rows)"})
+                continue
+            SIGNAL_STATUS.update(detail=f"{v}: scoring parcels as they stood then")
+            with pool.connection() as c:
+                with c.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS bt_score")
+                    cur.execute(BT_SCORE_SQL, {"s": sample, "v": v})
+                    sc = cur.execute(
+                        "SELECT apn, const_year, acres, edge_miles FROM bt_score WHERE edge_miles IS NOT NULL").fetchall()
+                c.commit()
+            scored = [(apn, BT.score(coefs, bins, float(d), float(a) if a else 1.0),
+                       cy, float(a) if a else 0.0, float(d)) for apn, cy, a, d in sc]
+            quints = BT.quintile_outcomes(scored, v)
+            results.append(BT.summarise(v, quints, len(rows), sum(r[1] for r in rows)))
+            SIGNAL_STATUS.update(detail=f"{v}: done")
+        payload = {"results": results, "verdict": BT.verdict(results),
+                   "sample_fraction": sample,
+                   "method": ("hazard refit per vintage on completed periods only; "
+                              "development frontier reconstructed from parcels built by "
+                              "that year; no present-day covariates used")}
+        with pool.connection() as c, c.cursor() as cur:
+            cur.execute("INSERT INTO model_fit(key,payload) VALUES('backtest',%s::jsonb) "
+                        "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, fitted_at=now()",
+                        (json.dumps(payload),))
+            c.commit()
+        SIGNAL_STATUS = {"state": "done", "kind": "backtest", **payload}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "kind": "backtest", "detail": str(e)[:250]}
+
+@app.get("/admin/backtest")
+def admin_backtest(token: str, sample: float = 0.10):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_backtest, kwargs={"sample": sample}, daemon=True).start()
+    return {"state": "started", "kind": "backtest", "next": "poll /admin/state?token=YOUR_TOKEN"}
 
 @app.get("/admin/state")
 def admin_state(token: str):
