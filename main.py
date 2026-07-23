@@ -1058,7 +1058,13 @@ def admin_signals_status(token: str):
 
 
 # --- HISTORICAL EVENTS: built parcels, for hazard estimation ---------------
-FEMA_NFHL = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query"
+# FEMA publishes the NFHL on two paths; hazards.fema.gov resets aggressively on
+# large or rapid queries, so both are tried and the extent is finely tiled.
+FEMA_URLS = ["https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
+             "https://hazards.fema.gov/gis/nfhl/rest/services/public/NFHL/MapServer/28/query"]
+FEMA_NFHL = FEMA_URLS[0]
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 HIGH_RISK_ZONES = ("A", "AE", "AH", "AO", "A99", "AR", "V", "VE")
 
 def _county_count(where):
@@ -1272,14 +1278,15 @@ UPDATE parcels SET landlocked = false WHERE landlocked IS NULL;
 # job, and per-neighbour intersection avoids that entirely. Corner overlaps can
 # double-count a metre or two, which LEAST(1.0, ...) absorbs.
 
-def _get_retry(url, params, timeout=180, tries=4):
+def _get_retry(url, params, timeout=180, tries=4, ua=None):
     """Transient resets are normal against large public GIS services. Retry with
     backoff rather than failing the whole job on one dropped connection."""
     import time
     last = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": UA})
+            r = requests.get(url, params=params, timeout=timeout,
+                             headers={"User-Agent": ua or UA, "Accept": "application/json"})
             if r.status_code >= 500:
                 last = RuntimeError(f"status {r.status_code}")
             else:
@@ -1290,11 +1297,25 @@ def _get_retry(url, params, timeout=180, tries=4):
     raise last if last else RuntimeError("request failed")
 
 
-def _fetch_flood(bbox, tiles=6, cap=200000):
+def _flood_url():
+    """Pick whichever FEMA path answers a trivial query."""
+    for u in FEMA_URLS:
+        try:
+            r = requests.get(u, params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
+                             timeout=45, headers={"User-Agent": BROWSER_UA})
+            if r.status_code < 400 and "count" in r.text[:400]:
+                return u
+        except Exception:
+            continue
+    return FEMA_URLS[0]
+
+
+def _fetch_flood(bbox, tiles=10, cap=200000):
     """FEMA's NFHL resets on county-sized envelopes, so the extent is split into
     a grid and each cell paged separately. Only high-risk zones and the
     regulatory floodway are kept."""
     x0, y0, x1, y1 = bbox
+    url = _flood_url()
     dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
     geoms = []
     for i in range(tiles):
@@ -1307,8 +1328,8 @@ def _fetch_flood(bbox, tiles=6, cap=200000):
                           "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
                           "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE,ZONE_SUBTY",
                           "returnGeometry": "true", "f": "geojson",
-                          "resultOffset": offset, "resultRecordCount": 500}
-                r = _get_retry(FEMA_NFHL, params)
+                          "resultOffset": offset, "resultRecordCount": 250}
+                r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
                 try:
                     feats = r.json().get("features", [])
                 except Exception:

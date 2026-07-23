@@ -209,8 +209,12 @@ function clearPaths(){ pathCache.clear(); }
 
 // Screens the review flagged: no legal access is a 50-90% discount, and floodway
 // land is not developable at any water status.
+// Frontage is measured against a parcel fabric containing only vacant/ag land,
+// so it systematically flags rural parcels. Recorded, but not applied to value
+// until validated against road centrelines. Mirrors APPLY_LANDLOCK_DISCOUNT.
+const APPLY_LANDLOCK_DISCOUNT=false;
 function siteFactor(p){ let f=1;
-  if(p.landlocked) f*=0.35;
+  if(p.landlocked && APPLY_LANDLOCK_DISCOUNT) f*=0.35;
   const z=(p.flood_zone||"").toUpperCase();
   if(z==="FLOODWAY") f*=0.10; else if(z) f*=0.75;
   return f; }
@@ -302,7 +306,7 @@ function parcelColorExpr(){
     // ratio ~= payoff * developerPrice / currentPrice  (floor and carry terms are
     // second order for a colour bucket; exact figures appear in the panel)
     const siteE=["*",
-      ["case",["==",["get","landlocked"],true],0.35,1],
+      1,
       ["case",["==",["to-string",["get","flood_zone"]],"FLOODWAY"],0.10,
               ["!=",["to-string",["get","flood_zone"]],""],0.75,1]];
     const ratioE=["*",payoffE,["/",["*",d0E,siteE],priceE]];
@@ -401,8 +405,8 @@ function updateValuationUI(){
         `${WSLBL[V.state]}. A: inside a designated provider or holding an assured-supply certificate, developable now. B: irrigated agricultural land whose grandfathered irrigation right can be relinquished under SB1611 (2025) for groundwater savings credits usable within one mile. C: raw groundwater-dependent land, blocked for subdivision since ADWR halted groundwater-based assured-supply applications in 2023, and dependent on being absorbed by a provider or on policy change.`)}">${WSLBL[V.state]}</span>`
     +`<span class="pill" style="background:#5b564d" data-tip="${escAttr(
         `Frontier heat ${Math.round(V.gi)} of 100 for ZIP ${p.zcta}. A weighted blend of developable land share, sales velocity, transport projects and in-migration. It sets how fast development is moving toward this zone, which drives the conversion hazard. It does not set an appreciation rate.`)}">Frontier ${Math.round(V.gi)}</span>`
-    +(p.landlocked?`<span class="pill" style="background:#7a2718" data-tip="${escAttr(
-        "No frontage: almost the whole parcel boundary is shared with neighbouring parcels, so there is no contact with public right-of-way. Legal access is the first thing a buyer checks, and its absence is a 50 to 90 percent discount. Modelled value here is cut to 35 percent of what a developer would otherwise pay.")}">Landlocked</span>`:"")
+    +(p.landlocked?`<span class="pill" style="background:#8b8579" data-tip="${escAttr(
+        "Flagged as fully enclosed by neighbouring parcels, which can mean no road frontage. This measure is unreliable at present: it is computed against a fabric holding only vacant and agricultural land, so it over-flags rural parcels. It is shown for information and does NOT affect the modelled value. Verify access on the plat before acting on it.")}">Check access</span>`:"")
     +(p.flood_zone?`<span class="pill" style="background:${p.flood_zone==="FLOODWAY"?"#7a2718":"#8a6d3b"}" data-tip="${escAttr(
         p.flood_zone==="FLOODWAY"?"In the regulatory floodway. Not developable at any water status; value cut to 10 percent."
         :"Inside a FEMA 1-percent-annual-chance flood zone ("+p.flood_zone+"). Buildable with mitigation; value cut to 75 percent.")}">Flood ${p.flood_zone}</span>`:"")

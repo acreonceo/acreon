@@ -85,12 +85,23 @@ def hazard_base(growth_index, p):
     return p["h_min"] + (p["h_max"] - p["h_min"]) * gi / 100.0
 
 
+# The frontage metric is computed from the parcel fabric, but that fabric only
+# contains vacant and agricultural land. Rural areas are almost entirely vacant/
+# ag, so a rural parcel sees every neighbour and reads as enclosed; in town the
+# neighbours are built parcels absent from the table, so nothing reads as
+# enclosed. The measure therefore flags rural land for being rural: it marked
+# 46,106 of 152,359 parcels, roughly 30%, where the true rate is a few percent.
+# It stays recorded but MUST NOT move value until it is validated against a road
+# centreline layer. Flip this on only after that check.
+APPLY_LANDLOCK_DISCOUNT = False
+
+
 def site_factor(landlocked, flood_zone):
-    """Multiplier on what a developer will pay. These are the screens the review
-    named as the source of the worst embarrassments: a landlocked parcel scored
-    like its road-frontage neighbour, and floodway land scored on momentum."""
+    """Multiplier on what a developer will pay. Floodway land is not developable
+    at any water status; the 1-percent-annual-chance zones are buildable with
+    mitigation."""
     f = 1.0
-    if landlocked:
+    if landlocked and APPLY_LANDLOCK_DISCOUNT:
         f *= 0.35                      # no legal access: a 50-90% discount
     z = (flood_zone or "").upper()
     if z == "FLOODWAY":
