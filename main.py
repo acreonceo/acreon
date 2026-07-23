@@ -1417,52 +1417,63 @@ def _flood_url_unused():
 
 
 def _flood_tiles(bbox, url, tiles=12, per_page=20):
-    """Yield one tile's flood polygons at a time.
+    """Yield flood polygons in batches.
 
-    The previous version accumulated every polygon countywide before writing any
-    of them. FEMA geometries are detailed, and holding the whole set exhausted
-    the container's memory, which restarted the service mid-run (the status
-    flipping back to idle was the process dying). Streaming per tile keeps peak
-    memory to a single tile.
+    The two sources need different request shapes:
+      * FEMA is national, so it must be filtered spatially, and it resets on
+        large geometry payloads, hence tiling and small pages.
+      * The county layer already covers exactly Maricopa County, so a bounding
+        box adds nothing. It returned records to a plain query and zero to an
+        enveloped one, so the envelope is dropped and the layer is paged through.
     """
+    is_fema = "hazards.fema.gov" in url
     x0, y0, x1, y1 = bbox
-    dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
-    for i in range(tiles):
-        for j in range(tiles):
-            bx0, by0 = x0 + i * dx, y0 + j * dy
-            bx1, by1 = bx0 + dx, by0 + dy
-            batch, offset = [], 0
-            while True:
-                where = SFHA_WHERE if "hazards.fema.gov" in url else "1=1"
-                fields = "FLD_ZONE,ZONE_SUBTY,SFHA_TF" if "hazards.fema.gov" in url else "*"
-                params = {"where": where, "geometry": f"{bx0},{by0},{bx1},{by1}",
-                          "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
-                          "spatialRel": "esriSpatialRelIntersects", "outFields": fields,
-                          "returnGeometry": "true", "f": "geojson",
-                          "maxAllowableOffset": GEN_OFFSET, "geometryPrecision": 6,
-                          "resultOffset": offset, "resultRecordCount": per_page}
-                r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
-                try:
-                    payload = r.json()   # NOT j: that is the tile loop index
-                except Exception:
-                    raise RuntimeError(f"flood source status {r.status_code}: {r.text[:140]}")
-                if isinstance(payload, dict) and payload.get("error"):
-                    # surface it instead of mistaking an error for an empty page
-                    raise RuntimeError(f"flood source rejected the query: {str(payload['error'])[:200]}")
-                feats = payload.get("features") or []
-                if not feats:
-                    break
-                for f in feats:
-                    g = f.get("geometry")
-                    if not g:
-                        continue
-                    z = _flood_class(f.get("properties") or {})
-                    if z:
-                        batch.append((json.dumps(g), z))
-                offset += len(feats)
-            yield (i * tiles + j + 1, tiles * tiles, batch)
-            batch = None
+    boxes = []
+    if is_fema:
+        dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
+        for i in range(tiles):
+            for k in range(tiles):
+                bx0, by0 = x0 + i * dx, y0 + k * dy
+                boxes.append((bx0, by0, bx0 + dx, by0 + dy))
+    else:
+        boxes.append(None)
+    page = per_page if is_fema else 200
 
+    for n, box in enumerate(boxes, 1):
+        batch, offset = [], 0
+        while True:
+            params = {"where": SFHA_WHERE if is_fema else "1=1",
+                      "outFields": "FLD_ZONE,ZONE_SUBTY,SFHA_TF" if is_fema else "*",
+                      "outSR": "4326", "returnGeometry": "true", "f": "geojson",
+                      "maxAllowableOffset": GEN_OFFSET, "geometryPrecision": 6,
+                      "resultOffset": offset, "resultRecordCount": page}
+            if box:
+                params.update({"geometry": f"{box[0]},{box[1]},{box[2]},{box[3]}",
+                               "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                               "spatialRel": "esriSpatialRelIntersects"})
+            r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
+            try:
+                payload = r.json()
+            except Exception:
+                raise RuntimeError(f"flood source status {r.status_code}: {r.text[:140]}")
+            if isinstance(payload, dict) and payload.get("error"):
+                raise RuntimeError(f"flood source rejected the query: {str(payload['error'])[:200]}")
+            feats = payload.get("features") or []
+            if not feats:
+                break
+            for f in feats:
+                g = f.get("geometry")
+                if not g:
+                    continue
+                z = _flood_class(f.get("properties") or {})
+                if z:
+                    batch.append((json.dumps(g), z))
+            offset += len(feats)
+            if len(batch) >= 400:
+                yield (n, len(boxes), batch)
+                batch = []
+        yield (n, len(boxes), batch)
+        batch = None
 
 def run_screens(do_flood=True, flood_source=None):
     """Two screens the review named as the source of the worst embarrassments:
