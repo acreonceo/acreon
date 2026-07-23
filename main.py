@@ -1063,9 +1063,15 @@ def admin_signals_status(token: str):
 # FEMA's own host has refused every request pattern from this server (connection
 # reset), so the county's floodplain service is tried first. It lives on the same
 # host that already serves the parcel data, which is known reachable.
-FEMA_URLS = ["https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services/Flood/MapServer/0/query",
-             "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
-             "https://hazards.fema.gov/gis/nfhl/rest/services/public/NFHL/MapServer/28/query"]
+# FEMA's main service answers fine and carries the real attributes; the earlier
+# resets were response size, not a block. The fix is filtering to Special Flood
+# Hazard Areas server-side (SFHA_TF='T') instead of pulling every polygon
+# including the vast zone-X areas that cover most of the county. The county
+# layer is kept as a fallback, but it exposes only OBJECTID, so it can say
+# "in a floodplain" and nothing more.
+FEMA_URLS = ["https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
+             "https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services/Flood/MapServer/0/query"]
+SFHA_WHERE = "SFHA_TF='T' OR ZONE_SUBTY LIKE '%FLOODWAY%'"
 FEMA_NFHL = FEMA_URLS[0]
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -1302,30 +1308,49 @@ def _get_retry(url, params, timeout=180, tries=4, ua=None):
 
 
 def _flood_class(props):
-    """Classify a flood polygon without assuming a schema. Sources differ: FEMA
-    uses FLD_ZONE/ZONE_SUBTY, the county uses its own labels. Anything naming a
-    floodway is treated as floodway; a recognised high-risk zone or a 1-percent
-    label is treated as floodplain. Unrecognised polygons in a floodplain layer
-    are kept as generic floodplain rather than silently dropped."""
+    """Classify a flood polygon. Schema varies by source, so this reads what is
+    there rather than assuming.
+
+    The decisive field is SFHA_TF: FEMA's flag for a Special Flood Hazard Area.
+    'F' means minimal hazard (zone X) and must NOT be flagged; an earlier version
+    defaulted unknown records to floodplain and would have discounted most of the
+    county for being explicitly safe.
+    """
+    z = str(props.get("FLD_ZONE") or "").strip().upper()
+    sub = str(props.get("ZONE_SUBTY") or "").strip().upper()
+    sfha = str(props.get("SFHA_TF") or "").strip().upper()
+
+    if "FLOODWAY" in sub:
+        return "FLOODWAY"
+    if sfha in ("F", "FALSE", "N", "NO"):
+        return ""                       # explicitly minimal hazard
+    if z in HIGH_RISK_ZONES:
+        return z
+    if z:                               # a zone code we do not treat as a constraint (X, D, etc.)
+        return ""
+    if sfha in ("T", "TRUE", "Y", "YES"):
+        return "AE"
+
+    # No FEMA fields at all: a dedicated floodplain layer carrying geometry only.
     text = " ".join(str(v).upper() for v in props.values() if v is not None)
     if "FLOODWAY" in text:
         return "FLOODWAY"
-    for k in ("FLD_ZONE", "ZONE", "ZONE_LABEL", "FLOODPLAIN", "TYPE", "DESCRIPT"):
-        v = props.get(k)
-        if v and str(v).strip().upper() in HIGH_RISK_ZONES:
-            return str(v).strip().upper()
-    if "1%" in text or "1 PERCENT" in text or "100-YEAR" in text or "100 YEAR" in text:
+    if "0.2%" in text or "500-YEAR" in text or "SHADED X" in text or "MINIMAL" in text:
+        return ""
+    if "1%" in text or "100-YEAR" in text or "100 YEAR" in text:
         return "AE"
-    if "0.2%" in text or "500-YEAR" in text or "SHADED X" in text:
-        return ""                      # 500-year: not a development constraint
-    return "FLOODPLAIN" if props else ""
+    known = {"OBJECTID", "GLOBALID", "GFID", "SHAPE.STAREA()", "SHAPE.STLENGTH()"}
+    if props and set(k.upper() for k in props) <= known:
+        return "FLOODPLAIN"             # geometry-only floodplain layer
+    return ""
 
 
 def _flood_url():
     """Pick whichever FEMA path answers a trivial query."""
     for u in FEMA_URLS:
         try:
-            r = requests.get(u, params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
+            w = SFHA_WHERE if "hazards.fema.gov" in u else "1=1"
+            r = requests.get(u, params={"where": w, "returnCountOnly": "true", "f": "json"},
                              timeout=45, headers={"User-Agent": BROWSER_UA})
             if r.status_code < 400 and "count" in r.text[:400]:
                 return u
@@ -1376,7 +1401,7 @@ def _flood_url_unused():
     return FEMA_URLS[0]
 
 
-def _flood_tiles(bbox, tiles=10, per_page=250):
+def _flood_tiles(bbox, tiles=12, per_page=100):
     """Yield one tile's flood polygons at a time.
 
     The previous version accumulated every polygon countywide before writing any
@@ -1394,9 +1419,11 @@ def _flood_tiles(bbox, tiles=10, per_page=250):
             bx1, by1 = bx0 + dx, by0 + dy
             batch, offset = [], 0
             while True:
-                params = {"where": "1=1", "geometry": f"{bx0},{by0},{bx1},{by1}",
+                where = SFHA_WHERE if "hazards.fema.gov" in url else "1=1"
+                fields = "FLD_ZONE,ZONE_SUBTY,SFHA_TF" if "hazards.fema.gov" in url else "*"
+                params = {"where": where, "geometry": f"{bx0},{by0},{bx1},{by1}",
                           "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
-                          "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
+                          "spatialRel": "esriSpatialRelIntersects", "outFields": fields,
                           "returnGeometry": "true", "f": "geojson",
                           "resultOffset": offset, "resultRecordCount": per_page}
                 r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
