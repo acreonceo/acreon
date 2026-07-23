@@ -6,6 +6,7 @@ PostGIS instance before shipping.
 import os, json, pathlib, requests, csv, io
 import model as MODEL
 import hazard as HZ
+import report as REPORT
 from fastapi import FastAPI, Response, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -295,17 +296,25 @@ def _valued(rows, p, horizon=10):
     return out
 
 @app.get("/targets")
-def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
+def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
             min_tenure: int = 0, water_state: str = "", include_public: bool = False,
+            absentee: bool = False, city: str = "", zcta: str = "",
+            max_price_per_acre: float = 0, max_total_price: float = 0,
+            min_score: int = 0, max_years: int = 0,
             min_ratio: float = 0, horizon: int = 10,
             lambda_p: float = None, h_max: float = None, g_d: float = None,
-            rho: float = None, sort: str = "value_ratio", limit: int = 100):
+            rho: float = None, sort: str = "value_score", limit: int = 100):
     where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
              "p.acres >= %s", "coalesce(p.tenure,0) >= %s", "p.est > 0", "p.acres > 0"]
     args = [min_acres, min_tenure]
     if use:          where.append("p.use = %s");          args.append(use)
     if owner_type:   where.append("p.owner_type = %s");   args.append(owner_type)
     if water_state:  where.append("COALESCE(p.water_state,'C') = %s"); args.append(water_state)
+    if max_acres:    where.append("p.acres <= %s");       args.append(max_acres)
+    if absentee:     where.append("p.absentee IS TRUE")
+    if city:         where.append("p.city ILIKE %s");     args.append(f"%{city}%")
+    if zcta:         where.append("p.zcta = %s");         args.append(zcta)
+    if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
     if not include_public:
         where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
     rows = _candidates(" AND ".join(where), tuple(args))
@@ -313,6 +322,12 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
     vals = _valued(rows, p, horizon)
     if min_ratio:
         vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
+    if max_price_per_acre:
+        vals = [r for r in vals if (r["price_per_acre"] or 0) <= max_price_per_acre]
+    if min_score:
+        vals = [r for r in vals if (r["value_score"] or 0) >= min_score]
+    if max_years:
+        vals = [r for r in vals if r["p50_years"] and r["p50_years"] <= max_years]
     keyf = {"value_ratio": lambda r: r["value_ratio"] or 0,
             "value_score": lambda r: r["value_score"] or 0,
             "value_total": lambda r: r["value_total"] or 0,
@@ -323,6 +338,24 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
     for r in vals:
         r.pop("mail_address", None)
     return vals[:limit]
+
+@app.get("/report")
+def report(apns: str, audience: str = "investor", horizon: int = 10,
+           lambda_p: float = None, h_max: float = None, g_d: float = None, rho: float = None):
+    """Printable brief for one or more parcels. Two audiences: an investor case
+    (why put capital here, what is the wait, what could go wrong) and a developer
+    case (what is the parcel, can it be built, what must be solved first)."""
+    ids = [a.strip() for a in (apns or "").split(",") if a.strip()][:40]
+    if not ids:
+        raise HTTPException(400, "pass ?apns=APN1,APN2")
+    rows = _candidates("p.apn = ANY(%s)", (ids,))
+    if not rows:
+        raise HTTPException(404, "no parcels found")
+    p = _model_params(lambda_p, h_max, g_d, rho, horizon)
+    vals = _valued(rows, p, horizon)
+    vals.sort(key=lambda r: r["value_score"] or 0, reverse=True)
+    html = REPORT.build(vals, audience)
+    return Response(html, media_type="text/html")
 
 @app.get("/targets/export")
 def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
@@ -338,6 +371,11 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     if use:          where.append("p.use = %s");          args.append(use)
     if owner_type:   where.append("p.owner_type = %s");   args.append(owner_type)
     if water_state:  where.append("COALESCE(p.water_state,'C') = %s"); args.append(water_state)
+    if max_acres:    where.append("p.acres <= %s");       args.append(max_acres)
+    if absentee:     where.append("p.absentee IS TRUE")
+    if city:         where.append("p.city ILIKE %s");     args.append(f"%{city}%")
+    if zcta:         where.append("p.zcta = %s");         args.append(zcta)
+    if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
     if not include_public:
         where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
     rows = _candidates(" AND ".join(where), tuple(args))
@@ -345,6 +383,12 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     vals = _valued(rows, p, horizon)
     if min_ratio:
         vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
+    if max_price_per_acre:
+        vals = [r for r in vals if (r["price_per_acre"] or 0) <= max_price_per_acre]
+    if min_score:
+        vals = [r for r in vals if (r["value_score"] or 0) >= min_score]
+    if max_years:
+        vals = [r for r in vals if r["p50_years"] and r["p50_years"] <= max_years]
     vals.sort(key=lambda r: r["value_ratio"] or 0, reverse=True)
     vals = vals[:limit]
 

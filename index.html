@@ -103,8 +103,25 @@
       <div class="filters">
         <div><label>Use</label><select id="fUse"><option value="">Vacant + Ag</option><option>Vacant</option><option>Agricultural</option></select></div>
         <div><label>Owner</label><select id="fOwner"><option value="">Any</option><option>Individual</option><option>Trust/LLC</option><option>Investor</option></select></div>
-        <div><label>Min acres</label><select id="fAcres"><option value="0">Any</option><option value="5">5+</option><option value="20">20+</option><option value="40">40+</option></select></div>
-        <div><label>Min held</label><select id="fTen"><option value="0">Any</option><option value="20">20+</option><option value="30">30+</option></select></div>
+        <div><label>Water</label><select id="fWater"><option value="">Any</option><option value="A">Served / assured</option><option value="B">Irrigated ag (SB1611)</option><option value="C">Raw groundwater</option></select></div>
+        <div><label>Min acres</label><select id="fAcres"><option value="0">Any</option><option value="5">5+</option><option value="20">20+</option><option value="40">40+</option><option value="160">160+</option></select></div>
+        <div><label>Max acres</label><select id="fAcresMax"><option value="0">Any</option><option value="20">20</option><option value="80">80</option><option value="320">320</option></select></div>
+        <div><label>Min held</label><select id="fTen"><option value="0">Any</option><option value="10">10+</option><option value="20">20+</option><option value="30">30+</option></select></div>
+        <div><label>Max $/acre</label><select id="fPpa"><option value="0">Any</option><option value="2000">$2k</option><option value="5000">$5k</option><option value="15000">$15k</option><option value="50000">$50k</option></select></div>
+        <div><label>Max total</label><select id="fTotal"><option value="0">Any</option><option value="100000">$100k</option><option value="500000">$500k</option><option value="2000000">$2M</option></select></div>
+        <div><label>Min score</label><select id="fScore"><option value="0">Any</option><option value="50">50+</option><option value="60">60+</option><option value="70">70+</option></select></div>
+        <div><label>Converts within</label><select id="fYears"><option value="0">Any</option><option value="10">10 yrs</option><option value="20">20 yrs</option><option value="30">30 yrs</option></select></div>
+        <div><label>Owner location</label><select id="fAbs"><option value="">Any</option><option value="1">Out of state only</option></select></div>
+        <div><label>Sort by</label><select id="fSort"><option value="value_score">Value score</option><option value="soonest">Soonest to convert</option><option value="value_total">Total value</option><option value="acq_score">Acquirability</option></select></div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;margin:2px 0 8px">
+        <label style="font-size:11.5px;color:var(--ink-soft);display:flex;align-items:center;gap:5px;cursor:pointer">
+          <input type="checkbox" id="selAll"> select all shown</label>
+        <span id="selCount" style="font-size:11.5px;color:var(--ink-soft);margin-left:auto"></span>
+      </div>
+      <div style="display:flex;gap:6px;margin-bottom:10px">
+        <button id="repInv" style="flex:1;padding:7px 4px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Investor brief</button>
+        <button id="repDev" style="flex:1;padding:7px 4px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Developer brief</button>
       </div>
       <button id="exportBtn" style="width:100%;margin:2px 0 12px;padding:8px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-weight:600;border-radius:8px;cursor:pointer">Export this list to CSV (with owner mailing addresses)</button>
       <div id="targetList"></div>
@@ -172,7 +189,7 @@ let targetsDirty=false, blocksDirty=false;
 // Judgment assumptions, surfaced rather than buried. Replaced by estimation
 // once the conversion hazard is fit on construction-year data.
 const ASM={h_max:.060,h_min:.001,lambda_s:.050,lambda_p:.015,g_D:.030,
-           rho:.058,sell:.080,wB0:.60,wB1:.90,lambda_B:.15,T:60};
+           rho:.058,sell:.080,wB0:.60,wB1:.90,lambda_B:.15,T:30};
 
 const WSLBL={A:"Served · assured supply",B:"Irrigated ag · SB1611 path",C:"Raw groundwater"};
 const WSCOL={A:"#1a9850",B:"#c1892b",C:"#b0472f"};
@@ -409,7 +426,11 @@ function renderDetail(p){
       <span class="k">Acquired for</span><span class="v">${p.paid?money(p.paid):"No recorded sale"}</span></div>
     <div id="acqblock"></div>
     <h3>Hold or sell</h3>
-    <div id="hsblock"></div>`;
+    <div id="hsblock"></div>
+    <div style="display:flex;gap:6px;margin-top:12px">
+      <button onclick="openReport('investor')" style="flex:1;padding:7px 4px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Investor brief</button>
+      <button onclick="openReport('developer')" style="flex:1;padding:7px 4px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Developer brief</button>
+    </div>`;
   document.getElementById("assumeBox").style.display="block";
   updateValuationUI();
 }
@@ -544,6 +565,19 @@ document.addEventListener("click",e=>{ if(!q.parentNode.contains(e.target)) res.
 
 /* ===================== TARGETS / BLOCKS ========================= */
 const val=id=>document.getElementById(id).value;
+const selected=new Set();
+function syncSel(){
+  const n=selected.size;
+  document.getElementById("selCount").textContent = n ? `${n} selected` : "";
+  document.getElementById("repInv").disabled = document.getElementById("repDev").disabled = false;
+}
+function openReport(aud){
+  const apns=[...selected];
+  if(!apns.length && selApn) apns.push(selApn);
+  if(!apns.length){ alert("Tick one or more parcels, or open a parcel first."); return; }
+  const p=new URLSearchParams({apns:apns.join(","),audience:aud,...modelParams()});
+  window.open(API+"/report?"+p,"_blank");
+}
 const modelParams=()=>({horizon:HZY[horizon],lambda_p:ASM.lambda_p,h_max:ASM.h_max,g_d:ASM.g_D,rho:ASM.rho});
 function markDirty(){ targetsDirty=true; blocksDirty=true;
   if(document.getElementById("pane-targets").style.display!=="none") loadTargets();
@@ -552,28 +586,48 @@ function markDirty(){ targetsDirty=true; blocksDirty=true;
 async function loadTargets(){
   const el=document.getElementById("targetList");
   el.innerHTML=`<div class="empty">Valuing parcels…</div>`;
-  const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),
-    min_tenure:val("fTen"),limit:80,...modelParams()});
+  const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),water_state:val("fWater"),
+    min_acres:val("fAcres"),max_acres:val("fAcresMax"),min_tenure:val("fTen"),
+    max_price_per_acre:val("fPpa"),max_total_price:val("fTotal"),min_score:val("fScore"),
+    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",sort:val("fSort"),
+    limit:80,...modelParams()});
   let rows=[];
   try{ rows=await (await fetch(API+"/targets?"+pr)).json(); }catch(e){ el.innerHTML=`<div class="empty">Could not load targets.</div>`; return; }
   if(!rows.length){ el.innerHTML=`<div class="empty">No parcels match these filters.</div>`; return; }
   el.innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
-      <div class="r1"><span>${r.situs_address||r.apn}</span><span class="pill" style="background:${ratioRamp(r.value_ratio)}">${r.value_score ?? valueScore(r.value_ratio||0)}</span></div>
+      <div class="r1"><span><input type="checkbox" class="selbox" data-apn="${r.apn}" ${selected.has(r.apn)?"checked":""} style="margin-right:6px;vertical-align:middle"> ${r.situs_address||r.apn}</span><span class="pill" style="background:${ratioRamp(r.value_ratio)}">${r.value_score ?? valueScore(r.value_ratio||0)}</span></div>
       <div class="r2"><span>${r.use} · ${(+r.acres).toLocaleString()} ac · <b>${money(r.price_per_acre)}/ac</b></span><span>${money(r.value_per_acre)}/ac value</span></div>
       <div class="r2"><span style="color:${WSCOL[r.water_state]}">${WSLBL[r.water_state]}</span><span>${r.p50_years?("even odds "+r.p50_years+"y"):">30y"} · held ${r.tenure??"?"}y</span></div>
     </div>`).join("");
   targetsDirty=false;
-  el.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{
+  el.querySelectorAll(".selbox").forEach(b=>b.addEventListener("click",e=>{
+    e.stopPropagation();
+    if(b.checked) selected.add(b.dataset.apn); else selected.delete(b.dataset.apn);
+    syncSel();}));
+  el.querySelectorAll(".card").forEach(c=>c.addEventListener("click",e=>{
+    if(e.target.classList.contains("selbox")) return;
     openParcel(c.dataset.apn); map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
+  syncSel();
   const src=map.getSource("targets");
   if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
     geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.value_ratio||0}}))});
 }
-["fUse","fOwner","fAcres","fTen"].forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
+["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fSort"]
+  .forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
+document.getElementById("selAll").addEventListener("change",e=>{
+  document.querySelectorAll("#targetList .selbox").forEach(b=>{
+    b.checked=e.target.checked;
+    if(b.checked) selected.add(b.dataset.apn); else selected.delete(b.dataset.apn);});
+  syncSel();});
+document.getElementById("repInv").addEventListener("click",()=>openReport("investor"));
+document.getElementById("repDev").addEventListener("click",()=>openReport("developer"));
 document.getElementById("exportBtn").addEventListener("click",()=>{
-  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),
-    min_tenure:val("fTen"),limit:2000,...modelParams()});
+  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),water_state:val("fWater"),
+    min_acres:val("fAcres"),max_acres:val("fAcresMax"),min_tenure:val("fTen"),
+    max_price_per_acre:val("fPpa"),max_total_price:val("fTotal"),min_score:val("fScore"),
+    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",
+    limit:2000,...modelParams()});
   window.location.href=API+"/targets/export?"+p; });
 
 async function loadBlocks(){
