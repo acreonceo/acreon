@@ -235,7 +235,56 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=acreon_targets.csv"})
 
-# --- REAL DATA: discovery probe -------------------------------------------
+# --- ASSEMBLAGE DETECTION --------------------------------------------------
+# Finds owners who control multiple touching parcels. A contiguous block under one
+# owner is worth more than the sum of its parts (one negotiation, developable
+# scale), and it is invisible on a parcel-by-parcel map.
+ASSEMBLAGE_SQL = """
+WITH land AS (
+  SELECT apn, owner, owner_type, zcta, city, acres, est, tenure, target_score, growth_score, geom, centroid
+  FROM parcels
+  WHERE use IN ('Vacant','Agricultural') AND status='Off-market'
+    AND owner IS NOT NULL AND acres IS NOT NULL
+    AND NOT (coalesce(owner,'') ILIKE ANY(%(pub)s))
+    AND ({ZFILTER})
+),
+clustered AS (
+  SELECT *, ST_ClusterDBSCAN(geom, eps := %(eps)s, minpoints := 2)
+             OVER (PARTITION BY owner) AS cid
+  FROM land
+)
+SELECT owner, owner_type, min(zcta) AS zcta, min(city) AS city,
+       count(*) AS parcel_count,
+       round(sum(acres)::numeric,1) AS total_acres,
+       sum(est) AS total_est,
+       CASE WHEN sum(acres) > 0 THEN round(sum(est)/sum(acres)) ELSE NULL END AS per_acre,
+       max(tenure) AS max_tenure,
+       round(avg(target_score),1) AS avg_target,
+       round(avg(growth_score),1) AS avg_growth,
+       ST_X(ST_Centroid(ST_Collect(centroid))) AS lon,
+       ST_Y(ST_Centroid(ST_Collect(centroid))) AS lat,
+       array_agg(apn ORDER BY acres DESC) AS apns
+FROM clustered
+WHERE cid IS NOT NULL
+GROUP BY owner, owner_type, cid
+HAVING count(*) >= %(minp)s AND sum(acres) >= %(minac)s
+ORDER BY sum(acres) DESC
+LIMIT %(lim)s
+"""
+
+@app.get("/assemblages")
+def assemblages(min_parcels: int = 2, min_acres: float = 10, zcta: str = "",
+                water_status: str = "", eps: float = 0.0004, limit: int = 100):
+    """Contiguous blocks of vacant/ag land held by a single owner."""
+    zfilter = "true"
+    params = {"pub": PUBLIC_OWNER_PATTERNS, "eps": eps, "minp": min_parcels,
+              "minac": min_acres, "lim": limit}
+    if zcta:
+        zfilter = "zcta = %(z)s"; params["z"] = zcta
+    elif water_status:
+        zfilter = "zcta IN (SELECT zcta FROM zones WHERE water_status = %(ws)s)"; params["ws"] = water_status
+    sql = ASSEMBLAGE_SQL.replace("{ZFILTER}", zfilter)
+    return qall(sql, params)
 # Hit this once (with your ADMIN_TOKEN) to confirm the server can reach the
 # county and to learn the real parcel field names before we wire the full pull.
 # It writes nothing to the database.

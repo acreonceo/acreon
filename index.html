@@ -87,6 +87,7 @@
     <div class="tabs">
       <button data-t="detail" aria-selected="true">Parcel</button>
       <button data-t="targets" aria-selected="false">Targets</button>
+      <button data-t="blocks" aria-selected="false">Blocks</button>
       <button data-t="map" aria-selected="false">Heatmap</button>
     </div>
 
@@ -104,6 +105,15 @@
       </div>
       <button id="exportBtn" style="width:100%;margin:2px 0 12px;padding:8px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-weight:600;border-radius:8px;cursor:pointer">Export this list to CSV (with owner mailing addresses)</button>
       <div id="targetList"></div>
+    </div>
+
+    <div class="body" id="pane-blocks" style="display:none">
+      <div class="filters">
+        <div><label>Min parcels</label><select id="bParcels"><option value="2">2+</option><option value="3">3+</option><option value="5">5+</option></select></div>
+        <div><label>Min total acres</label><select id="bAcres"><option value="10">10+</option><option value="40">40+</option><option value="160">160+</option><option value="640">640+</option></select></div>
+      </div>
+      <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin:0 0 10px">Contiguous land held by one owner. A single negotiation for developable scale, which a parcel-by-parcel view hides.</p>
+      <div id="blockList"></div>
     </div>
 
     <div class="body" id="pane-map" style="display:none">
@@ -397,11 +407,36 @@ function showTab(t){
   document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-selected",b.dataset.t===t));
   document.getElementById("pane-detail").style.display=t==="detail"?"block":"none";
   document.getElementById("pane-targets").style.display=t==="targets"?"block":"none";
+  document.getElementById("pane-blocks").style.display=t==="blocks"?"block":"none";
   document.getElementById("pane-map").style.display=t==="map"?"block":"none";
-  document.getElementById("legMode").textContent=t==="targets"?"by target score":"by ZIP region";
+  document.getElementById("legMode").textContent=t==="targets"?"by target score":(t==="blocks"?"owner land blocks":"shaded by ZIP region");
   if(t==="targets"){ if(!document.getElementById("targetList").children.length) loadTargets(); }
+  else if(t==="blocks"){ if(!document.getElementById("blockList").children.length) loadBlocks(); }
   else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
 }
+
+async function loadBlocks(){
+  const el=document.getElementById("blockList");
+  el.innerHTML=`<div class="empty">Finding owner blocks…</div>`;
+  const p=new URLSearchParams({min_parcels:val("bParcels"),min_acres:val("bAcres"),limit:60});
+  let rows=[];
+  try{ rows=await (await fetch(API+"/assemblages?"+p)).json(); }catch(e){ el.innerHTML=`<div class="empty">Could not load blocks.</div>`; return; }
+  if(!rows.length){ el.innerHTML=`<div class="empty">No owner blocks match these filters.</div>`; return; }
+  el.innerHTML=rows.map(r=>`
+    <div class="card" data-lon="${r.lon}" data-lat="${r.lat}" data-apn="${(r.apns&&r.apns[0])||""}">
+      <div class="r1"><span>${r.owner}</span><span class="pill" style="background:${ramp(r.avg_target)}">${Math.round(r.avg_target)}</span></div>
+      <div class="r2"><span><b>${r.parcel_count} parcels</b> &middot; ${(+r.total_acres).toLocaleString()} ac &middot; <b>${r.per_acre?money(r.per_acre)+"/ac":"n/a"}</b></span><span>${money(r.total_est)}</span></div>
+      <div class="r2"><span>${r.city||""} ${r.zcta||""} &middot; held up to ${r.max_tenure??"?"}y</span><span>${r.owner_type}</span></div>
+    </div>`).join("");
+  el.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{
+    map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});
+    if(c.dataset.apn) openParcel(c.dataset.apn);
+  }));
+  const src=map.getSource("targets");
+  if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
+    geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:(r.apns&&r.apns[0])||"",score:r.avg_target}}))});
+}
+["bParcels","bAcres"].forEach(id=>document.getElementById(id).addEventListener("change",loadBlocks));
 document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.t)));
 document.getElementById("assumeBox").innerHTML='<h3 style="margin:4px 0 6px">Assumptions</h3><div id="asld"></div>';
 buildAssume();
