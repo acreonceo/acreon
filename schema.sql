@@ -75,3 +75,35 @@ CREATE INDEX IF NOT EXISTS parcels_land_acres_ix
 -- Owner mailing address (added later for outreach export). Idempotent so existing
 -- databases pick it up on the next boot.
 ALTER TABLE parcels ADD COLUMN IF NOT EXISTS mail_address text;
+
+-- Rebuilt model (economist review): per-parcel water state and carry, zone-level
+-- developer price. Idempotent so existing databases pick these up on boot.
+ALTER TABLE parcels ADD COLUMN IF NOT EXISTS water_state text;
+ALTER TABLE parcels ADD COLUMN IF NOT EXISTS carry_rate numeric;
+ALTER TABLE zones   ADD COLUMN IF NOT EXISTS dev_value_per_acre numeric;
+CREATE INDEX IF NOT EXISTS parcels_water_state_ix ON parcels (water_state);
+
+-- Historical development events, used to reconstruct the frontier and fit the
+-- conversion hazard. Lightweight: only what the estimation needs.
+CREATE TABLE IF NOT EXISTS built (
+  apn        text PRIMARY KEY,
+  centroid   geometry(Point,4326) NOT NULL,
+  const_year int NOT NULL,
+  acres      numeric
+);
+CREATE INDEX IF NOT EXISTS built_centroid_gix ON built USING gist (centroid);
+CREATE INDEX IF NOT EXISTS built_year_ix ON built (const_year);
+
+-- Fitted model coefficients and run metadata.
+CREATE TABLE IF NOT EXISTS model_fit (
+  key text PRIMARY KEY,
+  payload jsonb NOT NULL,
+  fitted_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Parcel-level screens and fitted hazard.
+ALTER TABLE parcels ADD COLUMN IF NOT EXISTS edge_miles numeric;
+ALTER TABLE parcels ADD COLUMN IF NOT EXISTS hazard_fitted numeric;
+ALTER TABLE parcels ADD COLUMN IF NOT EXISTS landlocked boolean;
+ALTER TABLE parcels ADD COLUMN IF NOT EXISTS flood_zone text;
+CREATE INDEX IF NOT EXISTS parcels_landlocked_ix ON parcels (landlocked);

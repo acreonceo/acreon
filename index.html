@@ -88,7 +88,7 @@
       <button data-t="detail" aria-selected="true">Parcel</button>
       <button data-t="targets" aria-selected="false">Targets</button>
       <button data-t="blocks" aria-selected="false">Blocks</button>
-      <button data-t="map" aria-selected="false">Heatmap</button>
+      <button data-t="map" aria-selected="false">Model</button>
     </div>
 
     <div class="body" id="pane-detail">
@@ -118,14 +118,16 @@
 
     <div class="body" id="pane-map" style="display:none">
       <h3>Horizon</h3>
-      <div class="seg" id="hzSeg"><button data-h="near">5-yr</button><button data-h="mid" aria-pressed="true">10-yr</button><button data-h="long">20-yr</button></div>
-      <div class="toggle"><span>Water gate</span><label class="switch"><input type="checkbox" id="gate" checked><span class="track"></span></label></div>
-      <div class="toggle"><span>Heatmap strength</span></div>
+      <div class="seg" id="hzSeg"><button data-h="near">5-yr</button><button data-h="mid" aria-pressed="true">10-yr</button><button data-h="long">30-yr</button></div>
+      <h3>Frontier signals</h3>
+      <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin:0 0 8px">These drive how fast the development frontier reaches a zone, which sets the conversion hazard. They no longer set an appreciation rate.</p>
+      <div id="wSliders"></div>
+      <h3>Heatmap strength</h3>
       <input type="range" id="heatOp" min="10" max="80" value="52">
-      <h3>Signal weights</h3><div id="wSliders"></div>
-      <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin-top:12px">These weights set the growth score behind the heatmap and every parcel forecast. Drag to re-rank what matters, and the map recolors live.</p>
+      <h3>Water feasibility</h3>
+      <div id="wparams"></div>
+      <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin-top:10px">Water is no longer a flat multiplier. It is a probability that rises with time: served land is feasible now, irrigated ag has a path under SB1611, and raw groundwater land depends on being absorbed by a provider or on policy change.</p>
     </div>
-  </aside>
 
   <div id="map"><div class="tip" id="tip"></div><div class="htip" id="htip"></div>
     <div class="legend">
@@ -140,106 +142,194 @@
 const API = window.API_BASE || "";
 const money=v=>{v=Math.round(v||0);const s=v<0?"-":"";v=Math.abs(v);return v>=1e6?s+"$"+(v/1e6).toFixed(v>=1e7?1:2)+"M":v>=1e3?s+"$"+Math.round(v/1e3)+"k":s+"$"+v};
 const pct=v=>(v*100).toFixed(1)+"%";
-const cagr=(v0,vt,t)=>Math.pow(vt/v0,1/t)-1;
-const GC={assured:"#3f8f5a",alternative_pending:"#c1892b",groundwater_constrained:"#7a8790"};
-const GL={assured:"Assured supply",alternative_pending:"Alternative pending",groundwater_constrained:"Groundwater constrained"};
-function ramp(v){v=Math.max(0,Math.min(100,v));const s=[[0,"#d73027"],[25,"#fc8d59"],[50,"#fee08b"],[75,"#a6d96a"],[100,"#1a9850"]];
-  const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
-  for(let i=0;i<s.length-1;i++){if(v<=s[i+1][0]){const t=(v-s[i][0])/(s[i+1][0]-s[i][0]),a=hex(s[i][1]),b=hex(s[i+1][1]);
-    return `rgb(${a.map((x,k)=>Math.round(x+(b[k]-x)*t)).join(",")})`;}}return s[4][1];}
 
-// ---- growth model (client-side so weights drive everything live) ----
-const SIGS=["developable_land","permit_velocity","zoning_activity","infra_transport","infra_water","migration","schools"];
-const SIGLBL={developable_land:"Developable land",permit_velocity:"Permit velocity",zoning_activity:"Rezoning activity",
-  infra_transport:"Transport buildout",infra_water:"Utility / water buildout",migration:"In-migration",schools:"Enrollment growth"};
-const PRESETS={near:{developable_land:20,permit_velocity:85,zoning_activity:70,infra_transport:75,infra_water:45,migration:45,schools:40},
-  mid:{developable_land:50,permit_velocity:60,zoning_activity:55,infra_transport:60,infra_water:60,migration:60,schools:50},
-  long:{developable_land:90,permit_velocity:30,zoning_activity:45,infra_transport:55,infra_water:85,migration:75,schools:55}};
-const GATE={assured:1.0,alternative_pending:0.7,groundwater_constrained:0.3};
-const HZY={near:5,mid:10,long:20};
-let weights={...PRESETS.mid}, horizon="mid", gateOn=true, selApn=null;
-let targetsDirty=false, blocksDirty=false;   // server-ranked lists need reload after weight changes
-const ASM={base:.035,opt:1.0,hurdle:.07,sell:.08,carry:.007}, SP=.07, JUMP=.5;
+/* ===================== MODEL =====================================
+   Mirrors model.py exactly. Raw land is not a growth asset: it sits flat and
+   then steps up when it becomes developable. Value is the discounted
+   expectation of that one payoff, minus the cost of waiting.
+     V = SUM_t S(t-1)h(t)(1-ts)D(t)e^-rt  +  S(T)Vag e^-rT  -  SUM_t S(t)carry e^-rt
+   ================================================================= */
 
-function growthOf(sig){ if(!sig) return 0; let n=0,d=0; for(const k of SIGS){const v=Number(sig[k])||0; n+=weights[k]*v; d+=weights[k];}
-  let g=d?n/d:0; const gate=GATE[sig.water_status]; if(gateOn&&gate) g*=gate; return isFinite(g)?g:0; }
+// Signals kept: the ones that carry information about frontier timing.
+// Dropped: zoning_activity (duplicate of sales velocity), infra_water (water is
+// a feasibility gate, not an additive signal), schools (never wired to data).
+const SIGS=["developable_land","permit_velocity","infra_transport","migration"];
+const SIGLBL={developable_land:"Developable land",permit_velocity:"Sales velocity",
+  infra_transport:"Transport buildout",migration:"In-migration"};
+const PRESETS={near:{developable_land:25,permit_velocity:85,infra_transport:75,migration:45},
+  mid:{developable_land:55,permit_velocity:60,infra_transport:60,migration:60},
+  long:{developable_land:90,permit_velocity:35,infra_transport:55,migration:75}};
+const HZY={near:5,mid:10,long:30};
+let weights={...PRESETS.mid}, horizon="mid", selApn=null, curP=null;
+let targetsDirty=false, blocksDirty=false;
 
-// target score = the value the MAP colors parcels by (acquisition attractiveness)
-function tenureScoreJS(t,ot){let b=Math.max(0,Math.min(100,((t||0)-2)*4.2));let f=ot==="Builder/Developer"?0.35:(ot==="Investor"?0.8:1.0);return b*f;}
-function useScoreJS(u){return u==="Vacant"?100:(u==="Agricultural"?85:25);}
-function targetOf(p){return 0.5*growthOf(p.zone_signals)+0.3*tenureScoreJS(p.tenure,p.owner_type)+0.2*useScoreJS(p.use);}
-const escAttr=s=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-// zone shading is bold when zoomed out (macro corridor pattern) and fades to
-// outlines as parcels become legible, so the two color layers never fight.
-const zoneOpacityExpr=(m)=>["interpolate",["linear"],["zoom"],8,m,11.5,m*0.55,13,0.06,14.5,0];
+// Judgment assumptions, surfaced rather than buried. Replaced by estimation
+// once the conversion hazard is fit on construction-year data.
+const ASM={h_max:.060,h_min:.001,lambda_s:.050,lambda_p:.015,g_D:.030,
+           rho:.058,sell:.080,wB0:.60,wB1:.90,lambda_B:.15,T:60};
 
-// Parcel color follows the live sliders: target = 0.5*zone growth + 0.3*tenure
-// + 0.2*land type, evaluated in the style expression (GPU-side) so it stays fast
-// with the whole county loaded. Zone growth is injected as a zcta->growth match.
-function liveTargetExpr(){
-  const pairs=[];
-  if(zonesGeo){
-    const seen=new Set();
-    zonesGeo.features.forEach(f=>{const z=f.properties&&f.properties.zcta;
-      if(z!=null){const k=String(z); if(!seen.has(k)){seen.add(k); pairs.push(k, +growthOf(f.properties.signals).toFixed(1));}}});
+const WSLBL={A:"Served · assured supply",B:"Irrigated ag · SB1611 path",C:"Raw groundwater"};
+const WSCOL={A:"#1a9850",B:"#c1892b",C:"#b0472f"};
+
+function growthIndex(sig){ if(!sig) return 0; let n=0,d=0;
+  for(const k of SIGS){ const v=Number(sig[k]); if(v===null||isNaN(v)) continue; n+=weights[k]*v; d+=weights[k]; }
+  return d?n/d:0; }
+
+// Feasibility of ever being allowed to subdivide, rising with time.
+function waterW(state,t,heat){
+  if(state==="A") return 1;
+  if(state==="B") return ASM.wB0+(ASM.wB1-ASM.wB0)*(1-Math.exp(-ASM.lambda_B*t));
+  const lam=ASM.lambda_s*Math.max(0,Math.min(1,heat))+ASM.lambda_p;
+  return 1-Math.exp(-lam*t); }
+
+// Hazard path depends only on (zone growth, water state), so it is computed once
+// per pair. V is then linear in developer price and current price.
+const pathCache=new Map();
+function pathOf(gi,state,hazardOverride){
+  const key=Math.round(gi*10)/10+"|"+state+"|"+(hazardOverride==null?"j":hazardOverride.toFixed(4));
+  if(pathCache.has(key)) return pathCache.get(key);
+  const h0=(hazardOverride!=null)?hazardOverride
+           :ASM.h_min+(ASM.h_max-ASM.h_min)*Math.max(0,Math.min(100,gi))/100;
+  const heat=Math.max(0,Math.min(1,gi/100));
+  let S=1,payoff=0,carry=0,p50=null; const marks={},curve=[];
+  for(let t=1;t<=ASM.T;t++){
+    const h=Math.max(0,Math.min(.9,h0*waterW(state,t,heat)));
+    const disc=Math.exp(-ASM.rho*t);
+    payoff+=S*h*(1-ASM.sell)*Math.exp(ASM.g_D*t)*disc;
+    carry+=S*disc;
+    S*=(1-h);
+    const conv=1-S;
+    if(p50===null&&conv>=.5) p50=t;
+    if(t===5||t===10||t===20||t===30) marks[t]=conv;
+    curve.push(conv);
   }
-  // "match" needs at least one label; with none, fall back to the stored score
-  const growth = pairs.length ? ["match",["to-string",["get","zcta"]],...pairs,0]
-                              : ["to-number",["get","growth_score"],0];
-  const tenureBase=["min",100,["max",0,["*",["-",["to-number",["get","tenure"],0],2],4.2]]];
-  const ownerF=["match",["to-string",["get","owner_type"]],"Builder/Developer",0.35,"Investor",0.8,1.0];
-  const useS=["match",["to-string",["get","use"]],"Vacant",100,"Agricultural",85,25];
-  return ["+",["*",0.5,growth],["*",0.3,["*",tenureBase,ownerF]],["*",0.2,useS]];
+  const out={payoff,carry,floor:S*Math.exp(-ASM.rho*ASM.T),p50,marks,curve,h0};
+  pathCache.set(key,out); return out; }
+function clearPaths(){ pathCache.clear(); }
+
+// Screens the review flagged: no legal access is a 50-90% discount, and floodway
+// land is not developable at any water status.
+function siteFactor(p){ let f=1;
+  if(p.landlocked) f*=0.35;
+  const z=(p.flood_zone||"").toUpperCase();
+  if(z==="FLOODWAY") f*=0.10; else if(z) f*=0.75;
+  return f; }
+
+function valueOf(p){
+  const acres=+p.acres||0, est=+p.est||0;
+  if(acres<=0||est<=0) return null;
+  const gi=growthIndex(p.zone_signals), st=p.water_state||"C";
+  const hf=(p.hazard_fitted!==null&&p.hazard_fitted!==undefined)?+p.hazard_fitted:null;
+  const c=pathOf(gi,st,hf), price=est/acres;
+  const d0=(+p.dev_value_per_acre)||price*3;
+  const cr=(p.carry_rate!==null&&p.carry_rate!==undefined)?+p.carry_rate:0.003;
+  const site=siteFactor(p);
+  const v=c.payoff*d0*site+c.floor*price-c.carry*cr*price;
+  return {gi,state:st,price,d0,carry:cr,v,ratio:price>0?v/price:0,path:c,acres,est,site,
+          fitted:hf!==null}; }
+
+function acqOf(p){
+  let z=-1.20+0.045*Math.min(40,p.tenure||0);
+  if(p.absentee) z+=0.5;
+  if(p.owner_type==="Trust/LLC") z+=0.4;
+  if(!p.paid) z+=0.6;
+  if(p.owner_type==="Builder/Developer") z-=0.8;
+  else if(p.owner_type==="Investor") z-=0.2;
+  return 100/(1+Math.exp(-z)); }
+
+// Colour by value/price: 1.0 is fair, below is overpriced, above is a discount.
+function ratioRamp(r){
+  const v=Math.max(0,Math.min(100,(Math.max(0,Math.min(3,r||0))/3)*100));
+  const s=[[0,"#d73027"],[33,"#fc8d59"],[50,"#fee08b"],[70,"#a6d96a"],[100,"#1a9850"]];
+  const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
+  for(let i=0;i<s.length-1;i++){ if(v<=s[i+1][0]){ const t=(v-s[i][0])/(s[i+1][0]-s[i][0]),a=hex(s[i][1]),b=hex(s[i+1][1]);
+    return `rgb(${a.map((x,k)=>Math.round(x+(b[k]-x)*t)).join(",")})`; } }
+  return s[4][1]; }
+const ramp=ratioRamp;
+const escAttr=s=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+/* ===================== MAP ====================================== */
+let zonesGeo=null;
+const map=new maplibregl.Map({container:"map",center:[-112.2,33.5],zoom:8.2,
+  style:{version:8,sources:{carto:{type:"raster",tiles:["https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"],tileSize:256,attribution:"CARTO, OpenStreetMap"}},
+    layers:[{id:"bg",type:"raster",source:"carto"}]}});
+const tip=document.getElementById("tip"), htip=document.getElementById("htip");
+function showTip(e,html){tip.innerHTML=html;const r=map.getContainer().getBoundingClientRect();
+  tip.style.left=Math.min(e.point.x+12,r.width-236)+"px";tip.style.top=(e.point.y+12)+"px";tip.style.opacity=1;}
+function hideTip(){tip.style.opacity=0;}
+const zoneOpacityExpr=m=>["interpolate",["linear"],["zoom"],8,m,11.5,m*0.55,13,0.06,14.5,0];
+
+// Zone shading = frontier heat, stretched across the observed spread.
+function computeZoneColors(){
+  if(!zonesGeo) return;
+  const gs=zonesGeo.features.map(f=>growthIndex(f.properties.signals));
+  const sorted=[...gs].sort((a,b)=>a-b), n=sorted.length;
+  const q=p=>sorted[Math.max(0,Math.min(n-1,Math.floor(p*(n-1))))];
+  let lo=q(.08),hi=q(.92);
+  if(hi-lo<1){lo=Math.min(...gs);hi=Math.max(...gs);} if(hi-lo<1)hi=lo+1;
+  const heat=v=>{const t=Math.max(0,Math.min(100,(v-lo)/(hi-lo)*100));
+    const s=[[0,"#f5f0e6"],[50,"#e0a24f"],[100,"#8c2d1a"]];
+    const hex=c=>[parseInt(c.slice(1,3),16),parseInt(c.slice(3,5),16),parseInt(c.slice(5,7),16)];
+    for(let i=0;i<s.length-1;i++){ if(t<=s[i+1][0]){const k=(t-s[i][0])/(s[i+1][0]-s[i][0]),a=hex(s[i][1]),b=hex(s[i+1][1]);
+      return `rgb(${a.map((x,j)=>Math.round(x+(b[j]-x)*k)).join(",")})`;} } return s[2][1]; };
+  zonesGeo.features.forEach((f,i)=>{f.properties.g=Math.round(gs[i]); f.properties.c=heat(gs[i]);});
 }
-const PARCEL_RAMP=[0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"];
-// If the live expression is ever invalid, fall back to the server's stored score
-// so parcels always render instead of silently disappearing.
-const FALLBACK_COLOR=["interpolate",["linear"],["to-number",["get","target_score"],0],...PARCEL_RAMP];
+function recolorZones(){ computeZoneColors(); if(map.getSource("zones")) map.getSource("zones").setData(zonesGeo); }
+
+// Parcel colour = modelled value / price, computed live from the same maths as
+// the detail panel. V is linear in developer price and current price given the
+// hazard path, so the path coefficients go in as a per-(zone,state) lookup.
+const FALLBACK_COLOR=["interpolate",["linear"],["to-number",["get","target_score"],0],
+  0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"];
 function parcelColorExpr(){
-  try{ return ["interpolate",["linear"],liveTargetExpr(),...PARCEL_RAMP]; }
-  catch(e){ console.warn("live color expr failed; using stored score",e); return FALLBACK_COLOR; }
+  try{
+    if(!zonesGeo||!zonesGeo.features.length) return FALLBACK_COLOR;
+    const payoff=[],d0=[];const seen=new Set();
+    zonesGeo.features.forEach(f=>{
+      const z=f.properties&&f.properties.zcta; if(z==null) return;
+      const gi=growthIndex(f.properties.signals);
+      const dv=+f.properties.dev_value_per_acre||0;
+      ["A","B","C"].forEach(st=>{ const k=String(z)+"|"+st;
+        if(seen.has(k)) return; seen.add(k);
+        payoff.push(k, +pathOf(gi,st).payoff.toFixed(5)); });
+      d0.push(String(z), dv);
+    });
+    if(!payoff.length||!d0.length) return FALLBACK_COLOR;
+    const key=["concat",["to-string",["get","zcta"]],"|",["to-string",["get","water_state"]]];
+    const payoffE=["match",key,...payoff,0];
+    const d0E=["match",["to-string",["get","zcta"]],...d0,0];
+    const priceE=["max",1,["/",["to-number",["get","est"],0],["max",0.01,["to-number",["get","acres"],1]]]];
+    // ratio ~= payoff * developerPrice / currentPrice  (floor and carry terms are
+    // second order for a colour bucket; exact figures appear in the panel)
+    const siteE=["*",
+      ["case",["==",["get","landlocked"],true],0.35,1],
+      ["case",["==",["to-string",["get","flood_zone"]],"FLOODWAY"],0.10,
+              ["!=",["to-string",["get","flood_zone"]],""],0.75,1]];
+    const ratioE=["*",payoffE,["/",["*",d0E,siteE],priceE]];
+    const stops=[0,"#d73027",1,"#fee08b",1.6,"#a6d96a",3,"#1a9850"];
+    return ["interpolate",["linear"],ratioE,...stops];
+  }catch(e){ console.warn("value colour expression failed; using stored score",e); return FALLBACK_COLOR; }
 }
-const weightsParam=()=>SIGS.map(k=>k+":"+weights[k]).join(",");
 function repaintParcels(){
   const expr=parcelColorExpr();
   try{
     if(map.getLayer("parcels-fill")) map.setPaintProperty("parcels-fill","fill-color",expr);
     if(map.getLayer("parcels-pt"))   map.setPaintProperty("parcels-pt","circle-color",expr);
   }catch(e){
-    console.warn("repaint failed; reverting to stored score",e);
     if(map.getLayer("parcels-fill")) map.setPaintProperty("parcels-fill","fill-color",FALLBACK_COLOR);
     if(map.getLayer("parcels-pt"))   map.setPaintProperty("parcels-pt","circle-color",FALLBACK_COLOR);
   }
 }
 
-function forecast(p){
-  const V0=p.status==="For sale"?p.list_price:p.est, g=growthOf(p.zone_signals)/100, r=ASM.base+SP*g;
-  const pU=t=>Math.max(0,Math.min(.95,g*ASM.opt*Math.pow(t/20,1.3)));
-  const base=t=>V0*Math.pow(1+r,t)*(1+JUMP*pU(t));
-  const low=t=>V0*Math.pow(1+Math.max(0,r-0.02),t)*(1+JUMP*pU(t)*0.5);
-  const high=t=>V0*Math.pow(1+r+0.025,t)*(1+JUMP*Math.min(.95,pU(t)*1.4));
-  const pv=T=>{let s=0;for(let t=1;t<=T;t++)s+=V0*Math.pow(1+r,t)*ASM.carry/Math.pow(1+ASM.hurdle,t);return s;};
-  return {V0,base,low,high,fair:T=>base(T)/Math.pow(1+ASM.hurdle,T)-pv(T),sell:V0*(1-ASM.sell)};
-}
-
-// ---- map ----
-let zonesGeo=null;
-const map=new maplibregl.Map({container:"map",center:[-112.2,33.5],zoom:8.2,
-  style:{version:8,sources:{carto:{type:"raster",tiles:["https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"],tileSize:256,attribution:"CARTO, OpenStreetMap"}},
-    layers:[{id:"bg",type:"raster",source:"carto"}]}});
-const tip=document.getElementById("tip");
-function showTip(e,html){tip.innerHTML=html;const r=map.getContainer().getBoundingClientRect();
-  tip.style.left=Math.min(e.point.x+12,r.width-224)+"px";tip.style.top=(e.point.y+12)+"px";tip.style.opacity=1;}
-function hideTip(){tip.style.opacity=0;}
-
 map.on("load",()=>{
   fetch(API+"/zones").then(r=>r.json()).then(gj=>{ zonesGeo=gj; computeZoneColors(); setTimeout(repaintParcels,0);
     map.addSource("zones",{type:"geojson",data:gj});
-    const below = map.getLayer("parcels-fill") ? "parcels-fill" : undefined;
+    const below=map.getLayer("parcels-fill")?"parcels-fill":undefined;
     map.addLayer({id:"zones-fill",type:"fill",source:"zones",
-      paint:{"fill-color":["get","c"],"fill-opacity":zoneOpacityExpr(0.55)}}, below);
-    map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#ffffff","line-width":0.6,"line-opacity":.7}}, below);
-    map.on("mousemove","zones-fill",e=>{const p=e.features[0].properties;showTip(e,`<b>${p.zcta}</b><br>growth ${Math.round(p.g)} &middot; ${GL[p.water_status]}`);});
+      paint:{"fill-color":["get","c"],"fill-opacity":zoneOpacityExpr(0.55)}},below);
+    map.addLayer({id:"zones-line",type:"line",source:"zones",paint:{"line-color":"#fff","line-width":.6,"line-opacity":.7}},below);
+    map.on("mousemove","zones-fill",e=>{const p=e.features[0].properties;
+      showTip(e,`<b>${p.zcta}</b><br>frontier heat ${Math.round(p.g)}<br>developer land ${p.dev_value_per_acre?money(p.dev_value_per_acre)+"/ac":"n/a"}`);});
     map.on("mouseleave","zones-fill",hideTip);
   });
   map.addSource("parcels",{type:"vector",tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt"],minzoom:6,maxzoom:16});
@@ -247,220 +337,215 @@ map.on("load",()=>{
     paint:{"fill-color":parcelColorExpr(),"fill-opacity":.85,"fill-outline-color":"#fff"}});
   map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",filter:["==","$type","Point"],
     paint:{"circle-radius":["interpolate",["linear"],["zoom"],8,2.4,14,6],
-      "circle-color":parcelColorExpr(),
-      "circle-stroke-color":"#fff","circle-stroke-width":.7}});
-  // targets: a dedicated, larger, easy-to-click layer
+      "circle-color":parcelColorExpr(),"circle-stroke-color":"#fff","circle-stroke-width":.7}});
   map.addSource("targets",{type:"geojson",data:{type:"FeatureCollection",features:[]}});
-  map.addLayer({id:"targets-halo",type:"circle",source:"targets",
-    paint:{"circle-radius":12,"circle-color":"#1b1915","circle-opacity":.08}});
+  map.addLayer({id:"targets-halo",type:"circle",source:"targets",paint:{"circle-radius":12,"circle-color":"#1b1915","circle-opacity":.08}});
   map.addLayer({id:"targets-dot",type:"circle",source:"targets",
-    paint:{"circle-radius":8,"circle-color":["interpolate",["linear"],["get","score"],0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"],
+    paint:{"circle-radius":8,"circle-color":["interpolate",["linear"],["to-number",["get","score"],0],0,"#d73027",1,"#fee08b",1.6,"#a6d96a",3,"#1a9850"],
       "circle-stroke-color":"#1b1915","circle-stroke-width":1.4}});
-  const openFromFeat=e=>{const f=e.features&&e.features[0]; if(f) openParcel(f.properties.apn);};
+  const open=e=>{const f=e.features&&e.features[0]; if(f) openParcel(f.properties.apn);};
   ["parcels-fill","parcels-pt","targets-dot","targets-halo"].forEach(L=>{
-    map.on("click",L,openFromFeat);
+    map.on("click",L,open);
     map.on("mouseenter",L,()=>map.getCanvas().style.cursor="pointer");
     map.on("mouseleave",L,()=>map.getCanvas().style.cursor="");
   });
-  // hovering a parcel previews it before you click
   ["parcels-fill","parcels-pt"].forEach(L=>{
     map.on("mousemove",L,e=>{const p=e.features[0].properties;
-      showTip(e,`<b>${p.apn}</b><br>${p.use} &middot; ${p.acres?(+p.acres).toLocaleString()+" ac":"acreage n/a"}<br>target ${p.target_score??"?"} &middot; growth ${p.growth_score??"?"}`);});
+      const acres=+p.acres||0, est=+p.est||0, pa=acres>0?est/acres:0;
+      showTip(e,`<b>${p.apn}</b><br>${p.use} · ${acres?acres.toLocaleString()+" ac":"acreage n/a"}<br>${pa?money(pa)+"/ac":""} · water ${p.water_state||"?"}`);});
     map.on("mouseleave",L,hideTip);
   });
 });
 
-// Colors are stretched across the actual spread of regions (p8-p92), so changing
-// weights redistributes color and the heatmap visibly moves even when the raw
-// growth numbers shift only a little.
-function computeZoneColors(){
-  if(!zonesGeo) return;
-  const gs=zonesGeo.features.map(f=>growthOf(f.properties.signals));
-  const sorted=[...gs].sort((a,b)=>a-b), n=sorted.length;
-  const q=p=>sorted[Math.max(0,Math.min(n-1,Math.floor(p*(n-1))))];
-  let lo=q(0.08), hi=q(0.92);
-  if(hi-lo<1){lo=Math.min(...gs);hi=Math.max(...gs);}
-  if(hi-lo<1)hi=lo+1;
-  zonesGeo.features.forEach((f,i)=>{
-    f.properties.g=Math.round(gs[i]);
-    f.properties.c=ramp(Math.max(0,Math.min(100,(gs[i]-lo)/(hi-lo)*100)));
-  });
-}
-function recolorZones(){ computeZoneColors(); if(map.getSource("zones")) map.getSource("zones").setData(zonesGeo); }
+/* ===================== PARCEL DETAIL ============================ */
+async function openParcel(apn){ showTab("detail"); selApn=apn;
+  const p=await (await fetch(API+"/parcels/"+apn)).json(); renderDetail(p); }
 
-// ---- parcel detail ----
-async function openParcel(apn){
-  showTab("detail"); selApn=apn;
-  const p=await (await fetch(API+"/parcels/"+apn)).json();
-  renderDetail(p);
-}
-let curP=null;
 function renderDetail(p){
   curP=p;
-  const gain=p.paid?(p.est/p.paid).toFixed(1)+"×":"n/a";
-  const held=p.acquired?`${p.acquired} (${p.tenure} yrs)`:"Not on record";
-  const priceLbl=p.status==="For sale"?"List price":"Est. value", priceVal=p.status==="For sale"?p.list_price:p.est;
+  const held=p.acquired?`${p.acquired} (${p.tenure} yrs)`:"No recorded sale";
   document.getElementById("detailBody").innerHTML=`
     <h2>${p.situs_address||p.apn}</h2>
-    <div class="sub">${p.city||""} ${p.zcta||""} &middot; ${p.use} &middot; ${p.acres} ac &middot; APN ${p.apn}</div>
+    <div class="sub">${p.city||""} ${p.zcta||""} · ${p.use} · ${(+p.acres||0).toLocaleString()} ac · APN ${p.apn}</div>
     <div class="badges" id="badges"></div>
-    <div class="kv" style="margin-top:12px"><span class="k">${priceLbl}</span><span class="v" style="font-size:16px;font-weight:800">${money(priceVal)}</span>
-      <span class="k">Per acre</span><span class="v">${money(priceVal/p.acres)}</span></div>
-
-    <h3>Ownership</h3>
-    <div class="kv"><span class="k">Owner</span><span class="v" style="font-family:inherit">${p.owner}</span>
-      <span class="k">Type</span><span class="v" style="font-family:inherit">${p.owner_type}</span>
-      <span class="k">Held since</span><span class="v">${held}</span>
-      <span class="k">Acquired for</span><span class="v">${p.paid?money(p.paid):"No recorded sale"}</span>
-      <span class="k">Implied gain</span><span class="v">${gain}</span></div>
-
-    <h3>Purchase read &middot; <span id="hzlabel"></span></h3>
-    <div id="readblock"></div>
-
-    <h3>Projected value if held</h3>
+    <h3>Valuation</h3>
+    <div id="valblock"></div>
+    <h3>When does it convert?</h3>
     <div id="chart"></div>
-    <div id="fctable"></div>
-
+    <div id="timing"></div>
+    <h3>Ownership</h3>
+    <div class="kv"><span class="k">Owner</span><span class="v" style="font-family:inherit">${p.owner||""}</span>
+      <span class="k">Type</span><span class="v" style="font-family:inherit">${p.owner_type||""}</span>
+      <span class="k">Held since</span><span class="v">${held}</span>
+      <span class="k">Acquired for</span><span class="v">${p.paid?money(p.paid):"No recorded sale"}</span></div>
+    <div id="acqblock"></div>
     <h3>Hold or sell</h3>
     <div id="hsblock"></div>`;
-  document.getElementById("assumeBox").style.display="block";   // permanent, never rebuilt
-  updateForecastUI();     // fills the dynamic parts
+  document.getElementById("assumeBox").style.display="block";
+  updateValuationUI();
 }
 
-// Recompute only the forecast-driven pieces. Does NOT rebuild the sliders,
-// so dragging an assumption stays smooth and the section never collapses.
-function updateForecastUI(){
+function updateValuationUI(){
   if(!curP) return;
-  const p=curP, sg=p.zone_signals||{}, ws=sg.water_status, fc=forecast(p), H=HZY[horizon], g=growthOf(sg);
-  const projC=cagr(fc.V0,fc.base(H),H), diff=projC-ASM.hurdle;
-  const dLbl=diff>0.01?"Clears your hurdle":diff>=-0.01?"At your hurdle":"Below your hurdle";
-  const dCol=diff>0.01?"var(--good)":diff>=-0.01?"var(--warn)":"var(--bad)";
-  // reversed scale: Below (red) on the left, Clears (green) on the right
-  const mk=Math.max(3,Math.min(97,50+Math.max(-0.04,Math.min(0.04,diff))/0.04*47));
-  const holdPV=fc.fair(H), sell=fc.sell;
-  const V=holdPV>sell*1.05?["HOLD","var(--good)","holding beats selling at your hurdle"]
-        :holdPV<sell*0.95?["SELL","var(--bad)","trails your hurdle after costs"]
-        :["MARGINAL","var(--warn)","within ~5%, hinges on the water path"];
-  document.getElementById("hzlabel").textContent=H+"-yr exit";
-  const target=targetOf(p), gv=Math.round(g), wl=ws?GL[ws]:"n/a";
-  const tTarget=`Target score ${Math.round(target)} / 100 — how attractive this parcel is to pursue off-market, and the value the map colors by.\nFormula: 50% corridor growth + 30% owner tenure + 20% land type (vacant and ag score highest).`;
-  const tGrowth=`Corridor growth ${gv} / 100 for ZIP ${p.zcta}.\nWeighted blend of in-migration, developable land, permits, transport and schools, then multiplied by the water gate (now: ${wl}).`;
-  const tWater=`Water status from ADWR issued determinations.\nAssured: 100-year supply proven, full growth. Alternative pending: partial, growth ×0.7. Groundwater constrained: limited under current rules, growth ×0.3.`;
-  const tMkt=p.status==="For sale"?`Currently listed for sale at ${money(p.list_price)}.`:`No active MLS listing. Off-market parcels are the core acquisition opportunity, an owner you can approach directly.`;
+  const p=curP, V=valueOf(p);
+  if(!V){ document.getElementById("valblock").innerHTML=`<div class="empty">No value or acreage on record for this parcel.</div>`; return; }
+  const H=HZY[horizon], c=V.path, acq=acqOf(p);
+  const over = V.ratio<0.95, fair = V.ratio>=0.95 && V.ratio<=1.15;
+  const verdictTxt = over?"Overpriced at today's ask":(fair?"About fairly priced":"Trading below modelled value");
+  const verdictCol = over?"var(--bad)":(fair?"var(--warn)":"var(--good)");
+
   document.getElementById("badges").innerHTML=
-      `<span class="pill" style="background:${ramp(target)}" data-tip="${escAttr(tTarget)}">Target ${Math.round(target)}</span>`
-      +`<span class="pill" style="background:${ramp(g)}" data-tip="${escAttr(tGrowth)}">Growth ${gv}</span>`
-      +(ws?`<span class="pill" style="background:${GC[ws]}" data-tip="${escAttr(tWater)}">${GL[ws]}</span>`:"")
-      +(p.status==="For sale"?`<span class="pill" style="background:var(--teal)" data-tip="${escAttr(tMkt)}">For sale ${money(p.list_price)}</span>`:`<span class="pill" style="background:#8b8579" data-tip="${escAttr(tMkt)}">Off-market</span>`);
-  document.getElementById("readblock").innerHTML=`
-    <div class="sub" style="margin:-2px 0 6px">A separate question from the target score above: whether the projected return beats your hurdle at today's value.</div>
-    <div class="readline" style="color:${dCol}">${dLbl}</div>
-    <div class="sub">Projected <b>${pct(projC)}/yr</b> vs your ${pct(ASM.hurdle)} hurdle</div>
-    <div class="gauge"><div class="gaugebar"><span class="mk" style="left:${mk}%"></span></div>
-      <div class="gaugelbl"><span>Below</span><span>Hurdle</span><span>Clears</span></div></div>
-    <div class="sub" style="margin-top:8px">To clear your hurdle you could pay up to <b>${money(fc.fair(H))}</b>.</div>`;
-  drawChart(fc);
-  const rows=[5,10,20].map(t=>`<tr class="${t===H?'hl':''}"><td>${t}-yr</td><td>${money(fc.base(t))}</td><td>${pct(cagr(fc.V0,fc.base(t),t))}</td><td>${(fc.base(t)/fc.V0).toFixed(2)}×</td></tr>`).join("");
-  document.getElementById("fctable").innerHTML=`<table><tr><th>Horizon</th><th>Value</th><th>CAGR</th><th>×</th></tr>${rows}</table>`;
+     `<span class="pill" style="background:${ratioRamp(V.ratio)}" data-tip="${escAttr(
+        `Value to price ${V.ratio.toFixed(2)}x. Modelled value per acre divided by the current asking or assessed price per acre. Above 1 means the model thinks it is cheap; below 1 means dear. This is what the map colours by.`)}">Value ${V.ratio.toFixed(2)}×</span>`
+    +`<span class="pill" style="background:${WSCOL[V.state]}" data-tip="${escAttr(
+        `${WSLBL[V.state]}. A: inside a designated provider or holding an assured-supply certificate, developable now. B: irrigated agricultural land whose grandfathered irrigation right can be relinquished under SB1611 (2025) for groundwater savings credits usable within one mile. C: raw groundwater-dependent land, blocked for subdivision since ADWR halted groundwater-based assured-supply applications in 2023, and dependent on being absorbed by a provider or on policy change.`)}">${WSLBL[V.state]}</span>`
+    +`<span class="pill" style="background:#5b564d" data-tip="${escAttr(
+        `Frontier heat ${Math.round(V.gi)} of 100 for ZIP ${p.zcta}. A weighted blend of developable land share, sales velocity, transport projects and in-migration. It sets how fast development is moving toward this zone, which drives the conversion hazard. It does not set an appreciation rate.`)}">Frontier ${Math.round(V.gi)}</span>`
+    +(p.landlocked?`<span class="pill" style="background:#7a2718" data-tip="${escAttr(
+        "No frontage: almost the whole parcel boundary is shared with neighbouring parcels, so there is no contact with public right-of-way. Legal access is the first thing a buyer checks, and its absence is a 50 to 90 percent discount. Modelled value here is cut to 35 percent of what a developer would otherwise pay.")}">Landlocked</span>`:"")
+    +(p.flood_zone?`<span class="pill" style="background:${p.flood_zone==="FLOODWAY"?"#7a2718":"#8a6d3b"}" data-tip="${escAttr(
+        p.flood_zone==="FLOODWAY"?"In the regulatory floodway. Not developable at any water status; value cut to 10 percent."
+        :"Inside a FEMA 1-percent-annual-chance flood zone ("+p.flood_zone+"). Buildable with mitigation; value cut to 75 percent.")}">Flood ${p.flood_zone}</span>`:"")
+    +(V.fitted?`<span class="pill" style="background:#2f6f6a" data-tip="${escAttr(
+        "Conversion odds come from a hazard fitted on Maricopa's own construction-year history, not from a judgment parameter. Distance to the development frontier at the time is the main covariate.")}">Fitted hazard</span>`
+      :`<span class="pill" style="background:#8b8579" data-tip="${escAttr(
+        "Conversion odds are still a judgment parameter. Run the hazard fit to replace it with an estimate from county history.")}">Judgment hazard</span>`)
+    +(p.status==="For sale"?`<span class="pill" style="background:var(--teal)">For sale ${money(p.list_price)}</span>`
+      :`<span class="pill" style="background:#8b8579">Off-market</span>`);
+
+  document.getElementById("valblock").innerHTML=`
+    <div class="hs"><div class="box"><div class="k">Asking / assessed</div><div class="v">${money(V.price)}</div><small>per acre</small></div>
+      <div class="box"><div class="k">Modelled value</div><div class="v">${money(V.v)}</div><small>per acre</small></div></div>
+    <div class="readline" style="color:${verdictCol}">${verdictTxt}</div>
+    <div class="kv" style="margin-top:6px">
+      <span class="k">Whole parcel value</span><span class="v">${money(V.v*V.acres)}</span>
+      <span class="k">Developer pays here</span><span class="v">${money(V.d0)}/ac</span>
+      <span class="k">Carrying cost</span><span class="v">${(V.carry*100).toFixed(2)}%/yr</span>
+      ${V.site<1?`<span class="k">Site discount</span><span class="v" style="color:var(--bad)">×${V.site.toFixed(2)}</span>`:""}</div>
+    <div class="sub" style="margin-top:6px">Value is the discounted expectation of one conversion payoff, not compounded appreciation. Land sits flat, then steps up.</div>`;
+
+  drawConversion(c);
+  const p50=c.p50?`${c.p50} yrs`:"beyond 60 yrs";
+  document.getElementById("timing").innerHTML=`
+    <div class="kv"><span class="k">Even odds of converting</span><span class="v">${p50}</span>
+      <span class="k">Chance within ${H} yrs</span><span class="v">${pct(c.marks[H]||0)}</span>
+      <span class="k">Chance within 30 yrs</span><span class="v">${pct(c.marks[30]||0)}</span></div>`;
+
+  document.getElementById("acqblock").innerHTML=`
+    <div class="kv" style="margin-top:4px"><span class="k">Acquisition score</span>
+      <span class="v" style="font-weight:800;color:${acq>60?"var(--good)":(acq>40?"var(--warn)":"var(--ink-soft)")}" 
+        data-tip="${escAttr(`How approachable this owner looks: ${Math.round(acq)} of 100. Rises with years held, out-of-state mailing address, trust or estate ownership, and no recorded sale (an inherited parcel, often the most motivated). Falls for builders and developers, who bought to build. Deliberately separate from value: a long hold does not make the dirt worth more, it makes the owner easier to approach.`)}">${Math.round(acq)}</span></div>`;
+
+  const sellNet=V.price*(1-ASM.sell);
+  const hold=V.v;
+  const hv = hold>sellNet*1.05?["HOLD","var(--good)","modelled value beats selling today"]
+           : hold<sellNet*0.95?["SELL","var(--bad)","selling today beats the modelled wait"]
+           : ["MARGINAL","var(--warn)","within 5%, depends on your assumptions"];
   document.getElementById("hsblock").innerHTML=`
-    <div class="hs"><div class="box"><div class="k">Sell now, net</div><div class="v">${money(sell)}</div><small>after ${pct(ASM.sell)} costs</small></div>
-      <div class="box"><div class="k">Hold, value today</div><div class="v">${money(holdPV)}</div><small>PV of ${H}-yr exit</small></div></div>
-    <div class="verdict" style="background:${V[1]}"><span class="lead">${V[0]}</span><small>${V[2]}</small></div>`;
+    <div class="hs"><div class="box"><div class="k">Sell now, net</div><div class="v">${money(sellNet)}</div><small>per acre after ${pct(ASM.sell)}</small></div>
+      <div class="box"><div class="k">Hold, modelled</div><div class="v">${money(hold)}</div><small>per acre today</small></div></div>
+    <div class="verdict" style="background:${hv[1]}"><span class="lead">${hv[0]}</span><small>${hv[2]}</small></div>`;
 }
 
-function drawChart(fc){
-  const W=324,H=150,PL=48,PR=8,PT=8,PB=22,maxT=20,maxV=fc.high(20)*1.02;
-  const X=t=>PL+(t/maxT)*(W-PL-PR), Y=v=>PT+(1-v/maxV)*(H-PT-PB);
-  const path=fn=>{let d="";for(let t=0;t<=20;t+=0.5)d+=(t?"L":"M")+X(t).toFixed(1)+" "+Y(fn(t)).toFixed(1);return d;};
-  let band="M";for(let t=0;t<=20;t++)band+=X(t).toFixed(1)+" "+Y(fc.high(t)).toFixed(1)+"L";
-  for(let t=20;t>=0;t--)band+=X(t).toFixed(1)+" "+Y(fc.low(t)).toFixed(1)+"L";band=band.slice(0,-1)+"Z";
-  let gl="";for(const v of [maxV*.33,maxV*.66,maxV]) gl+=`<line x1="${PL}" y1="${Y(v).toFixed(1)}" x2="${W-PR}" y2="${Y(v).toFixed(1)}" stroke="#e6dfcf"/><text x="${PL-5}" y="${(Y(v)+3).toFixed(1)}" text-anchor="end" font-size="8.5" fill="#8b8579">${money(v)}</text>`;
-  let xl="";for(const t of [0,5,10,20]) xl+=`<text x="${X(t).toFixed(1)}" y="${H-7}" text-anchor="middle" font-size="8.5" fill="#8b8579">${t?"yr "+t:"now"}</text>`;
-  let dots="";for(const t of [5,10,20]) dots+=`<circle cx="${X(t).toFixed(1)}" cy="${Y(fc.base(t)).toFixed(1)}" r="3" fill="#9d2a1c"/>`;
-  const by=Y(fc.V0);
-  document.getElementById("chart").innerHTML=`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${gl}${xl}
-    <path d="${band}" fill="#cf6b39" fill-opacity=".14"/>
-    <line x1="${PL}" y1="${by.toFixed(1)}" x2="${W-PR}" y2="${by.toFixed(1)}" stroke="#2f6f6a" stroke-dasharray="4 3"/>
-    <path d="${path(fc.low)}" fill="none" stroke="#cf6b39" stroke-width="1" stroke-opacity=".5"/>
-    <path d="${path(fc.high)}" fill="none" stroke="#cf6b39" stroke-width="1" stroke-opacity=".5"/>
-    <path d="${path(fc.base)}" fill="none" stroke="#9d2a1c" stroke-width="2.2"/>${dots}</svg>`;
+// Cumulative probability the parcel has converted, by year. Replaces the old
+// smooth appreciation curve, which asserted a path no fringe parcel follows.
+function drawConversion(c){
+  const W=324,H=150,PL=34,PR=8,PT=8,PB=22,T=c.curve.length;
+  const X=t=>PL+(t/T)*(W-PL-PR), Y=v=>PT+(1-v)*(H-PT-PB);
+  let d="";for(let t=0;t<T;t++) d+=(t?"L":"M")+X(t+1).toFixed(1)+" "+Y(c.curve[t]).toFixed(1);
+  let gl="";[0.25,0.5,0.75,1].forEach(v=>{gl+=`<line x1="${PL}" y1="${Y(v).toFixed(1)}" x2="${W-PR}" y2="${Y(v).toFixed(1)}" stroke="#e6dfcf"/><text x="${PL-4}" y="${(Y(v)+3).toFixed(1)}" text-anchor="end" font-size="8.5" fill="#8b8579">${v*100}%</text>`;});
+  let xl="";[10,20,30,40,60].forEach(t=>{xl+=`<text x="${X(t).toFixed(1)}" y="${H-7}" text-anchor="middle" font-size="8.5" fill="#8b8579">${t}y</text>`;});
+  const marker=c.p50?`<line x1="${X(c.p50).toFixed(1)}" y1="${PT}" x2="${X(c.p50).toFixed(1)}" y2="${H-PB}" stroke="#2f6f6a" stroke-dasharray="4 3"/><text x="${(X(c.p50)+4).toFixed(1)}" y="${PT+10}" font-size="9" fill="#2f6f6a">even odds ${c.p50}y</text>`:"";
+  document.getElementById("chart").innerHTML=
+    `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${gl}${xl}${marker}<path d="${d}" fill="none" stroke="#8c2d1a" stroke-width="2.2"/></svg>
+     <div class="sub" style="margin-top:2px">Probability the parcel has become developable, by year.</div>`;
 }
 
-const ASLD=[["base","Base appreciation",0,10,.5,v=>v/100,v=>(v*100).toFixed(1)+"%"],
-  ["opt","Developability optimism",30,160,5,v=>v/100,v=>v.toFixed(2)+"×"],
-  ["hurdle","Your hurdle rate",3,15,.5,v=>v/100,v=>(v*100).toFixed(1)+"%"],
-  ["sell","Selling cost",4,14,1,v=>v/100,v=>(v*100).toFixed(0)+"%"]];
-function buildAssume(){const box=document.getElementById("asld");if(!box)return;
-  box.innerHTML=ASLD.map(([k,l,mn,mx,st])=>`<div class="sld"><div class="l"><span>${l}</span><span class="v" id="av_${k}"></span></div><input type="range" id="a_${k}" min="${mn}" max="${mx}" step="${st}" value="${ASM[k]*100}"></div>`).join("");
-  ASLD.forEach(([k,l,mn,mx,st,conv,fmt])=>{const inp=document.getElementById("a_"+k);document.getElementById("av_"+k).textContent=fmt(ASM[k]);
-    inp.addEventListener("input",()=>{ASM[k]=conv(+inp.value);document.getElementById("av_"+k).textContent=fmt(ASM[k]);if(selApn)refreshDetail();});});
+/* ===================== ASSUMPTIONS =============================== */
+const ASLD=[
+ ["rho","Discount rate",3,12,.1,v=>v/100,v=>(v*100).toFixed(1)+"%",
+  "Treasury plus an illiquidity premium. Risk about whether and when the parcel converts is already carried by the probabilities, so it is not also loaded into this rate."],
+ ["g_D","Developable land drift",0,7,.1,v=>v/100,v=>(v*100).toFixed(1)+"%",
+  "How fast the price of already-developable land grows. Estimate from a repeat-sales index; a judgment value until then."],
+ ["lambda_p","Policy resolution odds",0,4,.1,v=>v/100,v=>(v*100).toFixed(1)+"%/yr",
+  "Annual chance Arizona groundwater rules change enough to unblock raw land countywide. Genuinely unknowable, which is why it is a slider and not a buried constant."],
+ ["h_max","Frontier pace, hottest zone",1,15,.5,v=>v/100,v=>(v*100).toFixed(1)+"%/yr",
+  "Annual chance a parcel in the hottest corridor converts. Replaced by a fitted hazard once construction-year data is loaded."],
+ ["sell","Selling cost",4,14,1,v=>v/100,v=>(v*100).toFixed(0)+"%",
+  "Brokerage and closing on a land sale."]];
+
+function buildAssume(){
+  const box=document.getElementById("asld"); if(!box) return;
+  box.innerHTML=ASLD.map(([k,l,mn,mx,st,,fmt,tipTxt])=>
+    `<div class="sld"><div class="l"><span data-tip="${escAttr(tipTxt)}">${l}</span><span class="v" id="av_${k}"></span></div>
+     <input type="range" id="a_${k}" min="${mn}" max="${mx}" step="${st}" value="${ASM[k]*100}"></div>`).join("");
+  ASLD.forEach(([k,l,mn,mx,st,conv,fmt])=>{
+    const inp=document.getElementById("a_"+k);
+    document.getElementById("av_"+k).textContent=fmt(ASM[k]);
+    inp.addEventListener("input",()=>{ ASM[k]=conv(+inp.value);
+      document.getElementById("av_"+k).textContent=fmt(ASM[k]);
+      clearPaths(); repaintParcels(); markDirty(); if(curP) updateValuationUI(); });
+  });
 }
-function refreshDetail(){ if(curP) updateForecastUI(); }
 
-function flyToZone(zcta){ if(!zonesGeo) return; const f=zonesGeo.features.find(x=>x.properties.zcta===zcta); }
+const WPARAMS=[["lambda_s","Provider absorption, at the frontier",0,15,.5,v=>v/100,v=>(v*100).toFixed(1)+"%/yr"],
+               ["wB0","Irrigated ag feasibility today",20,100,5,v=>v/100,v=>(v*100).toFixed(0)+"%"]];
+function buildWaterParams(){
+  const box=document.getElementById("wparams"); if(!box) return;
+  box.innerHTML=WPARAMS.map(([k,l,mn,mx,st,,fmt])=>
+    `<div class="sld"><div class="l"><span>${l}</span><span class="v" id="wv_${k}"></span></div>
+     <input type="range" id="wp_${k}" min="${mn}" max="${mx}" step="${st}" value="${ASM[k]*100}"></div>`).join("");
+  WPARAMS.forEach(([k,l,mn,mx,st,conv,fmt])=>{
+    const inp=document.getElementById("wp_"+k);
+    document.getElementById("wv_"+k).textContent=fmt(ASM[k]);
+    inp.addEventListener("input",()=>{ ASM[k]=conv(+inp.value);
+      document.getElementById("wv_"+k).textContent=fmt(ASM[k]);
+      clearPaths(); repaintParcels(); markDirty(); if(curP) updateValuationUI(); });
+  });
+}
 
-// ---- search ----
+/* ===================== SEARCH =================================== */
 const q=document.getElementById("q"), res=document.getElementById("res"); let st=null;
-q.addEventListener("input",()=>{clearTimeout(st);const v=q.value.trim();if(v.length<2){res.classList.remove("on");return;}
-  st=setTimeout(async()=>{const rows=await(await fetch(API+"/parcels/search?q="+encodeURIComponent(v))).json();
-    res.innerHTML=rows.map(r=>`<div data-apn="${r.apn}">${r.situs_address} <span class="m">${r.city} ${r.zcta} &middot; ${money(r.est)}</span></div>`).join("")||`<div class="m" style="padding:8px 10px">No match</div>`;
+q.addEventListener("input",()=>{clearTimeout(st);const v=q.value.trim(); if(v.length<2){res.classList.remove("on");return;}
+  st=setTimeout(async()=>{ const rows=await (await fetch(API+"/parcels/search?q="+encodeURIComponent(v))).json();
+    res.innerHTML=rows.map(r=>`<div data-apn="${r.apn}">${r.situs_address} <span class="m">${r.city} ${r.zcta} · ${money(r.est)}</span></div>`).join("")||`<div class="m" style="padding:8px 10px">No match</div>`;
     res.classList.add("on");
     res.querySelectorAll("[data-apn]").forEach(d=>d.addEventListener("click",()=>{openParcel(d.dataset.apn);res.classList.remove("on");q.value="";}));},200);});
-document.addEventListener("click",e=>{if(!q.parentNode.contains(e.target))res.classList.remove("on");});
+document.addEventListener("click",e=>{ if(!q.parentNode.contains(e.target)) res.classList.remove("on"); });
 
-// ---- targets ----
+/* ===================== TARGETS / BLOCKS ========================= */
 const val=id=>document.getElementById(id).value;
-async function loadTargets(){
-  const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),weights:weightsParam(),gate:gateOn,limit:80});
-  const rows=await(await fetch(API+"/targets?"+pr)).json();
-  document.getElementById("targetList").innerHTML=rows.map(r=>`
-    <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
-      <div class="r1"><span>${r.situs_address}</span><span class="pill" style="background:${ramp(r.target_score)}">${Math.round(r.target_score)}</span></div>
-      <div class="r2"><span>${r.use} &middot; ${r.acres} ac &middot; <b>${r.acres?money(r.est/r.acres)+"/ac":"n/a"}</b> &middot; held ${r.tenure??"?"}y</span><span>${money(r.est)}</span></div></div>`).join("")
-    ||`<div class="empty">No targets match these filters.</div>`;
-  targetsDirty=false;
-  document.querySelectorAll("#targetList .card").forEach(c=>c.addEventListener("click",()=>{openParcel(c.dataset.apn);map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
-  const src=map.getSource("targets");
-  if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
-    geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.target_score}}))});
-}
-["fUse","fOwner","fAcres","fTen"].forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
-document.getElementById("exportBtn").addEventListener("click",()=>{
-  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),weights:weightsParam(),gate:gateOn,limit:2000});
-  window.location.href=API+"/targets/export?"+p;
-});
-
-// ---- heatmap controls ----
-function buildWeights(){
-  document.getElementById("wSliders").innerHTML=SIGS.map(k=>`<div class="sld"><div class="l"><span>${SIGLBL[k]}</span><span class="v" id="wv_${k}">${weights[k]}</span></div><input type="range" id="w_${k}" min="0" max="100" step="5" value="${weights[k]}"></div>`).join("");
-  SIGS.forEach(k=>document.getElementById("w_"+k).addEventListener("input",e=>{weights[k]=+e.target.value;document.getElementById("wv_"+k).textContent=e.target.value;afterWeights();}));
-  document.querySelectorAll("#hzSeg button").forEach(b=>b.addEventListener("click",()=>{
-    horizon=b.dataset.h; weights={...PRESETS[horizon]};
-    document.querySelectorAll("#hzSeg button").forEach(x=>x.setAttribute("aria-pressed",x===b));
-    SIGS.forEach(k=>{document.getElementById("w_"+k).value=weights[k];document.getElementById("wv_"+k).textContent=weights[k];});afterWeights();}));
-  document.getElementById("gate").addEventListener("change",e=>{gateOn=e.target.checked;afterWeights();});
-  document.getElementById("heatOp").addEventListener("input",e=>{if(map.getLayer("zones-fill"))map.setPaintProperty("zones-fill","fill-opacity",zoneOpacityExpr(+e.target.value/100));});
-}
-// Weight changes invalidate the server-ranked lists. The sliders live on the
-// Heatmap tab, so the lists are usually hidden when they change: mark them dirty
-// and reload on the next view, or immediately if already showing.
-function afterWeights(){ recolorZones(); repaintParcels(); if(selApn) refreshDetail();
-  targetsDirty=true; blocksDirty=true;
+const modelParams=()=>({horizon:HZY[horizon],lambda_p:ASM.lambda_p,h_max:ASM.h_max,g_d:ASM.g_D,rho:ASM.rho});
+function markDirty(){ targetsDirty=true; blocksDirty=true;
   if(document.getElementById("pane-targets").style.display!=="none") loadTargets();
   if(document.getElementById("pane-blocks").style.display!=="none") loadBlocks(); }
 
-// ---- tabs ----
-function showTab(t){
-  document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-selected",b.dataset.t===t));
-  document.getElementById("pane-detail").style.display=t==="detail"?"block":"none";
-  document.getElementById("pane-targets").style.display=t==="targets"?"block":"none";
-  document.getElementById("pane-blocks").style.display=t==="blocks"?"block":"none";
-  document.getElementById("pane-map").style.display=t==="map"?"block":"none";
-  document.getElementById("legMode").textContent=t==="targets"?"by target score":(t==="blocks"?"owner land blocks":"shaded by ZIP region");
-  if(t==="targets"){ if(targetsDirty || !document.getElementById("targetList").children.length) loadTargets(); }
-  else if(t==="blocks"){ if(blocksDirty || !document.getElementById("blockList").children.length) loadBlocks(); }
-  else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
+async function loadTargets(){
+  const el=document.getElementById("targetList");
+  el.innerHTML=`<div class="empty">Valuing parcels…</div>`;
+  const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),
+    min_tenure:val("fTen"),limit:80,...modelParams()});
+  let rows=[];
+  try{ rows=await (await fetch(API+"/targets?"+pr)).json(); }catch(e){ el.innerHTML=`<div class="empty">Could not load targets.</div>`; return; }
+  if(!rows.length){ el.innerHTML=`<div class="empty">No parcels match these filters.</div>`; return; }
+  el.innerHTML=rows.map(r=>`
+    <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
+      <div class="r1"><span>${r.situs_address||r.apn}</span><span class="pill" style="background:${ratioRamp(r.value_ratio)}">${(r.value_ratio||0).toFixed(2)}×</span></div>
+      <div class="r2"><span>${r.use} · ${(+r.acres).toLocaleString()} ac · <b>${money(r.price_per_acre)}/ac</b></span><span>${money(r.value_per_acre)}/ac value</span></div>
+      <div class="r2"><span style="color:${WSCOL[r.water_state]}">${WSLBL[r.water_state]}</span><span>${r.p50_years?("even odds "+r.p50_years+"y"):">60y"} · held ${r.tenure??"?"}y</span></div>
+    </div>`).join("");
+  targetsDirty=false;
+  el.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{
+    openParcel(c.dataset.apn); map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
+  const src=map.getSource("targets");
+  if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
+    geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.value_ratio||0}}))});
 }
+["fUse","fOwner","fAcres","fTen"].forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
+document.getElementById("exportBtn").addEventListener("click",()=>{
+  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),
+    min_tenure:val("fTen"),limit:2000,...modelParams()});
+  window.location.href=API+"/targets/export?"+p; });
 
 async function loadBlocks(){
   const el=document.getElementById("blockList");
@@ -471,28 +556,52 @@ async function loadBlocks(){
   if(!rows.length){ el.innerHTML=`<div class="empty">No owner blocks match these filters.</div>`; return; }
   el.innerHTML=rows.map(r=>`
     <div class="card" data-lon="${r.lon}" data-lat="${r.lat}" data-apn="${(r.apns&&r.apns[0])||""}">
-      <div class="r1"><span>${r.owner}</span><span class="pill" style="background:${ramp(r.avg_target)}">${Math.round(r.avg_target)}</span></div>
-      <div class="r2"><span><b>${r.parcel_count} parcels</b> &middot; ${(+r.total_acres).toLocaleString()} ac &middot; <b>${r.per_acre?money(r.per_acre)+"/ac":"n/a"}</b></span><span>${money(r.total_est)}</span></div>
-      <div class="r2"><span>${r.city||""} ${r.zcta||""} &middot; held up to ${r.max_tenure??"?"}y</span><span>${r.owner_type}</span></div>
+      <div class="r1"><span>${r.owner}</span><span class="pill" style="background:#5b564d">${r.parcel_count} parcels</span></div>
+      <div class="r2"><span>${(+r.total_acres).toLocaleString()} ac · <b>${r.per_acre?money(r.per_acre)+"/ac":"n/a"}</b></span><span>${money(r.total_est)}</span></div>
+      <div class="r2"><span>${r.city||""} ${r.zcta||""}</span><span>held up to ${r.max_tenure??"?"}y</span></div>
     </div>`).join("");
   blocksDirty=false;
   el.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{
-    map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});
-    if(c.dataset.apn) openParcel(c.dataset.apn);
-  }));
-  const src=map.getSource("targets");
-  if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
-    geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:(r.apns&&r.apns[0])||"",score:r.avg_target}}))});
+    map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13}); if(c.dataset.apn) openParcel(c.dataset.apn); }));
 }
 ["bParcels","bAcres"].forEach(id=>document.getElementById(id).addEventListener("change",loadBlocks));
-document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.t)));
-document.getElementById("assumeBox").innerHTML='<h3 style="margin:4px 0 6px">Assumptions</h3><div id="asld"></div>';
-buildAssume();
-buildWeights();
 
-// explanatory hover bubbles for any element with data-tip (the detail pills, etc.)
-const htip=document.getElementById("htip");
-document.addEventListener("mouseover",e=>{const t=e.target.closest&&e.target.closest("[data-tip]");if(t){htip.textContent=t.dataset.tip;htip.style.opacity="1";}});
-document.addEventListener("mousemove",e=>{if(htip.style.opacity==="1"){htip.style.left=Math.min(e.clientX+14,window.innerWidth-282)+"px";htip.style.top=Math.min(e.clientY+16,window.innerHeight-130)+"px";}});
-document.addEventListener("mouseout",e=>{const t=e.target.closest&&e.target.closest("[data-tip]");if(t)htip.style.opacity="0";});
+/* ===================== SIGNAL WEIGHTS / TABS ==================== */
+function buildWeights(){
+  document.getElementById("wSliders").innerHTML=SIGS.map(k=>
+    `<div class="sld"><div class="l"><span>${SIGLBL[k]}</span><span class="v" id="wv2_${k}">${weights[k]}</span></div>
+     <input type="range" id="w_${k}" min="0" max="100" step="5" value="${weights[k]}"></div>`).join("");
+  SIGS.forEach(k=>document.getElementById("w_"+k).addEventListener("input",e=>{
+    weights[k]=+e.target.value; document.getElementById("wv2_"+k).textContent=e.target.value; afterWeights(); }));
+  document.querySelectorAll("#hzSeg button").forEach(b=>b.addEventListener("click",()=>{
+    horizon=b.dataset.h; weights={...PRESETS[horizon]};
+    document.querySelectorAll("#hzSeg button").forEach(x=>x.setAttribute("aria-pressed",x===b));
+    SIGS.forEach(k=>{document.getElementById("w_"+k).value=weights[k];document.getElementById("wv2_"+k).textContent=weights[k];});
+    afterWeights(); }));
+  document.getElementById("heatOp").addEventListener("input",e=>{
+    if(map.getLayer("zones-fill")) map.setPaintProperty("zones-fill","fill-opacity",zoneOpacityExpr(+e.target.value/100)); });
+}
+function afterWeights(){ clearPaths(); recolorZones(); repaintParcels(); if(curP) updateValuationUI(); markDirty(); }
+
+function showTab(t){
+  document.querySelectorAll(".tabs button").forEach(b=>b.setAttribute("aria-selected",b.dataset.t===t));
+  document.getElementById("pane-detail").style.display=t==="detail"?"block":"none";
+  document.getElementById("pane-targets").style.display=t==="targets"?"block":"none";
+  document.getElementById("pane-blocks").style.display=t==="blocks"?"block":"none";
+  document.getElementById("pane-map").style.display=t==="map"?"block":"none";
+  const lm=document.getElementById("legMode");
+  if(lm) lm.textContent=t==="targets"?"parcels by value vs price":(t==="blocks"?"owner land blocks":"zones by frontier heat");
+  if(t==="targets"){ if(targetsDirty||!document.getElementById("targetList").children.length) loadTargets(); }
+  else if(t==="blocks"){ if(blocksDirty||!document.getElementById("blockList").children.length) loadBlocks(); }
+  else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
+}
+document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.t)));
+
+document.getElementById("assumeBox").innerHTML='<h3 style="margin:4px 0 6px">Assumptions</h3><div id="asld"></div>';
+buildAssume(); buildWaterParams(); buildWeights();
+
+document.addEventListener("mouseover",e=>{const t=e.target.closest&&e.target.closest("[data-tip]"); if(t){htip.textContent=t.dataset.tip;htip.style.opacity="1";}});
+document.addEventListener("mousemove",e=>{ if(htip.style.opacity==="1"){htip.style.left=Math.min(e.clientX+14,window.innerWidth-292)+"px";htip.style.top=Math.min(e.clientY+16,window.innerHeight-150)+"px";}});
+document.addEventListener("mouseout",e=>{const t=e.target.closest&&e.target.closest("[data-tip]"); if(t) htip.style.opacity="0";});
 </script>
+

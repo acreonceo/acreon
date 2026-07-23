@@ -4,6 +4,8 @@ straight from PostGIS. Every SQL statement here was validated against a live
 PostGIS instance before shipping.
 """
 import os, json, pathlib, requests, csv, io
+import model as MODEL
+import hazard as HZ
 from fastapi import FastAPI, Response, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -109,6 +111,11 @@ SELECT ST_AsMVT(t,'parcels') FROM (
   SELECT p.apn, p.use, p.status, p.acres, p.zcta,
          coalesce(p.tenure,0)::int AS tenure,
          p.owner_type,
+         p.est::bigint AS est,
+         COALESCE(p.water_state,'C') AS water_state,
+         COALESCE(p.landlocked,false) AS landlocked,
+         COALESCE(p.flood_zone,'') AS flood_zone,
+         round(COALESCE(p.carry_rate,0.003)::numeric,4)::float8 AS carry_rate,
          round(p.target_score)::int AS target_score,
          round(p.growth_score)::int AS growth_score,
          ST_AsMVTGeom(ST_Transform(p.geom,3857), b.g) geom
@@ -137,7 +144,8 @@ def zones():
           'type','Feature',
           'geometry', ST_AsGeoJSON(ST_SimplifyPreserveTopology(geom, 0.002))::jsonb,
           'properties', jsonb_build_object('zcta',zcta,'growth',growth_default,
-                                           'water_status',water_status,'signals',signals)))
+                                           'water_status',water_status,'signals',signals,
+                                           'dev_value_per_acre',dev_value_per_acre)))
       ) FROM zones""")
     return Response(json.dumps(row[0]), media_type="application/json")
 
@@ -155,7 +163,7 @@ def search(q: str = Query(..., min_length=2), limit: int = 12):
 @app.get("/parcels/{apn}")
 def parcel(apn: str):
     rows = qall("""
-      SELECT p.*, z.signals AS zone_signals
+      SELECT p.*, z.signals AS zone_signals, z.dev_value_per_acre
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
       WHERE p.apn = %s
     """, (apn,))
@@ -217,109 +225,140 @@ PUBLIC_OWNER_PATTERNS = [
     '%COMMUNITY ASSOCIATION%', '%COMMON AREA%',
 ]
 
-@app.get("/targets")
-def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
-            min_tenure: int = 0, min_growth: float = 0, water_status: str = "",
-            include_public: bool = False, weights: str = "", gate: bool = True,
-            limit: int = 100):
-    W = _parse_weights(weights)
-    growth_sql, target_sql = _live_sql(W, gate)
-    where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
-             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", f"{growth_sql} >= %s"]
-    params = [min_acres, min_tenure, min_growth]
-    if use:          where.append("p.use = %s");         params.append(use)
-    if owner_type:   where.append("p.owner_type = %s");  params.append(owner_type)
-    if water_status: where.append("z.water_status = %s"); params.append(water_status)
-    if not include_public:
-        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))")
-        params.append(PUBLIC_OWNER_PATTERNS)
-    params.append(limit)
+def _model_params(lambda_p=None, h_max=None, g_d=None, rho=None, horizon=None):
+    p = dict(MODEL.DEFAULTS)
+    if lambda_p is not None: p["lambda_p"] = max(0.0, min(0.10, lambda_p))
+    if h_max    is not None: p["h_max"]    = max(0.005, min(0.20, h_max))
+    if g_d      is not None: p["g_D"]      = max(-0.02, min(0.10, g_d))
+    if rho      is not None: p["rho"]      = max(0.02, min(0.15, rho))
+    return p
+
+def _candidates(where_sql, params):
     return qall(f"""
-      SELECT p.apn, p.situs_address, p.city, p.zcta, p.use, p.acres, p.owner, p.owner_type,
-             p.tenure, p.acquired, p.paid, p.est,
-             round({growth_sql}::numeric,1) AS growth_score,
-             round({target_sql}::numeric,1) AS target_score,
+      SELECT p.apn, p.situs_address, p.city, p.zcta, p.use, p.acres, p.est, p.assessed,
+             p.owner, p.owner_type, p.absentee, p.tenure, p.acquired, p.paid,
+             p.mail_address, COALESCE(p.water_state,'C') AS water_state,
+             p.carry_rate, p.hazard_fitted, p.landlocked, p.flood_zone, p.edge_miles,
+             z.signals AS signals, z.dev_value_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
-      WHERE {' AND '.join(where)}
-      ORDER BY {target_sql} DESC
-      LIMIT %s
-    """, tuple(params))
+      WHERE {where_sql}
+    """, params)
+
+def _valued(rows, p, horizon=10):
+    """Attach V, V/P, timing and acquisition score. The hazard path depends only
+    on (zone growth, water state), so it is computed once per pair and reused."""
+    cache = {}
+    out = []
+    for r in rows:
+        acres = float(r["acres"] or 0)
+        est = float(r["est"] or 0)
+        if acres <= 0 or est <= 0:
+            continue
+        gi = MODEL.growth_index(r["signals"] or {})
+        st = r["water_state"] or "C"
+        hf = float(r["hazard_fitted"]) if r.get("hazard_fitted") is not None else None
+        key = (round(gi, 1), st, round(hf, 4) if hf is not None else None)
+        if key not in cache:
+            cache[key] = MODEL.path(gi, st, p, hazard_override=hf)
+        c = cache[key]
+        site = MODEL.site_factor(r.get("landlocked"), r.get("flood_zone"))
+        price_ac = est / acres
+        d0 = float(r["dev_value_per_acre"] or 0) or price_ac * 3.0
+        cr = float(r["carry_rate"]) if r["carry_rate"] is not None else MODEL.carry_rate(est, r["assessed"])
+        v_ac = MODEL.value_per_acre(c, d0, price_ac, cr, site)
+        r["growth_index"] = round(gi, 1)
+        r["price_per_acre"] = round(price_ac)
+        r["dev_price_per_acre"] = round(d0)
+        r["value_per_acre"] = round(v_ac)
+        r["value_total"] = round(v_ac * acres)
+        r["value_ratio"] = round(v_ac / price_ac, 2) if price_ac > 0 else None
+        r["p50_years"] = c["p50_years"]
+        r["p_convert"] = c["p_convert"].get(horizon)
+        r["carry_pct"] = round(cr * 100, 2)
+        r["site_factor"] = round(site, 2)
+        r["hazard_source"] = "fitted" if hf is not None else "judgment"
+        r["acq_score"] = round(MODEL.acquisition_score(
+            r["tenure"], r["owner_type"], r["absentee"], bool(r["paid"])), 1)
+        r.pop("signals", None)
+        out.append(r)
+    return out
+
+@app.get("/targets")
+def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
+            min_tenure: int = 0, water_state: str = "", include_public: bool = False,
+            min_ratio: float = 0, horizon: int = 10,
+            lambda_p: float = None, h_max: float = None, g_d: float = None,
+            rho: float = None, sort: str = "value_ratio", limit: int = 100):
+    where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
+             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", "p.est > 0", "p.acres > 0"]
+    args = [min_acres, min_tenure]
+    if use:          where.append("p.use = %s");          args.append(use)
+    if owner_type:   where.append("p.owner_type = %s");   args.append(owner_type)
+    if water_state:  where.append("COALESCE(p.water_state,'C') = %s"); args.append(water_state)
+    if not include_public:
+        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
+    rows = _candidates(" AND ".join(where), tuple(args))
+    p = _model_params(lambda_p, h_max, g_d, rho, horizon)
+    vals = _valued(rows, p, horizon)
+    if min_ratio:
+        vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
+    keyf = {"value_ratio": lambda r: r["value_ratio"] or 0,
+            "value_total": lambda r: r["value_total"] or 0,
+            "acq_score":   lambda r: r["acq_score"] or 0,
+            "soonest":     lambda r: -(r["p50_years"] or 999)}.get(sort,
+              lambda r: r["value_ratio"] or 0)
+    vals.sort(key=keyf, reverse=True)
+    for r in vals:
+        r.pop("mail_address", None)
+    return vals[:limit]
 
 @app.get("/targets/export")
 def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
-                   min_tenure: int = 0, min_growth: float = 0, water_status: str = "",
-                   include_public: bool = False, weights: str = "", gate: bool = True,
-                   limit: int = 2000):
-    """Downloadable outreach list: top private off-market targets with the owner's
-    mailing address, ready for a direct-mail merge."""
-    W = _parse_weights(weights)
-    growth_sql, target_sql = _live_sql(W, gate)
+                   min_tenure: int = 0, water_state: str = "", include_public: bool = False,
+                   min_ratio: float = 0, horizon: int = 10,
+                   lambda_p: float = None, h_max: float = None, g_d: float = None,
+                   rho: float = None, sort: str = "value_ratio", limit: int = 2000):
+    """Outreach list with owner mailing addresses, ranked by the same model the
+    map and target list use."""
     where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
-             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", f"{growth_sql} >= %s"]
-    params = [min_acres, min_tenure, min_growth]
-    if use:          where.append("p.use = %s");         params.append(use)
-    if owner_type:   where.append("p.owner_type = %s");  params.append(owner_type)
-    if water_status: where.append("z.water_status = %s"); params.append(water_status)
+             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", "p.est > 0", "p.acres > 0"]
+    args = [min_acres, min_tenure]
+    if use:          where.append("p.use = %s");          args.append(use)
+    if owner_type:   where.append("p.owner_type = %s");   args.append(owner_type)
+    if water_state:  where.append("COALESCE(p.water_state,'C') = %s"); args.append(water_state)
     if not include_public:
-        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); params.append(PUBLIC_OWNER_PATTERNS)
-    params.append(limit)
-    rows = qall(f"""
-      SELECT p.apn, p.situs_address, p.city, p.zcta, p.use, p.acres, p.est,
-             CASE WHEN p.acres>0 THEN round(p.est/p.acres) ELSE NULL END AS per_acre,
-             p.owner, p.owner_type, p.absentee, p.tenure, p.acquired, p.paid, p.mail_address,
-             round({target_sql}::numeric) target_score, round({growth_sql}::numeric) growth_score
-      FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
-      WHERE {' AND '.join(where)}
-      ORDER BY {target_sql} DESC LIMIT %s
-    """, tuple(params))
+        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
+    rows = _candidates(" AND ".join(where), tuple(args))
+    p = _model_params(lambda_p, h_max, g_d, rho, horizon)
+    vals = _valued(rows, p, horizon)
+    if min_ratio:
+        vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
+    vals.sort(key=lambda r: r["value_ratio"] or 0, reverse=True)
+    vals = vals[:limit]
+
+    WS = {"A": "A served/assured", "B": "B irrigated ag (SB1611 path)", "C": "C raw groundwater"}
     buf = io.StringIO(); w = csv.writer(buf)
-    w.writerow(["APN", "Situs Address", "City", "ZIP", "Use", "Acres", "Est Value", "$/Acre",
+    w.writerow(["APN", "Situs Address", "City", "ZIP", "Use", "Acres",
+                "Price $/Acre", "Modeled Value $/Acre", "Value/Price",
+                "Developer $/Acre", "Water State", "P50 Yrs to Convert",
+                f"P(convert<={horizon}y)", "Carry %/yr",
                 "Owner", "Owner Type", "Absentee", "Years Held", "Acquired", "Paid",
-                "Owner Mailing Address", "Target Score", "Growth Score"])
-    for r in rows:
-        w.writerow([r["apn"], r["situs_address"], r["city"], r["zcta"], r["use"], r["acres"], r["est"], r["per_acre"],
+                "Owner Mailing Address", "Acquisition Score", "Zone Growth Index",
+                "Landlocked", "Flood Zone", "Site Factor", "Hazard Source"])
+    for r in vals:
+        w.writerow([r["apn"], r["situs_address"], r["city"], r["zcta"], r["use"], r["acres"],
+                    r["price_per_acre"], r["value_per_acre"], r["value_ratio"],
+                    r["dev_price_per_acre"], WS.get(r["water_state"], r["water_state"]),
+                    r["p50_years"] if r["p50_years"] else ">60",
+                    round(r["p_convert"], 3) if r["p_convert"] is not None else "",
+                    r["carry_pct"],
                     r["owner"], r["owner_type"], r["absentee"], r["tenure"], r["acquired"], r["paid"],
-                    r["mail_address"], r["target_score"], r["growth_score"]])
+                    r["mail_address"], r["acq_score"], r["growth_index"],
+                    r.get("landlocked"), r.get("flood_zone") or "", r.get("site_factor"),
+                    r.get("hazard_source")])
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=acreon_targets.csv"})
-
-# --- ASSEMBLAGE DETECTION --------------------------------------------------
-# Finds owners who control multiple touching parcels. A contiguous block under one
-# owner is worth more than the sum of its parts (one negotiation, developable
-# scale), and it is invisible on a parcel-by-parcel map.
-ASSEMBLAGE_SQL = """
-WITH land AS (
-  SELECT apn, owner, owner_type, zcta, city, acres, est, tenure, target_score, growth_score, geom, centroid
-  FROM parcels
-  WHERE use IN ('Vacant','Agricultural') AND status='Off-market'
-    AND owner IS NOT NULL AND acres IS NOT NULL
-    AND NOT (coalesce(owner,'') ILIKE ANY(%(pub)s))
-    AND ({ZFILTER})
-),
-clustered AS (
-  SELECT *, ST_ClusterDBSCAN(geom, eps := %(eps)s, minpoints := 2)
-             OVER (PARTITION BY owner) AS cid
-  FROM land
-)
-SELECT owner, owner_type, min(zcta) AS zcta, min(city) AS city,
-       count(*) AS parcel_count,
-       round(sum(acres)::numeric,1) AS total_acres,
-       sum(est) AS total_est,
-       CASE WHEN sum(acres) > 0 THEN round(sum(est)/sum(acres)) ELSE NULL END AS per_acre,
-       max(tenure) AS max_tenure,
-       round(avg(target_score),1) AS avg_target,
-       round(avg(growth_score),1) AS avg_growth,
-       ST_X(ST_Centroid(ST_Collect(centroid))) AS lon,
-       ST_Y(ST_Centroid(ST_Collect(centroid))) AS lat,
-       array_agg(apn ORDER BY acres DESC) AS apns
-FROM clustered
-WHERE cid IS NOT NULL
-GROUP BY owner, owner_type, cid
-HAVING count(*) >= %(minp)s AND sum(acres) >= %(minac)s
-ORDER BY sum(acres) DESC
-LIMIT %(lim)s
-"""
 
 @app.get("/assemblages")
 def assemblages(min_parcels: int = 2, min_acres: float = 10, zcta: str = "",
@@ -777,6 +816,28 @@ UPDATE zones z SET water_status = CASE
 FROM cov c WHERE z.zcta = c.zcta;
 """
 
+
+# Developer price per acre, per zone: the observed median $/acre of land that is
+# already assured-supply (water state A). That is the closest available proxy for
+# "what a developer pays for developable dirt here" without a hedonic surface.
+# Zones with no assured-supply land of their own inherit the average of the three
+# nearest zones that do, so far-fringe zones do not silently pick up metro-core
+# prices, which would wildly overvalue deep desert.
+DEV_VALUE_SQL = """
+WITH own AS (
+  SELECT zcta, percentile_cont(0.5) WITHIN GROUP (ORDER BY est/acres) AS v
+  FROM parcels
+  WHERE water_state = 'A' AND acres > 0 AND est > 0
+  GROUP BY zcta HAVING count(*) >= 3
+)
+UPDATE zones z SET dev_value_per_acre = COALESCE(
+  (SELECT v FROM own WHERE own.zcta = z.zcta),
+  (SELECT avg(t.v) FROM (
+      SELECT o.v FROM own o JOIN zones zz ON zz.zcta = o.zcta
+      ORDER BY ST_Distance(z.geom, zz.geom) LIMIT 3) t)
+);
+"""
+
 def _fetch_aaws(bbox, cap=15000):
     geoms, offset = [], 0
     while len(geoms) < cap:
@@ -884,6 +945,23 @@ def run_signals(kind="migration"):
                     cur.execute("CREATE INDEX ON aaws USING gist(geom); ANALYZE aaws;")
                     cur.execute(WATER_OVERLAY_SQL)
                     updated = cur.rowcount
+                    # per-parcel water state: A served, B irrigated ag (SB1611
+                    # conversion path), C raw groundwater-dependent
+                    cur.execute("""
+                      UPDATE parcels p SET water_state = CASE
+                        WHEN EXISTS (SELECT 1 FROM aaws a WHERE ST_Contains(a.geom, p.centroid)) THEN 'A'
+                        WHEN p.use = 'Agricultural' THEN 'B' ELSE 'C' END
+                    """)
+                    # carry from the tax roll, not a flat assumption
+                    cur.execute("""
+                      UPDATE parcels SET carry_rate =
+                        CASE WHEN est > 0
+                          THEN (%s * %s * COALESCE(NULLIF(assessed,0), est*0.8)) / est + %s
+                          ELSE %s END
+                    """, (MODEL.DEFAULT_TAX_RATE, MODEL.ASSESS_RATIO, MODEL.UPKEEP, MODEL.UPKEEP+0.002))
+                    # zone developer price: observed $/ac of assured-supply land,
+                    # spatially interpolated where a zone has none of its own
+                    cur.execute(DEV_VALUE_SQL)
                     cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
                     cur.execute(RESCORE_SQL)
                 c.commit()
@@ -970,6 +1048,270 @@ def admin_signals_status(token: str):
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     return SIGNAL_STATUS
+
+
+# --- HISTORICAL EVENTS: built parcels, for hazard estimation ---------------
+FEMA_NFHL = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query"
+HIGH_RISK_ZONES = ("A", "AE", "AH", "AO", "A99", "AR", "V", "VE")
+
+def run_ingest_built(cap=2_000_000):
+    """Pull every parcel that carries a construction year. Only APN, point and
+    year, so this stays light even across ~1.5M improved parcels. This is the
+    census of development events the hazard is fit on."""
+    global INGEST_STATUS
+    INGEST_STATUS = {"state": "running", "mode": "built", "fetched": 0, "detail": "starting"}
+    offset, buf, loaded = 0, [], 0
+    try:
+        while offset < cap:
+            params = {"where": "CONST_YEAR <> ''", "outFields": "APN_DASH,APN,CONST_YEAR,LONGITUDE,LATITUDE,LAND_SIZE",
+                      "returnGeometry": "false", "f": "json",
+                      "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": 2000}
+            r = requests.get(COUNTY_PARCELS, params=params, timeout=120, headers={"User-Agent": UA})
+            try:
+                feats = r.json().get("features", [])
+            except Exception:
+                raise RuntimeError(f"county status {r.status_code}: {r.text[:150]}")
+            if not feats:
+                break
+            offset += len(feats)
+            for f in feats:
+                a = f.get("attributes") or {}
+                cy = (str(a.get("CONST_YEAR") or "")).strip()
+                lon, lat = a.get("LONGITUDE"), a.get("LATITUDE")
+                if not (len(cy) == 4 and cy.isdigit()) or lon is None or lat is None:
+                    continue
+                yr = int(cy)
+                if yr < 1900 or yr > 2026:
+                    continue
+                ls = a.get("LAND_SIZE")
+                acres = round(ls / 43560.0, 3) if isinstance(ls, (int, float)) and ls > 0 else None
+                buf.append(((a.get("APN_DASH") or a.get("APN") or "").strip(), lon, lat, yr, acres))
+            INGEST_STATUS.update(fetched=offset, detail=f"fetching ({offset})")
+            if len(buf) >= 20000:
+                loaded += _flush_built(buf); buf = []
+                INGEST_STATUS.update(loaded=loaded)
+            if len(feats) < 2000:
+                break
+        if buf:
+            loaded += _flush_built(buf)
+        with pool.connection() as c:
+            n = c.execute("SELECT count(*) FROM built").fetchone()[0]
+            yr = c.execute("SELECT min(const_year), max(const_year) FROM built").fetchone()
+        INGEST_STATUS = {"state": "done", "mode": "built", "fetched": offset, "rows": n, "year_range": yr}
+    except Exception as e:
+        INGEST_STATUS = {"state": "error", "mode": "built", "detail": str(e)[:200], "fetched": offset}
+
+def _flush_built(rows):
+    with pool.connection() as c, c.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS built_stage; CREATE TEMP TABLE built_stage(apn text, lon float8, lat float8, cy int, acres numeric);")
+        with cur.copy("COPY built_stage (apn,lon,lat,cy,acres) FROM STDIN") as cp:
+            for r in rows:
+                cp.write_row(r)
+        cur.execute("""INSERT INTO built (apn, centroid, const_year, acres)
+                       SELECT apn, ST_SetSRID(ST_Point(lon,lat),4326), cy, acres FROM built_stage
+                       WHERE apn <> '' ON CONFLICT (apn) DO UPDATE
+                         SET centroid=EXCLUDED.centroid, const_year=EXCLUDED.const_year, acres=EXCLUDED.acres""")
+        c.commit()
+    return len(rows)
+
+# --- HAZARD FIT ------------------------------------------------------------
+# The frontier at year T is every parcel already built by T. Distance from an
+# at-risk parcel to that set is the covariate the review identified as the single
+# strongest predictor of conversion.
+PANEL_SQL = """
+CREATE TEMP TABLE panel AS
+WITH universe AS (
+  SELECT apn, centroid, NULL::int AS const_year, acres FROM parcels
+   WHERE centroid IS NOT NULL AND random() < %(s_vac)s
+  UNION ALL
+  SELECT apn, centroid, const_year, acres FROM built
+   WHERE random() < %(s_blt)s
+)
+SELECT u.apn, y.t AS period,
+       (u.const_year IS NOT NULL AND u.const_year >= y.t AND u.const_year < y.t + 5)::int AS event,
+       u.acres,
+       (SELECT ST_Distance(u.centroid::geography, b.centroid::geography) / 1609.34
+          FROM built b
+         WHERE b.const_year <= y.t
+         ORDER BY u.centroid <-> b.centroid
+         LIMIT 1) AS edge_miles
+FROM universe u
+CROSS JOIN (SELECT unnest(%(periods)s::int[]) AS t) y
+WHERE u.const_year IS NULL OR u.const_year > y.t;
+"""
+
+def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
+    """Build the panel, fit the discrete-time logit, store coefficients, then
+    score every current parcel with its fitted annual hazard."""
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": "hazard", "detail": "checking history"}
+    try:
+        with pool.connection() as c:
+            nb = c.execute("SELECT count(*) FROM built").fetchone()[0]
+        if nb < 5000:
+            SIGNAL_STATUS = {"state": "error", "kind": "hazard",
+                             "detail": f"only {nb} built parcels on record; run /admin/ingest_built first"}
+            return
+        SIGNAL_STATUS["detail"] = "building panel (reconstructing the historical frontier)"
+        with pool.connection() as c:
+            with c.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS panel")
+                cur.execute(PANEL_SQL, {"s_vac": sample_vacant, "s_blt": sample_built,
+                                        "periods": HZ.PERIODS})
+                rows = cur.execute("SELECT period, event, acres, edge_miles FROM panel WHERE edge_miles IS NOT NULL").fetchall()
+            c.commit()
+        if len(rows) < 2000:
+            SIGNAL_STATUS = {"state": "error", "kind": "hazard", "detail": f"panel too small ({len(rows)} rows)"}
+            return
+        SIGNAL_STATUS["detail"] = f"fitting on {len(rows):,} parcel-periods"
+        X = [HZ.design_row(int(p), float(d), float(a) if a else 1.0) for p, e, a, d in rows]
+        y = [int(e) for p, e, a, d in rows]
+        coefs = HZ.fit_logit(X, y)
+        events = sum(y)
+        summary = HZ.summarize(coefs)
+
+        SIGNAL_STATUS["detail"] = "scoring parcels with the fitted hazard"
+        cur_year = 2025
+        with pool.connection() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                  UPDATE parcels p SET edge_miles = sub.d FROM (
+                    SELECT p2.apn, (SELECT ST_Distance(p2.centroid::geography, b.centroid::geography)/1609.34
+                                      FROM built b WHERE b.const_year <= %s
+                                     ORDER BY p2.centroid <-> b.centroid LIMIT 1) AS d
+                    FROM parcels p2) sub
+                  WHERE p.apn = sub.apn""", (cur_year,))
+                cur.execute("INSERT INTO model_fit(key,payload) VALUES('hazard',%s::jsonb) "
+                            "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, fitted_at=now()",
+                            (json.dumps({"coefs": coefs, "summary": summary, "n": len(rows),
+                                         "events": events, "periods": HZ.PERIODS}),))
+                rows2 = cur.execute("SELECT apn, edge_miles, acres FROM parcels WHERE edge_miles IS NOT NULL").fetchall()
+                upd = []
+                for apn, d, ac in rows2:
+                    p5 = HZ.predict_p5(coefs, HZ.PERIODS[-1], float(d), float(ac) if ac else 1.0)
+                    upd.append((HZ.annual_hazard(p5), apn))
+                cur.executemany("UPDATE parcels SET hazard_fitted=%s WHERE apn=%s", upd)
+            c.commit()
+        SIGNAL_STATUS = {"state": "done", "kind": "hazard", "panel_rows": len(rows),
+                         "conversion_events": events, "parcels_scored": len(rows2),
+                         "coefficients": summary}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "kind": "hazard", "detail": str(e)[:250]}
+
+# --- PARCEL SCREENS --------------------------------------------------------
+# Landlocked: share of the parcel boundary touching other parcels. Public
+# right-of-way is generally not parcelled, so a parcel whose perimeter is almost
+# entirely shared with neighbours has no frontage and no legal access.
+LANDLOCK_SQL = """
+UPDATE parcels p SET landlocked = COALESCE(sub.shared, 0) > 0.97
+FROM (
+  SELECT p2.apn,
+         ST_Length(ST_Intersection(ST_Boundary(p2.geom),
+                                   ST_Buffer(ST_Union(n.geom), 0.00002))::geography)
+           / NULLIF(ST_Perimeter(p2.geom::geography), 0) AS shared
+  FROM parcels p2
+  JOIN parcels n ON n.apn <> p2.apn AND ST_DWithin(p2.geom, n.geom, 0.00002)
+  WHERE ST_GeometryType(p2.geom) IN ('ST_Polygon','ST_MultiPolygon')
+  GROUP BY p2.apn, p2.geom
+) sub
+WHERE p.apn = sub.apn;
+UPDATE parcels SET landlocked = false WHERE landlocked IS NULL;
+"""
+
+def _fetch_flood(bbox, cap=40000):
+    geoms, offset = [], 0
+    while len(geoms) < cap:
+        params = {"where": "1=1", "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+                  "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
+                  "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE,ZONE_SUBTY",
+                  "returnGeometry": "true", "f": "geojson",
+                  "resultOffset": offset, "resultRecordCount": 1000}
+        r = requests.get(FEMA_NFHL, params=params, timeout=180, headers={"User-Agent": UA})
+        try:
+            feats = r.json().get("features", [])
+        except Exception:
+            raise RuntimeError(f"FEMA status {r.status_code}: {r.text[:150]}")
+        if not feats:
+            break
+        for f in feats:
+            g, pr = f.get("geometry"), (f.get("properties") or {})
+            z = (pr.get("FLD_ZONE") or "").strip().upper()
+            sub = (pr.get("ZONE_SUBTY") or "").strip().upper()
+            if g and (z in HIGH_RISK_ZONES or "FLOODWAY" in sub):
+                geoms.append((json.dumps(g), ("FLOODWAY" if "FLOODWAY" in sub else z)))
+        offset += len(feats)
+        if len(feats) < 1000:
+            break
+    return geoms
+
+def run_screens(do_flood=True):
+    """Two screens the review named as the source of the worst embarrassments:
+    a landlocked parcel scored like its road-frontage neighbour, and floodway
+    land scored on growth momentum."""
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": "screens", "detail": "computing frontage"}
+    try:
+        with pool.connection() as c:
+            with c.cursor() as cur:
+                for stmt in [s for s in LANDLOCK_SQL.split(";") if s.strip()]:
+                    cur.execute(stmt)
+            c.commit()
+            ll = c.execute("SELECT count(*) FROM parcels WHERE landlocked").fetchone()[0]
+        flood = 0
+        if do_flood:
+            SIGNAL_STATUS["detail"] = "fetching FEMA flood zones"
+            with pool.connection() as c:
+                bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+            fz = _fetch_flood(bb)
+            if fz:
+                SIGNAL_STATUS["detail"] = f"overlaying {len(fz)} flood polygons"
+                with pool.connection() as c:
+                    with c.cursor() as cur:
+                        cur.execute("DROP TABLE IF EXISTS flood; CREATE TEMP TABLE flood(geom geometry(Geometry,4326), zone text);")
+                        cur.executemany("INSERT INTO flood(geom,zone) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)),%s)", fz)
+                        cur.execute("CREATE INDEX ON flood USING gist(geom); ANALYZE flood;")
+                        cur.execute("""UPDATE parcels p SET flood_zone = f.zone FROM flood f
+                                       WHERE ST_Contains(f.geom, p.centroid)""")
+                    c.commit()
+                    flood = c.execute("SELECT count(*) FROM parcels WHERE flood_zone IS NOT NULL").fetchone()[0]
+        SIGNAL_STATUS = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "kind": "screens", "detail": str(e)[:250]}
+
+@app.get("/admin/ingest_built")
+def admin_ingest_built(token: str):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if INGEST_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": INGEST_STATUS}
+    threading.Thread(target=run_ingest_built, daemon=True).start()
+    return {"state": "started", "mode": "built",
+            "note": "pulls construction years countywide; long-running; poll /admin/status"}
+
+@app.get("/admin/fit_hazard")
+def admin_fit_hazard(token: str, sample_vacant: float = 0.06, sample_built: float = 0.05):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_fit_hazard, args=(sample_vacant, sample_built), daemon=True).start()
+    return {"state": "started", "kind": "hazard", "next": "poll /admin/signals_status"}
+
+@app.get("/admin/screens")
+def admin_screens(token: str, flood: bool = True):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_screens, args=(flood,), daemon=True).start()
+    return {"state": "started", "kind": "screens", "next": "poll /admin/signals_status"}
+
+@app.get("/admin/fit")
+def admin_fit(token: str):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    rows = qall("SELECT key, payload, fitted_at FROM model_fit")
+    return rows or {"detail": "no fit stored yet; run /admin/fit_hazard"}
 
 # Serve the MapLibre frontend (single file, same origin as the API).
 _here = pathlib.Path(__file__).resolve().parent
