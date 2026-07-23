@@ -1272,29 +1272,59 @@ UPDATE parcels SET landlocked = false WHERE landlocked IS NULL;
 # job, and per-neighbour intersection avoids that entirely. Corner overlaps can
 # double-count a metre or two, which LEAST(1.0, ...) absorbs.
 
-def _fetch_flood(bbox, cap=40000):
-    geoms, offset = [], 0
-    while len(geoms) < cap:
-        params = {"where": "1=1", "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
-                  "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
-                  "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE,ZONE_SUBTY",
-                  "returnGeometry": "true", "f": "geojson",
-                  "resultOffset": offset, "resultRecordCount": 1000}
-        r = requests.get(FEMA_NFHL, params=params, timeout=180, headers={"User-Agent": UA})
+def _get_retry(url, params, timeout=180, tries=4):
+    """Transient resets are normal against large public GIS services. Retry with
+    backoff rather than failing the whole job on one dropped connection."""
+    import time
+    last = None
+    for i in range(tries):
         try:
-            feats = r.json().get("features", [])
-        except Exception:
-            raise RuntimeError(f"FEMA status {r.status_code}: {r.text[:150]}")
-        if not feats:
-            break
-        for f in feats:
-            g, pr = f.get("geometry"), (f.get("properties") or {})
-            z = (pr.get("FLD_ZONE") or "").strip().upper()
-            sub = (pr.get("ZONE_SUBTY") or "").strip().upper()
-            if g and (z in HIGH_RISK_ZONES or "FLOODWAY" in sub):
-                geoms.append((json.dumps(g), ("FLOODWAY" if "FLOODWAY" in sub else z)))
-        offset += len(feats)
+            r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": UA})
+            if r.status_code >= 500:
+                last = RuntimeError(f"status {r.status_code}")
+            else:
+                return r
+        except Exception as e:
+            last = e
+        time.sleep(1.5 * (i + 1))
+    raise last if last else RuntimeError("request failed")
+
+
+def _fetch_flood(bbox, tiles=6, cap=200000):
+    """FEMA's NFHL resets on county-sized envelopes, so the extent is split into
+    a grid and each cell paged separately. Only high-risk zones and the
+    regulatory floodway are kept."""
+    x0, y0, x1, y1 = bbox
+    dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
+    geoms = []
+    for i in range(tiles):
+        for j in range(tiles):
+            bx0, by0 = x0 + i * dx, y0 + j * dy
+            bx1, by1 = bx0 + dx, by0 + dy
+            offset = 0
+            while len(geoms) < cap:
+                params = {"where": "1=1", "geometry": f"{bx0},{by0},{bx1},{by1}",
+                          "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
+                          "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE,ZONE_SUBTY",
+                          "returnGeometry": "true", "f": "geojson",
+                          "resultOffset": offset, "resultRecordCount": 500}
+                r = _get_retry(FEMA_NFHL, params)
+                try:
+                    feats = r.json().get("features", [])
+                except Exception:
+                    raise RuntimeError(f"FEMA status {r.status_code}: {r.text[:120]}")
+                if not feats:
+                    break
+                for f in feats:
+                    g, pr = f.get("geometry"), (f.get("properties") or {})
+                    z = (pr.get("FLD_ZONE") or "").strip().upper()
+                    sub = (pr.get("ZONE_SUBTY") or "").strip().upper()
+                    if g and (z in HIGH_RISK_ZONES or "FLOODWAY" in sub):
+                        geoms.append((json.dumps(g), ("FLOODWAY" if "FLOODWAY" in sub else z)))
+                offset += len(feats)
+            SIGNAL_STATUS.update(detail=f"flood tiles {i*tiles+j+1}/{tiles*tiles}, {len(geoms)} polygons")
     return geoms
+
 
 def run_screens(do_flood=True):
     """Two screens the review named as the source of the worst embarrassments:
@@ -1309,8 +1339,9 @@ def run_screens(do_flood=True):
                     cur.execute(stmt)
             c.commit()
             ll = c.execute("SELECT count(*) FROM parcels WHERE landlocked").fetchone()[0]
-        flood = 0
+        flood, flood_err = 0, None
         if do_flood:
+          try:
             SIGNAL_STATUS["detail"] = "fetching FEMA flood zones"
             with pool.connection() as c:
                 bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
@@ -1326,7 +1357,12 @@ def run_screens(do_flood=True):
                                        WHERE ST_Contains(f.geom, p.centroid)""")
                     c.commit()
                     flood = c.execute("SELECT count(*) FROM parcels WHERE flood_zone IS NOT NULL").fetchone()[0]
-        SIGNAL_STATUS = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood}
+          except Exception as fe:
+            flood_err = str(fe)[:180]      # keep the frontage result either way
+        out = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood}
+        if flood_err:
+            out["flood_error"] = flood_err
+        SIGNAL_STATUS = out
     except Exception as e:
         SIGNAL_STATUS = {"state": "error", "kind": "screens", "detail": str(e)[:250]}
 
