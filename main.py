@@ -1310,25 +1310,29 @@ def _flood_url():
     return FEMA_URLS[0]
 
 
-def _fetch_flood(bbox, tiles=10, cap=200000):
-    """FEMA's NFHL resets on county-sized envelopes, so the extent is split into
-    a grid and each cell paged separately. Only high-risk zones and the
-    regulatory floodway are kept."""
+def _flood_tiles(bbox, tiles=10, per_page=250):
+    """Yield one tile's flood polygons at a time.
+
+    The previous version accumulated every polygon countywide before writing any
+    of them. FEMA geometries are detailed, and holding the whole set exhausted
+    the container's memory, which restarted the service mid-run (the status
+    flipping back to idle was the process dying). Streaming per tile keeps peak
+    memory to a single tile.
+    """
     x0, y0, x1, y1 = bbox
     url = _flood_url()
     dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
-    geoms = []
     for i in range(tiles):
         for j in range(tiles):
             bx0, by0 = x0 + i * dx, y0 + j * dy
             bx1, by1 = bx0 + dx, by0 + dy
-            offset = 0
-            while len(geoms) < cap:
+            batch, offset = [], 0
+            while True:
                 params = {"where": "1=1", "geometry": f"{bx0},{by0},{bx1},{by1}",
                           "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
                           "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE,ZONE_SUBTY",
                           "returnGeometry": "true", "f": "geojson",
-                          "resultOffset": offset, "resultRecordCount": 250}
+                          "resultOffset": offset, "resultRecordCount": per_page}
                 r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
                 try:
                     feats = r.json().get("features", [])
@@ -1341,10 +1345,10 @@ def _fetch_flood(bbox, tiles=10, cap=200000):
                     z = (pr.get("FLD_ZONE") or "").strip().upper()
                     sub = (pr.get("ZONE_SUBTY") or "").strip().upper()
                     if g and (z in HIGH_RISK_ZONES or "FLOODWAY" in sub):
-                        geoms.append((json.dumps(g), ("FLOODWAY" if "FLOODWAY" in sub else z)))
+                        batch.append((json.dumps(g), ("FLOODWAY" if "FLOODWAY" in sub else z)))
                 offset += len(feats)
-            SIGNAL_STATUS.update(detail=f"flood tiles {i*tiles+j+1}/{tiles*tiles}, {len(geoms)} polygons")
-    return geoms
+            yield (i * tiles + j + 1, tiles * tiles, batch)
+            batch = None
 
 
 def run_screens(do_flood=True):
@@ -1363,19 +1367,33 @@ def run_screens(do_flood=True):
         flood, flood_err = 0, None
         if do_flood:
           try:
-            SIGNAL_STATUS["detail"] = "fetching FEMA flood zones"
+            SIGNAL_STATUS["detail"] = "locating FEMA service"
             with pool.connection() as c:
-                bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
-            fz = _fetch_flood(bb)
-            if fz:
-                SIGNAL_STATUS["detail"] = f"overlaying {len(fz)} flood polygons"
+                bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
+                               "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+                with c.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS flood")
+                    cur.execute("CREATE TABLE flood(geom geometry(Geometry,4326), zone text)")
+                c.commit()
+            written = 0
+            for idx, total_tiles, batch in _flood_tiles(bb):
+                if batch:
+                    with pool.connection() as c, c.cursor() as cur:
+                        cur.executemany(
+                            "INSERT INTO flood(geom,zone) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)),%s)",
+                            batch)
+                        c.commit()
+                    written += len(batch)
+                SIGNAL_STATUS.update(detail=f"flood tile {idx}/{total_tiles}, {written} polygons stored")
+            if written:
                 with pool.connection() as c:
                     with c.cursor() as cur:
-                        cur.execute("DROP TABLE IF EXISTS flood; CREATE TEMP TABLE flood(geom geometry(Geometry,4326), zone text);")
-                        cur.executemany("INSERT INTO flood(geom,zone) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)),%s)", fz)
-                        cur.execute("CREATE INDEX ON flood USING gist(geom); ANALYZE flood;")
+                        cur.execute("CREATE INDEX ON flood USING gist(geom)")
+                        cur.execute("ANALYZE flood")
+                        cur.execute("UPDATE parcels SET flood_zone = NULL")
                         cur.execute("""UPDATE parcels p SET flood_zone = f.zone FROM flood f
                                        WHERE ST_Contains(f.geom, p.centroid)""")
+                        cur.execute("DROP TABLE flood")
                     c.commit()
                     flood = c.execute("SELECT count(*) FROM parcels WHERE flood_zone IS NOT NULL").fetchone()[0]
           except Exception as fe:
