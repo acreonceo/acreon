@@ -1445,13 +1445,13 @@ def _flood_tiles(bbox, tiles=12, per_page=50):
                           "resultOffset": offset, "resultRecordCount": per_page}
                 r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
                 try:
-                    j = r.json()
+                    payload = r.json()   # NOT j: that is the tile loop index
                 except Exception:
                     raise RuntimeError(f"flood source status {r.status_code}: {r.text[:140]}")
-                if isinstance(j, dict) and j.get("error"):
+                if isinstance(payload, dict) and payload.get("error"):
                     # surface it instead of mistaking an error for an empty page
-                    raise RuntimeError(f"flood source rejected the query: {str(j['error'])[:200]}")
-                feats = j.get("features") or []
+                    raise RuntimeError(f"flood source rejected the query: {str(payload['error'])[:200]}")
+                feats = payload.get("features") or []
                 if not feats:
                     break
                 for f in feats:
@@ -1518,7 +1518,9 @@ def run_screens(do_flood=True):
                     flood = c.execute("SELECT count(*) FROM parcels WHERE flood_zone IS NOT NULL").fetchone()[0]
           except Exception as fe:
             flood_err = str(fe)[:180]      # keep the frontage result either way
-        out = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood}
+        out = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood,
+               "flood_source": SIGNAL_STATUS.get("flood_source"),
+               "flood_polygons": SIGNAL_STATUS.get("flood_polygons")}
         if flood_err:
             out["flood_error"] = flood_err
         SIGNAL_STATUS = out
