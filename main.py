@@ -27,6 +27,38 @@ _here = pathlib.Path(__file__).resolve().parent
 
 SCHEMA_STATUS = {"state": "not run"}
 
+# Columns the code writes to. Declared here rather than relying on schema.sql
+# having been uploaded, because a stale schema file means a job fails thousands
+# of rows into a long ingest with a missing-column error. Every job that writes
+# calls _ensure_columns() first, so the database cannot lag the code.
+REQUIRED_PARCEL_COLUMNS = {
+    "mail_address": "text", "water_state": "text", "carry_rate": "numeric",
+    "edge_miles": "numeric", "hazard_fitted": "numeric", "landlocked": "boolean",
+    "flood_zone": "text", "zoning": "text", "jurisdiction": "text",
+}
+REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric"}
+
+def _ensure_columns():
+    added = []
+    try:
+        with pool.connection() as c, c.cursor() as cur:
+            for name, typ in REQUIRED_PARCEL_COLUMNS.items():
+                cur.execute(f"ALTER TABLE parcels ADD COLUMN IF NOT EXISTS {name} {typ}")
+            for name, typ in REQUIRED_ZONE_COLUMNS.items():
+                cur.execute(f"ALTER TABLE zones ADD COLUMN IF NOT EXISTS {name} {typ}")
+            cur.execute("""CREATE TABLE IF NOT EXISTS built (
+                             apn text PRIMARY KEY, centroid geometry(Point,4326) NOT NULL,
+                             const_year int NOT NULL, acres numeric)""")
+            cur.execute("CREATE INDEX IF NOT EXISTS built_centroid_gix ON built USING gist (centroid)")
+            cur.execute("CREATE INDEX IF NOT EXISTS built_year_ix ON built (const_year)")
+            cur.execute("""CREATE TABLE IF NOT EXISTS model_fit (
+                             key text PRIMARY KEY, payload jsonb NOT NULL,
+                             fitted_at timestamptz NOT NULL DEFAULT now())""")
+            c.commit()
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+    return {"ok": True}
+
 def _apply_schema():
     """Apply schema.sql statement by statement, each in its own transaction.
 
@@ -522,12 +554,46 @@ def _zip_bbox(zcta):
     walk(f["geometry"]["coordinates"])
     return (min(xs), min(ys), max(xs), max(ys))
 
+@app.get("/admin/state")
+def admin_state(token: str):
+    """One link for everything. Reports what is running, what finished, and how
+    current each part of the data is, so there is no need to remember which job
+    reports to which status endpoint."""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    def one(sql, default=None):
+        try:
+            return q1(sql)[0]
+        except Exception:
+            return default
+    running = None
+    for label, st in (("data load", INGEST_STATUS), ("model", SIGNAL_STATUS)):
+        if st.get("state") == "running":
+            running = {"phase": label, **st}
+    return {
+        "running": running,
+        "busy": running is not None,
+        "data_load": INGEST_STATUS,
+        "model": SIGNAL_STATUS,
+        "counts": {
+            "parcels": one("SELECT count(*) FROM parcels", 0),
+            "with_zoning": one("SELECT count(*) FROM parcels WHERE coalesce(zoning,'') <> ''", 0),
+            "with_water_state": one("SELECT count(*) FROM parcels WHERE water_state IS NOT NULL", 0),
+            "with_fitted_hazard": one("SELECT count(*) FROM parcels WHERE hazard_fitted IS NOT NULL", 0),
+            "construction_records": one("SELECT count(*) FROM built", 0),
+            "zones": one("SELECT count(*) FROM zones", 0),
+        },
+        "hazard_fitted_at": one("SELECT fitted_at::text FROM model_fit WHERE key='hazard'"),
+        "schema": SCHEMA_STATUS,
+    }
+
 @app.get("/admin/migrate")
 def admin_migrate(token: str):
     """Force schema.sql to be applied and report exactly what landed and what did
     not. Run this after any deploy that adds columns."""
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
+    _ensure_columns()
     res = _apply_schema()
     cols = qall("""SELECT column_name FROM information_schema.columns
                    WHERE table_name='parcels' ORDER BY column_name""")
@@ -708,6 +774,7 @@ def _load_parcels(rows, replace=False):
         return c.execute("SELECT count(*) FROM parcels").fetchone()[0]
 
 def run_ingest(zcta, cap=6000, replace=False):
+    _ensure_columns()
     global INGEST_STATUS
     INGEST_STATUS = {"state": "running", "zip": zcta, "detail": "starting"}
     try:
@@ -755,6 +822,7 @@ def _fetch_page(offset, where, n=1000):
         raise RuntimeError(f"county status {r.status_code}: {r.text[:150]}")
 
 def run_ingest_county(include_all=False, chunk=5000, cap=2_000_000):
+    _ensure_columns()
     """Page the whole county (no per-ZIP bbox), loading in chunks. Replaces once on
     the first flush then appends, so it's a clean full rebuild. Handles ~250k
     vacant/ag parcels, or everything with include_all."""
@@ -1066,6 +1134,7 @@ def _fetch_projects(bbox, cap=20000):
     return geoms
 
 def run_signals(kind="migration"):
+    _ensure_columns()
     global SIGNAL_STATUS
     SIGNAL_STATUS = {"state": "running", "kind": kind, "detail": "starting"}
     try:
@@ -1266,6 +1335,7 @@ def _county_count(where):
         return None
 
 def run_ingest_built(cap=2_000_000):
+    _ensure_columns()
     """Pull every parcel carrying a construction year: APN, point, year, size.
     This is the census of development events the hazard is fit on.
 
@@ -1652,6 +1722,7 @@ def _flood_tiles(bbox, url, tiles=12, per_page=20):
         batch = None
 
 def run_screens(do_flood=True, flood_source=None):
+    _ensure_columns()
     """Two screens the review named as the source of the worst embarrassments:
     a landlocked parcel scored like its road-frontage neighbour, and floodway
     land scored on growth momentum."""
