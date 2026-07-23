@@ -1060,7 +1060,11 @@ def admin_signals_status(token: str):
 # --- HISTORICAL EVENTS: built parcels, for hazard estimation ---------------
 # FEMA publishes the NFHL on two paths; hazards.fema.gov resets aggressively on
 # large or rapid queries, so both are tried and the extent is finely tiled.
-FEMA_URLS = ["https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
+# FEMA's own host has refused every request pattern from this server (connection
+# reset), so the county's floodplain service is tried first. It lives on the same
+# host that already serves the parcel data, which is known reachable.
+FEMA_URLS = ["https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services/Flood/MapServer/0/query",
+             "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
              "https://hazards.fema.gov/gis/nfhl/rest/services/public/NFHL/MapServer/28/query"]
 FEMA_NFHL = FEMA_URLS[0]
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -1297,8 +1301,70 @@ def _get_retry(url, params, timeout=180, tries=4, ua=None):
     raise last if last else RuntimeError("request failed")
 
 
+def _flood_class(props):
+    """Classify a flood polygon without assuming a schema. Sources differ: FEMA
+    uses FLD_ZONE/ZONE_SUBTY, the county uses its own labels. Anything naming a
+    floodway is treated as floodway; a recognised high-risk zone or a 1-percent
+    label is treated as floodplain. Unrecognised polygons in a floodplain layer
+    are kept as generic floodplain rather than silently dropped."""
+    text = " ".join(str(v).upper() for v in props.values() if v is not None)
+    if "FLOODWAY" in text:
+        return "FLOODWAY"
+    for k in ("FLD_ZONE", "ZONE", "ZONE_LABEL", "FLOODPLAIN", "TYPE", "DESCRIPT"):
+        v = props.get(k)
+        if v and str(v).strip().upper() in HIGH_RISK_ZONES:
+            return str(v).strip().upper()
+    if "1%" in text or "1 PERCENT" in text or "100-YEAR" in text or "100 YEAR" in text:
+        return "AE"
+    if "0.2%" in text or "500-YEAR" in text or "SHADED X" in text:
+        return ""                      # 500-year: not a development constraint
+    return "FLOODPLAIN" if props else ""
+
+
 def _flood_url():
     """Pick whichever FEMA path answers a trivial query."""
+    for u in FEMA_URLS:
+        try:
+            r = requests.get(u, params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
+                             timeout=45, headers={"User-Agent": BROWSER_UA})
+            if r.status_code < 400 and "count" in r.text[:400]:
+                return u
+        except Exception:
+            continue
+    return FEMA_URLS[0]
+
+
+@app.get("/admin/probe_flood")
+def admin_probe_flood(token: str):
+    """Report which floodplain service answers and what fields it exposes, so the
+    source can be confirmed rather than guessed."""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    out = []
+    for u in FEMA_URLS:
+        rec = {"url": u}
+        try:
+            r = requests.get(u, params={"where": "1=1", "outFields": "*", "returnGeometry": "false",
+                                        "resultRecordCount": 2, "f": "json"},
+                             timeout=45, headers={"User-Agent": BROWSER_UA})
+            rec["status"] = r.status_code
+            j = r.json()
+            if j.get("error"):
+                rec["error"] = str(j["error"])[:160]
+            feats = j.get("features", [])
+            rec["returned"] = len(feats)
+            if feats:
+                a = feats[0].get("attributes", {})
+                rec["fields"] = list(a.keys())
+                rec["sample"] = {k: a[k] for k in list(a)[:12]}
+                rec["classified_as"] = _flood_class(a)
+        except Exception as e:
+            rec["error"] = str(e)[:160]
+        out.append(rec)
+    return {"candidates": out}
+
+
+def _flood_url_unused():
     for u in FEMA_URLS:
         try:
             r = requests.get(u, params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
@@ -1330,7 +1396,7 @@ def _flood_tiles(bbox, tiles=10, per_page=250):
             while True:
                 params = {"where": "1=1", "geometry": f"{bx0},{by0},{bx1},{by1}",
                           "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
-                          "spatialRel": "esriSpatialRelIntersects", "outFields": "FLD_ZONE,ZONE_SUBTY",
+                          "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
                           "returnGeometry": "true", "f": "geojson",
                           "resultOffset": offset, "resultRecordCount": per_page}
                 r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
@@ -1341,11 +1407,12 @@ def _flood_tiles(bbox, tiles=10, per_page=250):
                 if not feats:
                     break
                 for f in feats:
-                    g, pr = f.get("geometry"), (f.get("properties") or {})
-                    z = (pr.get("FLD_ZONE") or "").strip().upper()
-                    sub = (pr.get("ZONE_SUBTY") or "").strip().upper()
-                    if g and (z in HIGH_RISK_ZONES or "FLOODWAY" in sub):
-                        batch.append((json.dumps(g), ("FLOODWAY" if "FLOODWAY" in sub else z)))
+                    g = f.get("geometry")
+                    if not g:
+                        continue
+                    z = _flood_class(f.get("properties") or {})
+                    if z:
+                        batch.append((json.dumps(g), z))
                 offset += len(feats)
             yield (i * tiles + j + 1, tiles * tiles, batch)
             batch = None
