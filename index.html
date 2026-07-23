@@ -172,6 +172,31 @@ const escAttr=s=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(
 // outlines as parcels become legible, so the two color layers never fight.
 const zoneOpacityExpr=(m)=>["interpolate",["linear"],["zoom"],8,m,11.5,m*0.55,13,0.06,14.5,0];
 
+// Parcel color follows the live sliders: target = 0.5*zone growth + 0.3*tenure
+// + 0.2*land type, evaluated in the style expression (GPU-side) so it stays fast
+// with the whole county loaded. Zone growth is injected as a zcta->growth match.
+function liveTargetExpr(){
+  const m=["match",["get","zcta"]];
+  if(zonesGeo){
+    const seen=new Set();
+    zonesGeo.features.forEach(f=>{const z=f.properties.zcta;
+      if(z&&!seen.has(z)){seen.add(z); m.push(z, +growthOf(f.properties.signals).toFixed(1));}});
+  }
+  m.push(0);                                   // default when zone unknown
+  const growth=m;
+  const tenureBase=["min",100,["max",0,["*",["-",["to-number",["get","tenure"],0],2],4.2]]];
+  const ownerF=["match",["get","owner_type"],"Builder/Developer",0.35,"Investor",0.8,1.0];
+  const useS=["match",["get","use"],"Vacant",100,"Agricultural",85,25];
+  return ["+",["*",0.5,growth],["*",0.3,["*",tenureBase,ownerF]],["*",0.2,useS]];
+}
+const PARCEL_RAMP=[0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"];
+function parcelColorExpr(){ return ["interpolate",["linear"],liveTargetExpr(),...PARCEL_RAMP]; }
+const weightsParam=()=>SIGS.map(k=>k+":"+weights[k]).join(",");
+function repaintParcels(){
+  if(map.getLayer("parcels-fill")) map.setPaintProperty("parcels-fill","fill-color",parcelColorExpr());
+  if(map.getLayer("parcels-pt"))   map.setPaintProperty("parcels-pt","circle-color",parcelColorExpr());
+}
+
 function forecast(p){
   const V0=p.status==="For sale"?p.list_price:p.est, g=growthOf(p.zone_signals)/100, r=ASM.base+SP*g;
   const pU=t=>Math.max(0,Math.min(.95,g*ASM.opt*Math.pow(t/20,1.3)));
@@ -193,7 +218,7 @@ function showTip(e,html){tip.innerHTML=html;const r=map.getContainer().getBoundi
 function hideTip(){tip.style.opacity=0;}
 
 map.on("load",()=>{
-  fetch(API+"/zones").then(r=>r.json()).then(gj=>{ zonesGeo=gj; computeZoneColors();
+  fetch(API+"/zones").then(r=>r.json()).then(gj=>{ zonesGeo=gj; computeZoneColors(); setTimeout(repaintParcels,0);
     map.addSource("zones",{type:"geojson",data:gj});
     const below = map.getLayer("parcels-fill") ? "parcels-fill" : undefined;
     map.addLayer({id:"zones-fill",type:"fill",source:"zones",
@@ -204,10 +229,10 @@ map.on("load",()=>{
   });
   map.addSource("parcels",{type:"vector",tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt"],minzoom:6,maxzoom:16});
   map.addLayer({id:"parcels-fill",type:"fill",source:"parcels","source-layer":"parcels",
-    paint:{"fill-color":["interpolate",["linear"],["to-number",["get","target_score"],0],0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"],"fill-opacity":.85,"fill-outline-color":"#fff"}});
+    paint:{"fill-color":parcelColorExpr(),"fill-opacity":.85,"fill-outline-color":"#fff"}});
   map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",filter:["==","$type","Point"],
     paint:{"circle-radius":["interpolate",["linear"],["zoom"],8,2.4,14,6],
-      "circle-color":["interpolate",["linear"],["to-number",["get","target_score"],0],0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"],
+      "circle-color":parcelColorExpr(),
       "circle-stroke-color":"#fff","circle-stroke-width":.7}});
   // targets: a dedicated, larger, easy-to-click layer
   map.addSource("targets",{type:"geojson",data:{type:"FeatureCollection",features:[]}});
@@ -371,7 +396,7 @@ document.addEventListener("click",e=>{if(!q.parentNode.contains(e.target))res.cl
 // ---- targets ----
 const val=id=>document.getElementById(id).value;
 async function loadTargets(){
-  const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),limit:80});
+  const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),weights:weightsParam(),gate:gateOn,limit:80});
   const rows=await(await fetch(API+"/targets?"+pr)).json();
   document.getElementById("targetList").innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
@@ -385,7 +410,7 @@ async function loadTargets(){
 }
 ["fUse","fOwner","fAcres","fTen"].forEach(id=>document.getElementById(id).addEventListener("change",loadTargets));
 document.getElementById("exportBtn").addEventListener("click",()=>{
-  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),limit:2000});
+  const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),min_acres:val("fAcres"),min_tenure:val("fTen"),weights:weightsParam(),gate:gateOn,limit:2000});
   window.location.href=API+"/targets/export?"+p;
 });
 
@@ -400,7 +425,9 @@ function buildWeights(){
   document.getElementById("gate").addEventListener("change",e=>{gateOn=e.target.checked;afterWeights();});
   document.getElementById("heatOp").addEventListener("input",e=>{if(map.getLayer("zones-fill"))map.setPaintProperty("zones-fill","fill-opacity",zoneOpacityExpr(+e.target.value/100));});
 }
-function afterWeights(){ recolorZones(); if(selApn) refreshDetail(); }
+function afterWeights(){ recolorZones(); repaintParcels(); if(selApn) refreshDetail();
+  if(document.getElementById("pane-targets").style.display!=="none") loadTargets();
+  if(document.getElementById("pane-blocks").style.display!=="none") loadBlocks(); }
 
 // ---- tabs ----
 function showTab(t){

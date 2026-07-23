@@ -106,7 +106,9 @@ def healthz():
 TILE_SQL = """
 WITH b AS (SELECT ST_TileEnvelope(%(z)s,%(x)s,%(y)s) g)
 SELECT ST_AsMVT(t,'parcels') FROM (
-  SELECT p.apn, p.use, p.status, p.acres,
+  SELECT p.apn, p.use, p.status, p.acres, p.zcta,
+         coalesce(p.tenure,0)::int AS tenure,
+         p.owner_type,
          round(p.target_score)::int AS target_score,
          round(p.growth_score)::int AS growth_score,
          ST_AsMVTGeom(ST_Transform(p.geom,3857), b.g) geom
@@ -164,6 +166,44 @@ def parcel(apn: str):
     return r
 
 # --- ACQUISITION TARGETS ---------------------------------------------------
+SIG_KEYS = ["developable_land", "permit_velocity", "zoning_activity",
+            "infra_transport", "infra_water", "migration", "schools"]
+DEFAULT_W = {"developable_land": 50, "permit_velocity": 60, "zoning_activity": 55,
+             "infra_transport": 60, "infra_water": 60, "migration": 60, "schools": 50}
+
+def _parse_weights(w: str):
+    """w is 'developable_land:80,migration:20,...'. Missing keys fall back to
+    defaults. Returns None when the caller passed nothing (use stored scores)."""
+    if not w:
+        return None
+    out = dict(DEFAULT_W)
+    for part in w.split(","):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k = k.strip()
+        if k in DEFAULT_W:
+            try:
+                out[k] = max(0, min(100, float(v)))
+            except ValueError:
+                pass
+    return out
+
+def _live_sql(weights, gate=True):
+    """SQL fragments recomputing growth + target with the caller's weights, so the
+    list ranks the same way the map is colored."""
+    if not weights:
+        return "p.growth_score", "p.target_score"
+    total = sum(weights.values()) or 1
+    terms = " + ".join(f"{weights[k]}*(z.signals->>'{k}')::numeric" for k in SIG_KEYS)
+    gate_sql = ("CASE z.water_status WHEN 'assured' THEN 1.0 WHEN 'alternative_pending' THEN 0.7 ELSE 0.3 END"
+                if gate else "1.0")
+    growth = f"(({terms}) / {float(total)} * {gate_sql})"
+    target = (f"(0.5*{growth} + 0.3*LEAST(100,GREATEST(0,(coalesce(p.tenure,0)-2)*4.2)) "
+              f"* CASE p.owner_type WHEN 'Builder/Developer' THEN 0.35 WHEN 'Investor' THEN 0.8 ELSE 1.0 END "
+              f"+ 0.2*CASE p.use WHEN 'Vacant' THEN 100 WHEN 'Agricultural' THEN 85 ELSE 25 END)")
+    return growth, target
+
 PUBLIC_OWNER_PATTERNS = [
     'MARICOPA COUNTY%', '%STATE OF ARIZONA%', 'ARIZONA STATE LAND%', '%STATE LAND DEPART%',
     'STATE OF ARIZONA%', 'UNITED STATES%', '%UNITED STATES OF AMERICA%', '%US GOVERNMENT%',
@@ -180,49 +220,58 @@ PUBLIC_OWNER_PATTERNS = [
 @app.get("/targets")
 def targets(use: str = "", owner_type: str = "", min_acres: float = 0,
             min_tenure: int = 0, min_growth: float = 0, water_status: str = "",
-            include_public: bool = False, limit: int = 100):
-    where = ["status='Off-market'", "use IN ('Vacant','Agricultural')",
-             "acres >= %s", "coalesce(tenure,0) >= %s", "growth_score >= %s"]
+            include_public: bool = False, weights: str = "", gate: bool = True,
+            limit: int = 100):
+    W = _parse_weights(weights)
+    growth_sql, target_sql = _live_sql(W, gate)
+    where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
+             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", f"{growth_sql} >= %s"]
     params = [min_acres, min_tenure, min_growth]
-    if use:          where.append("use = %s");         params.append(use)
-    if owner_type:   where.append("owner_type = %s");  params.append(owner_type)
-    if water_status: where.append("zcta IN (SELECT zcta FROM zones WHERE water_status=%s)"); params.append(water_status)
+    if use:          where.append("p.use = %s");         params.append(use)
+    if owner_type:   where.append("p.owner_type = %s");  params.append(owner_type)
+    if water_status: where.append("z.water_status = %s"); params.append(water_status)
     if not include_public:
-        where.append("NOT (coalesce(owner,'') ILIKE ANY(%s))")
+        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))")
         params.append(PUBLIC_OWNER_PATTERNS)
     params.append(limit)
     return qall(f"""
-      SELECT apn, situs_address, city, zcta, use, acres, owner, owner_type,
-             tenure, acquired, paid, est, growth_score, target_score,
-             ST_X(centroid) lon, ST_Y(centroid) lat
-      FROM parcels
+      SELECT p.apn, p.situs_address, p.city, p.zcta, p.use, p.acres, p.owner, p.owner_type,
+             p.tenure, p.acquired, p.paid, p.est,
+             round({growth_sql}::numeric,1) AS growth_score,
+             round({target_sql}::numeric,1) AS target_score,
+             ST_X(p.centroid) lon, ST_Y(p.centroid) lat
+      FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
       WHERE {' AND '.join(where)}
-      ORDER BY target_score DESC
+      ORDER BY {target_sql} DESC
       LIMIT %s
     """, tuple(params))
 
 @app.get("/targets/export")
 def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
                    min_tenure: int = 0, min_growth: float = 0, water_status: str = "",
-                   include_public: bool = False, limit: int = 2000):
+                   include_public: bool = False, weights: str = "", gate: bool = True,
+                   limit: int = 2000):
     """Downloadable outreach list: top private off-market targets with the owner's
     mailing address, ready for a direct-mail merge."""
-    where = ["status='Off-market'", "use IN ('Vacant','Agricultural')",
-             "acres >= %s", "coalesce(tenure,0) >= %s", "growth_score >= %s"]
+    W = _parse_weights(weights)
+    growth_sql, target_sql = _live_sql(W, gate)
+    where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
+             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", f"{growth_sql} >= %s"]
     params = [min_acres, min_tenure, min_growth]
-    if use:          where.append("use = %s");         params.append(use)
-    if owner_type:   where.append("owner_type = %s");  params.append(owner_type)
-    if water_status: where.append("zcta IN (SELECT zcta FROM zones WHERE water_status=%s)"); params.append(water_status)
+    if use:          where.append("p.use = %s");         params.append(use)
+    if owner_type:   where.append("p.owner_type = %s");  params.append(owner_type)
+    if water_status: where.append("z.water_status = %s"); params.append(water_status)
     if not include_public:
-        where.append("NOT (coalesce(owner,'') ILIKE ANY(%s))"); params.append(PUBLIC_OWNER_PATTERNS)
+        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); params.append(PUBLIC_OWNER_PATTERNS)
     params.append(limit)
     rows = qall(f"""
-      SELECT apn, situs_address, city, zcta, use, acres, est,
-             CASE WHEN acres>0 THEN round(est/acres) ELSE NULL END AS per_acre,
-             owner, owner_type, absentee, tenure, acquired, paid, mail_address,
-             round(target_score) target_score, round(growth_score) growth_score
-      FROM parcels WHERE {' AND '.join(where)}
-      ORDER BY target_score DESC LIMIT %s
+      SELECT p.apn, p.situs_address, p.city, p.zcta, p.use, p.acres, p.est,
+             CASE WHEN p.acres>0 THEN round(p.est/p.acres) ELSE NULL END AS per_acre,
+             p.owner, p.owner_type, p.absentee, p.tenure, p.acquired, p.paid, p.mail_address,
+             round({target_sql}::numeric) target_score, round({growth_sql}::numeric) growth_score
+      FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
+      WHERE {' AND '.join(where)}
+      ORDER BY {target_sql} DESC LIMIT %s
     """, tuple(params))
     buf = io.StringIO(); w = csv.writer(buf)
     w.writerow(["APN", "Situs Address", "City", "ZIP", "Use", "Acres", "Est Value", "$/Acre",
