@@ -845,7 +845,7 @@ def _fetch_aaws(bbox, cap=15000):
                   "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
                   "spatialRel": "esriSpatialRelIntersects", "outFields": "OBJECTID",
                   "returnGeometry": "true", "f": "geojson", "orderByFields": "OBJECTID",
-                  "resultOffset": offset, "resultRecordCount": 2000}
+                  "resultOffset": offset, "resultRecordCount": 1000}
         r = requests.get(AAWS_URL, params=params, timeout=120, headers={"User-Agent": UA})
         try:
             batch = r.json().get("features", [])
@@ -858,7 +858,7 @@ def _fetch_aaws(bbox, cap=15000):
             if g:
                 geoms.append(json.dumps(g))
         offset += len(batch)
-        if len(batch) < 2000:
+        if not batch:
             break
     return geoms
 
@@ -886,17 +886,24 @@ UPDATE zones z SET signals = jsonb_set(z.signals, '{infra_transport}',
 FROM nc WHERE z.zcta = nc.zcta;
 """
 
-def _fetch_projects(bbox):
-    params = {"where": "1=1", "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
-              "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
-              "spatialRel": "esriSpatialRelIntersects", "outFields": "OBJECTID",
-              "returnGeometry": "true", "f": "geojson", "resultRecordCount": 2000}
-    r = requests.get(ADOT_PROJECTS_URL, params=params, timeout=120, headers={"User-Agent": UA})
-    try:
-        feats = r.json().get("features", [])
-    except Exception:
-        raise RuntimeError(f"ADOT status {r.status_code}: {r.text[:150]}")
-    return [json.dumps(f["geometry"]) for f in feats if f.get("geometry")]
+def _fetch_projects(bbox, cap=20000):
+    geoms, offset = [], 0
+    while len(geoms) < cap:
+        params = {"where": "1=1", "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+                  "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
+                  "spatialRel": "esriSpatialRelIntersects", "outFields": "OBJECTID",
+                  "returnGeometry": "true", "f": "geojson",
+                  "resultOffset": offset, "resultRecordCount": 1000}
+        r = requests.get(ADOT_PROJECTS_URL, params=params, timeout=120, headers={"User-Agent": UA})
+        try:
+            feats = r.json().get("features", [])
+        except Exception:
+            raise RuntimeError(f"ADOT status {r.status_code}: {r.text[:150]}")
+        if not feats:
+            break
+        geoms.extend(json.dumps(f["geometry"]) for f in feats if f.get("geometry"))
+        offset += len(feats)
+    return geoms
 
 def run_signals(kind="migration"):
     global SIGNAL_STATUS
@@ -1065,7 +1072,7 @@ def run_ingest_built(cap=2_000_000):
         while offset < cap:
             params = {"where": "CONST_YEAR <> ''", "outFields": "APN_DASH,APN,CONST_YEAR,LONGITUDE,LATITUDE,LAND_SIZE",
                       "returnGeometry": "false", "f": "json",
-                      "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": 2000}
+                      "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": 1000}
             r = requests.get(COUNTY_PARCELS, params=params, timeout=120, headers={"User-Agent": UA})
             try:
                 feats = r.json().get("features", [])
@@ -1090,8 +1097,9 @@ def run_ingest_built(cap=2_000_000):
             if len(buf) >= 20000:
                 loaded += _flush_built(buf); buf = []
                 INGEST_STATUS.update(loaded=loaded)
-            if len(feats) < 2000:
-                break
+            # NOTE: stop only on an empty page. The county caps a page at 1000
+            # regardless of what we ask for, so "short page means finished" is
+            # wrong and silently truncates the pull after the first request.
         if buf:
             loaded += _flush_built(buf)
         with pool.connection() as c:
@@ -1240,8 +1248,6 @@ def _fetch_flood(bbox, cap=40000):
             if g and (z in HIGH_RISK_ZONES or "FLOODWAY" in sub):
                 geoms.append((json.dumps(g), ("FLOODWAY" if "FLOODWAY" in sub else z)))
         offset += len(feats)
-        if len(feats) < 1000:
-            break
     return geoms
 
 def run_screens(do_flood=True):
