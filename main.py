@@ -823,14 +823,49 @@ def run_signals(kind="migration"):
     except Exception as e:
         SIGNAL_STATUS = {"state": "error", "detail": str(e)[:200]}
 
+ALL_SIGNAL_KINDS = ["migration", "water", "developable", "velocity", "transport"]
+
+def run_all_signals():
+    """Run every real signal in sequence. Used by the one-click refresh and the
+    monthly scheduled job."""
+    global SIGNAL_STATUS
+    ran = {}
+    for i, k in enumerate(ALL_SIGNAL_KINDS, 1):
+        run_signals(k)
+        ran[k] = SIGNAL_STATUS.get("state")
+        if SIGNAL_STATUS.get("state") == "error":
+            SIGNAL_STATUS = {"state": "error", "at": k, "detail": SIGNAL_STATUS.get("detail"), "ran": ran}
+            return
+    SIGNAL_STATUS = {"state": "done", "kind": "all", "ran": ran}
+
+def run_full_refresh(parcels=False):
+    """Optionally re-pull all parcels, then run every signal. Used by the quarterly
+    scheduled job and the manual full refresh."""
+    if parcels:
+        run_ingest_county()
+        if INGEST_STATUS.get("state") == "error":
+            return
+    run_all_signals()
+
 @app.get("/admin/signals")
 def admin_signals(token: str, kind: str = "migration"):
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if SIGNAL_STATUS.get("state") == "running":
         return {"state": "already_running", "status": SIGNAL_STATUS}
-    threading.Thread(target=run_signals, args=(kind,), daemon=True).start()
+    target = run_all_signals if kind == "all" else (lambda: run_signals(kind))
+    threading.Thread(target=target, daemon=True).start()
     return {"state": "started", "kind": kind, "next": "poll /admin/signals_status?token=YOUR_TOKEN"}
+
+@app.get("/admin/refresh")
+def admin_refresh(token: str, parcels: bool = False):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if INGEST_STATUS.get("state") == "running" or SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running"}
+    threading.Thread(target=run_full_refresh, kwargs={"parcels": parcels}, daemon=True).start()
+    return {"state": "started", "parcels": parcels,
+            "note": "parcels=false runs all signals; parcels=true also re-pulls the county first. Poll /admin/status then /admin/signals_status"}
 
 @app.get("/admin/signals_status")
 def admin_signals_status(token: str):
