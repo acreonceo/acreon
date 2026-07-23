@@ -1071,7 +1071,7 @@ def admin_signals_status(token: str):
 # "in a floodplain" and nothing more.
 FEMA_URLS = ["https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
              "https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services/Flood/MapServer/0/query"]
-SFHA_WHERE = "SFHA_TF='T' OR ZONE_SUBTY LIKE '%FLOODWAY%'"
+SFHA_WHERE = "SFHA_TF='T'"
 # Server-side generalisation, in output-SR units (degrees). ~20m.
 GEN_OFFSET = 0.0002
 FEMA_NFHL = FEMA_URLS[0]
@@ -1427,6 +1427,7 @@ def _flood_tiles(bbox, tiles=12, per_page=50):
     """
     x0, y0, x1, y1 = bbox
     url = _flood_url()
+    SIGNAL_STATUS.update(flood_source=url)
     dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
     for i in range(tiles):
         for j in range(tiles):
@@ -1444,9 +1445,13 @@ def _flood_tiles(bbox, tiles=12, per_page=50):
                           "resultOffset": offset, "resultRecordCount": per_page}
                 r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
                 try:
-                    feats = r.json().get("features", [])
+                    j = r.json()
                 except Exception:
-                    raise RuntimeError(f"FEMA status {r.status_code}: {r.text[:120]}")
+                    raise RuntimeError(f"flood source status {r.status_code}: {r.text[:140]}")
+                if isinstance(j, dict) and j.get("error"):
+                    # surface it instead of mistaking an error for an empty page
+                    raise RuntimeError(f"flood source rejected the query: {str(j['error'])[:200]}")
+                feats = j.get("features") or []
                 if not feats:
                     break
                 for f in feats:
@@ -1495,6 +1500,11 @@ def run_screens(do_flood=True):
                         c.commit()
                     written += len(batch)
                 SIGNAL_STATUS.update(detail=f"flood tile {idx}/{total_tiles}, {written} polygons stored")
+            SIGNAL_STATUS.update(flood_polygons=written)
+            if not written:
+                flood_err = ("no flood polygons returned by "
+                             + str(SIGNAL_STATUS.get("flood_source"))
+                             + " (query accepted but empty; check the layer filter)")
             if written:
                 with pool.connection() as c:
                     with c.cursor() as cur:
