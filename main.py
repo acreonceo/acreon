@@ -1061,29 +1061,53 @@ def admin_signals_status(token: str):
 FEMA_NFHL = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query"
 HIGH_RISK_ZONES = ("A", "AE", "AH", "AO", "A99", "AR", "V", "VE")
 
-def run_ingest_built(cap=2_000_000):
-    """Pull every parcel that carries a construction year. Only APN, point and
-    year, so this stays light even across ~1.5M improved parcels. This is the
-    census of development events the hazard is fit on."""
-    global INGEST_STATUS
-    INGEST_STATUS = {"state": "running", "mode": "built", "fetched": 0, "detail": "starting"}
-    offset, buf, loaded = 0, [], 0
+def _county_count(where):
+    """Ask the server how many records match, so progress is measured against a
+    real target instead of guessed."""
     try:
-        while offset < cap:
-            params = {"where": "CONST_YEAR <> ''", "outFields": "APN_DASH,APN,CONST_YEAR,LONGITUDE,LATITUDE,LAND_SIZE",
+        r = requests.get(COUNTY_PARCELS, params={"where": where, "returnCountOnly": "true", "f": "json"},
+                         timeout=60, headers={"User-Agent": UA})
+        return int(r.json().get("count"))
+    except Exception:
+        return None
+
+def run_ingest_built(cap=2_000_000):
+    """Pull every parcel carrying a construction year: APN, point, year, size.
+    This is the census of development events the hazard is fit on.
+
+    Pagination is by OBJECTID rather than resultOffset. Some ArcGIS layers ignore
+    resultOffset and return the same first page every time, which silently caps a
+    pull at one page. Keyset paging (OBJECTID > last seen) always advances.
+    """
+    global INGEST_STATUS
+    where_base = "CONST_YEAR <> ''"
+    total = _county_count(where_base)
+    INGEST_STATUS = {"state": "running", "mode": "built", "fetched": 0,
+                     "server_count": total, "detail": "starting"}
+    last_oid, seen, buf, loaded, stalls = -1, 0, [], 0, 0
+    try:
+        while seen < cap:
+            params = {"where": f"({where_base}) AND OBJECTID > {last_oid}",
+                      "outFields": "OBJECTID,APN_DASH,APN,CONST_YEAR,LONGITUDE,LATITUDE,LAND_SIZE",
                       "returnGeometry": "false", "f": "json",
-                      "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": 1000}
+                      "orderByFields": "OBJECTID", "resultRecordCount": 1000}
             r = requests.get(COUNTY_PARCELS, params=params, timeout=120, headers={"User-Agent": UA})
             try:
-                feats = r.json().get("features", [])
+                j = r.json()
             except Exception:
                 raise RuntimeError(f"county status {r.status_code}: {r.text[:150]}")
+            if j.get("error"):
+                raise RuntimeError(f"county error: {str(j['error'])[:180]}")
+            feats = j.get("features", [])
             if not feats:
                 break
-            offset += len(feats)
+            prev = last_oid
             for f in feats:
                 a = f.get("attributes") or {}
-                cy = (str(a.get("CONST_YEAR") or "")).strip()
+                oid = a.get("OBJECTID")
+                if isinstance(oid, (int, float)):
+                    last_oid = max(last_oid, int(oid))
+                cy = str(a.get("CONST_YEAR") or "").strip()
                 lon, lat = a.get("LONGITUDE"), a.get("LATITUDE")
                 if not (len(cy) == 4 and cy.isdigit()) or lon is None or lat is None:
                     continue
@@ -1092,22 +1116,32 @@ def run_ingest_built(cap=2_000_000):
                     continue
                 ls = a.get("LAND_SIZE")
                 acres = round(ls / 43560.0, 3) if isinstance(ls, (int, float)) and ls > 0 else None
-                buf.append(((a.get("APN_DASH") or a.get("APN") or "").strip(), lon, lat, yr, acres))
-            INGEST_STATUS.update(fetched=offset, detail=f"fetching ({offset})")
+                apn = (a.get("APN_DASH") or a.get("APN") or "").strip()
+                if apn:
+                    buf.append((apn, lon, lat, yr, acres))
+            seen += len(feats)
+            if last_oid <= prev:          # server is not advancing; stop rather than spin
+                stalls += 1
+                if stalls >= 2:
+                    raise RuntimeError("server did not advance past OBJECTID "
+                                       f"{last_oid}; pagination unsupported on this layer")
+            else:
+                stalls = 0
+            INGEST_STATUS.update(fetched=seen, detail=f"fetching ({seen}"
+                                 + (f" of {total}" if total else "") + ")")
             if len(buf) >= 20000:
                 loaded += _flush_built(buf); buf = []
                 INGEST_STATUS.update(loaded=loaded)
-            # NOTE: stop only on an empty page. The county caps a page at 1000
-            # regardless of what we ask for, so "short page means finished" is
-            # wrong and silently truncates the pull after the first request.
         if buf:
             loaded += _flush_built(buf)
         with pool.connection() as c:
             n = c.execute("SELECT count(*) FROM built").fetchone()[0]
             yr = c.execute("SELECT min(const_year), max(const_year) FROM built").fetchone()
-        INGEST_STATUS = {"state": "done", "mode": "built", "fetched": offset, "rows": n, "year_range": yr}
+        INGEST_STATUS = {"state": "done", "mode": "built", "fetched": seen,
+                         "server_count": total, "rows": n, "year_range": yr}
     except Exception as e:
-        INGEST_STATUS = {"state": "error", "mode": "built", "detail": str(e)[:200], "fetched": offset}
+        INGEST_STATUS = {"state": "error", "mode": "built", "detail": str(e)[:220],
+                         "fetched": seen, "server_count": total}
 
 def _flush_built(rows):
     with pool.connection() as c, c.cursor() as cur:
