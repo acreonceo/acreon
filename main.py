@@ -1416,7 +1416,7 @@ def _flood_url_unused():
     return FEMA_URLS[0]
 
 
-def _flood_tiles(bbox, tiles=12, per_page=50):
+def _flood_tiles(bbox, url, tiles=12, per_page=20):
     """Yield one tile's flood polygons at a time.
 
     The previous version accumulated every polygon countywide before writing any
@@ -1426,8 +1426,6 @@ def _flood_tiles(bbox, tiles=12, per_page=50):
     memory to a single tile.
     """
     x0, y0, x1, y1 = bbox
-    url = _flood_url()
-    SIGNAL_STATUS.update(flood_source=url)
     dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
     for i in range(tiles):
         for j in range(tiles):
@@ -1466,7 +1464,7 @@ def _flood_tiles(bbox, tiles=12, per_page=50):
             batch = None
 
 
-def run_screens(do_flood=True):
+def run_screens(do_flood=True, flood_source=None):
     """Two screens the review named as the source of the worst embarrassments:
     a landlocked parcel scored like its road-frontage neighbour, and floodway
     land scored on growth momentum."""
@@ -1481,43 +1479,56 @@ def run_screens(do_flood=True):
             ll = c.execute("SELECT count(*) FROM parcels WHERE landlocked").fetchone()[0]
         flood, flood_err = 0, None
         if do_flood:
-          try:
-            SIGNAL_STATUS["detail"] = "locating FEMA service"
-            with pool.connection() as c:
-                bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
-                               "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
-                with c.cursor() as cur:
-                    cur.execute("DROP TABLE IF EXISTS flood")
-                    cur.execute("CREATE TABLE flood(geom geometry(Geometry,4326), zone text)")
-                c.commit()
-            written = 0
-            for idx, total_tiles, batch in _flood_tiles(bb):
-                if batch:
-                    with pool.connection() as c, c.cursor() as cur:
-                        cur.executemany(
-                            "INSERT INTO flood(geom,zone) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)),%s)",
-                            batch)
+            # FEMA serves a single polygon but resets on tiled queries, so each
+            # candidate source is tried in turn and the first that actually
+            # delivers is used. The county layer carries no attributes, so it can
+            # only say "in a floodplain", which is still worth having.
+            candidates = [flood_source] if flood_source else list(FEMA_URLS)
+            errors = []
+            for url in candidates:
+                written = 0
+                SIGNAL_STATUS.update(flood_source=url, detail=f"trying {url.split('/')[2]}")
+                try:
+                    with pool.connection() as c:
+                        with c.cursor() as cur:
+                            cur.execute("DROP TABLE IF EXISTS flood")
+                            cur.execute("CREATE TABLE flood(geom geometry(Geometry,4326), zone text)")
                         c.commit()
-                    written += len(batch)
-                SIGNAL_STATUS.update(detail=f"flood tile {idx}/{total_tiles}, {written} polygons stored")
+                        bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
+                                       "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+                    for idx, total_tiles, batch in _flood_tiles(bb, url):
+                        if batch:
+                            with pool.connection() as c, c.cursor() as cur:
+                                cur.executemany(
+                                    "INSERT INTO flood(geom,zone) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)),%s)",
+                                    batch)
+                                c.commit()
+                            written += len(batch)
+                        SIGNAL_STATUS.update(detail=f"{url.split('/')[2]} tile {idx}/{total_tiles}, {written} polygons",
+                                             flood_polygons=written)
+                    if written:
+                        break
+                    errors.append(f"{url.split('/')[2]}: returned no polygons")
+                except Exception as fe:
+                    errors.append(f"{url.split('/')[2]}: {str(fe)[:90]}")
+                    continue
             SIGNAL_STATUS.update(flood_polygons=written)
-            if not written:
-                flood_err = ("no flood polygons returned by "
-                             + str(SIGNAL_STATUS.get("flood_source"))
-                             + " (query accepted but empty; check the layer filter)")
             if written:
-                with pool.connection() as c:
-                    with c.cursor() as cur:
-                        cur.execute("CREATE INDEX ON flood USING gist(geom)")
-                        cur.execute("ANALYZE flood")
-                        cur.execute("UPDATE parcels SET flood_zone = NULL")
-                        cur.execute("""UPDATE parcels p SET flood_zone = f.zone FROM flood f
-                                       WHERE ST_Contains(f.geom, p.centroid)""")
-                        cur.execute("DROP TABLE flood")
-                    c.commit()
-                    flood = c.execute("SELECT count(*) FROM parcels WHERE flood_zone IS NOT NULL").fetchone()[0]
-          except Exception as fe:
-            flood_err = str(fe)[:180]      # keep the frontage result either way
+                try:
+                    with pool.connection() as c:
+                        with c.cursor() as cur:
+                            cur.execute("CREATE INDEX ON flood USING gist(geom)")
+                            cur.execute("ANALYZE flood")
+                            cur.execute("UPDATE parcels SET flood_zone = NULL")
+                            cur.execute("""UPDATE parcels p SET flood_zone = f.zone FROM flood f
+                                           WHERE ST_Contains(f.geom, p.centroid)""")
+                            cur.execute("DROP TABLE flood")
+                        c.commit()
+                        flood = c.execute("SELECT count(*) FROM parcels WHERE flood_zone IS NOT NULL").fetchone()[0]
+                except Exception as fe:
+                    flood_err = f"overlay failed: {str(fe)[:140]}"
+            else:
+                flood_err = "; ".join(errors)[:220]
         out = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood,
                "flood_source": SIGNAL_STATUS.get("flood_source"),
                "flood_polygons": SIGNAL_STATUS.get("flood_polygons")}
@@ -1547,12 +1558,12 @@ def admin_fit_hazard(token: str, sample_vacant: float = 0.06, sample_built: floa
     return {"state": "started", "kind": "hazard", "next": "poll /admin/signals_status"}
 
 @app.get("/admin/screens")
-def admin_screens(token: str, flood: bool = True):
+def admin_screens(token: str, flood: bool = True, flood_source: str = None):
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if SIGNAL_STATUS.get("state") == "running":
         return {"state": "already_running", "status": SIGNAL_STATUS}
-    threading.Thread(target=run_screens, args=(flood,), daemon=True).start()
+    threading.Thread(target=run_screens, args=(flood, flood_source), daemon=True).start()
     return {"state": "started", "kind": "screens", "next": "poll /admin/signals_status"}
 
 @app.get("/admin/fit")
