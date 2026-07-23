@@ -1072,6 +1072,8 @@ def admin_signals_status(token: str):
 FEMA_URLS = ["https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query",
              "https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services/Flood/MapServer/0/query"]
 SFHA_WHERE = "SFHA_TF='T' OR ZONE_SUBTY LIKE '%FLOODWAY%'"
+# Server-side generalisation, in output-SR units (degrees). ~20m.
+GEN_OFFSET = 0.0002
 FEMA_NFHL = FEMA_URLS[0]
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -1346,17 +1348,30 @@ def _flood_class(props):
 
 
 def _flood_url():
-    """Pick whichever FEMA path answers a trivial query."""
+    """Pick a service by asking for GEOMETRY, not just a count.
+
+    Every failure so far has been on geometry retrieval: the probe succeeded with
+    returnGeometry=false and reset with it on. FEMA's flood polygons are highly
+    detailed, so requests carry maxAllowableOffset to have the server generalise
+    them before sending. Roughly 20m of precision is far finer than needed to ask
+    whether a parcel centroid sits inside a flood zone, and it cuts the payload
+    by an order of magnitude.
+    """
     for u in FEMA_URLS:
         try:
             w = SFHA_WHERE if "hazards.fema.gov" in u else "1=1"
-            r = requests.get(u, params={"where": w, "returnCountOnly": "true", "f": "json"},
-                             timeout=45, headers={"User-Agent": BROWSER_UA})
-            if r.status_code < 400 and "count" in r.text[:400]:
+            r = requests.get(u, params={"where": w, "outFields": "FLD_ZONE,ZONE_SUBTY,SFHA_TF"
+                                        if "hazards.fema.gov" in u else "*",
+                                        "returnGeometry": "true", "outSR": "4326",
+                                        "maxAllowableOffset": GEN_OFFSET,
+                                        "geometryPrecision": 6,
+                                        "resultRecordCount": 1, "f": "geojson"},
+                             timeout=60, headers={"User-Agent": BROWSER_UA})
+            if r.status_code < 400 and "features" in r.text[:2000]:
                 return u
         except Exception:
             continue
-    return FEMA_URLS[0]
+    return FEMA_URLS[-1]
 
 
 @app.get("/admin/probe_flood")
@@ -1401,7 +1416,7 @@ def _flood_url_unused():
     return FEMA_URLS[0]
 
 
-def _flood_tiles(bbox, tiles=12, per_page=100):
+def _flood_tiles(bbox, tiles=12, per_page=50):
     """Yield one tile's flood polygons at a time.
 
     The previous version accumulated every polygon countywide before writing any
@@ -1425,6 +1440,7 @@ def _flood_tiles(bbox, tiles=12, per_page=100):
                           "geometryType": "esriGeometryEnvelope", "inSR": "4326", "outSR": "4326",
                           "spatialRel": "esriSpatialRelIntersects", "outFields": fields,
                           "returnGeometry": "true", "f": "geojson",
+                          "maxAllowableOffset": GEN_OFFSET, "geometryPrecision": 6,
                           "resultOffset": offset, "resultRecordCount": per_page}
                 r = _get_retry(url, params, timeout=120, tries=3, ua=BROWSER_UA)
                 try:
