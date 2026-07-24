@@ -40,7 +40,10 @@ BIASES WE KNOW ABOUT (from the review, worth restating where the code lives)
 import math
 
 LAG_YEARS = 2          # payoff precedes construction by roughly this much
-DIST_BINS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]   # miles; 7 bins including the tail
+DIST_BINS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]   # miles; 8 bins including the tail
+# The 20-mile edge matters in Maricopa: without it the far west desert around
+# Tonopah shares a bin with land a few miles outside Surprise, and the model
+# cannot tell them apart.
 PERIODS = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
 
 

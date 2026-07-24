@@ -581,48 +581,60 @@ def _zip_bbox(zcta):
 
 
 # --- BACKTEST --------------------------------------------------------------
-# Panel of parcel-periods that had FINISHED before the vintage year. Anything
-# later would let the scoring model see the outcome it is being tested on.
-BT_TRAIN_SQL = """
-CREATE TEMP TABLE bt_train AS
-WITH universe AS (
-  SELECT apn, centroid, NULL::int AS const_year, acres FROM parcels
-   WHERE centroid IS NOT NULL AND random() < %(s)s
+# Analysed on a fixed grid of ground, not on parcels. See backtest.py for why:
+# subdivision turns one converted farm into thousands of converted house lots,
+# which swamps the unconverted land and destroys the test.
+BT_GRID_SQL = """
+CREATE TABLE bt_cells AS
+WITH pts AS (
+  SELECT floor(ST_X(centroid)/%(dx)s)::int gx, floor(ST_Y(centroid)/%(dy)s)::int gy,
+         const_year, centroid FROM built
   UNION ALL
-  SELECT apn, centroid, const_year, acres FROM built WHERE random() < %(s)s
+  SELECT floor(ST_X(centroid)/%(dx)s)::int, floor(ST_Y(centroid)/%(dy)s)::int,
+         NULL::int, centroid FROM parcels WHERE centroid IS NOT NULL
 )
-SELECT u.apn, y.t AS period,
-       (u.const_year IS NOT NULL AND u.const_year >= y.t AND u.const_year < y.t + 5)::int AS event,
-       u.acres,
-       (SELECT ST_Distance(u.centroid::geography, b.centroid::geography) / 1609.34
-          FROM built b WHERE b.const_year <= y.t
-         ORDER BY u.centroid <-> b.centroid LIMIT 1) AS edge_miles
-FROM universe u
-CROSS JOIN (SELECT unnest(%(periods)s::int[]) AS t) y
-WHERE u.const_year IS NULL OR u.const_year > y.t
+SELECT gx, gy,
+       (array_agg(const_year ORDER BY const_year)
+          FILTER (WHERE const_year IS NOT NULL))[%(minb)s] AS dev_year,
+       count(*) FILTER (WHERE const_year IS NULL) AS vacant_parcels,
+       count(*) AS total_parcels,
+       ST_Centroid(ST_Collect(centroid)) AS centroid
+FROM pts
+GROUP BY gx, gy
 """
 
-# Everything still undeveloped at the vintage year, with the frontier measured
-# as it stood THEN. Outcome (const_year) comes along but is never scored on.
-BT_SCORE_SQL = """
-CREATE TEMP TABLE bt_score AS
-WITH universe AS (
-  SELECT apn, centroid, NULL::int AS const_year, acres FROM parcels
-   WHERE centroid IS NOT NULL AND random() < %(s)s
-  UNION ALL
-  SELECT apn, centroid, const_year, acres FROM built WHERE random() < %(s)s
-)
-SELECT u.apn, u.const_year, u.acres,
-       (SELECT ST_Distance(u.centroid::geography, b.centroid::geography) / 1609.34
-          FROM built b WHERE b.const_year <= %(v)s
-         ORDER BY u.centroid <-> b.centroid LIMIT 1) AS edge_miles
-FROM universe u
-WHERE (u.const_year IS NULL OR u.const_year > %(v)s)
+# Distance to the frontier is computed against a per-year frontier table that is
+# built and indexed first. Filtering "dev_year <= t" inside the nearest-neighbour
+# query defeats the spatial index and turns each lookup into a scan, which made
+# the whole run intractable.
+BT_FRONT_SQL = """
+DROP TABLE IF EXISTS bt_front;
+CREATE TABLE bt_front AS SELECT centroid FROM bt_cells WHERE dev_year <= %(t)s;
+CREATE INDEX ON bt_front USING gist(centroid);
+ANALYZE bt_front;
 """
 
-def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=0.10):
-    """Score parcels as of each vintage using only what existed then, then look
-    at what actually happened afterwards."""
+BT_AT_RISK_SQL = """
+SELECT c.gx, c.gy, c.dev_year, c.total_parcels,
+       (SELECT ST_Distance(c.centroid::geography, f.centroid::geography) / 1609.34
+          FROM bt_front f ORDER BY c.centroid <-> f.centroid LIMIT 1) AS edge_miles
+FROM bt_cells c
+WHERE (c.dev_year IS NULL OR c.dev_year > %(t)s)
+"""
+
+def _frontier_year(t):
+    with pool.connection() as c, c.cursor() as cur:
+        for stmt in [x for x in BT_FRONT_SQL.split(";") if x.strip()]:
+            cur.execute(stmt, {"t": t})
+        c.commit()
+
+def _at_risk(t):
+    with pool.connection() as c:
+        return c.execute(BT_AT_RISK_SQL, {"t": t}).fetchall()
+
+def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=None):
+    """Score every undeveloped cell of ground as of each vintage using only what
+    existed then, then measure what actually happened."""
     global SIGNAL_STATUS
     SIGNAL_STATUS = {"state": "running", "kind": "backtest", "detail": "checking history"}
     try:
@@ -633,6 +645,30 @@ def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=0.10):
             SIGNAL_STATUS = {"state": "error", "kind": "backtest",
                              "detail": f"only {nb} construction records; run /admin/ingest_built first"}
             return
+        SIGNAL_STATUS.update(detail="building the grid")
+        with pool.connection() as c:
+            with c.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS bt_cells")
+                cur.execute(BT_GRID_SQL, {"dx": BT.CELL_DX, "dy": BT.CELL_DY,
+                                          "minb": BT.MIN_BUILT_FOR_DEVELOPED})
+                cur.execute("CREATE INDEX ON bt_cells USING gist(centroid)")
+                cur.execute("CREATE INDEX ON bt_cells (dev_year)")
+                cur.execute("ANALYZE bt_cells")
+                cells = cur.execute("SELECT count(*), count(dev_year) FROM bt_cells").fetchone()
+            c.commit()
+        # NOTE: a real table, not TEMP. Temp tables are session-scoped and this
+        # runs across a connection pool, so a temp grid disappears between steps.
+        SIGNAL_STATUS.update(detail=f"{cells[0]:,} cells, {cells[1]:,} ever developed")
+
+        # One pass per year, reused for both training and scoring
+        years = sorted({p for v in vintages for p in HZ.PERIODS if p + 5 <= v} | set(vintages))
+        risk = {}
+        for i, t in enumerate(years, 1):
+            SIGNAL_STATUS.update(detail=f"measuring the frontier as it stood in {t} ({i}/{len(years)})")
+            _frontier_year(t)
+            risk[t] = [(gx, gy, dy, float(n or 0), float(d))
+                       for gx, gy, dy, n, d in _at_risk(t) if d is not None]
+
         results = []
         for v in vintages:
             periods = [p for p in HZ.PERIODS if p + 5 <= v]
@@ -640,52 +676,51 @@ def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=0.10):
                 results.append({"vintage": v, "error": "not enough completed periods before this year"})
                 continue
             SIGNAL_STATUS.update(detail=f"{v}: training on periods {periods}")
-            with pool.connection() as c:
-                with c.cursor() as cur:
-                    cur.execute("DROP TABLE IF EXISTS bt_train")
-                    cur.execute(BT_TRAIN_SQL, {"s": sample, "periods": periods})
-                    train = cur.execute(
-                        "SELECT period, event, acres, edge_miles FROM bt_train WHERE edge_miles IS NOT NULL").fetchall()
-                c.commit()
-            rows = [(int(p), int(e), float(a) if a else 1.0, float(d)) for p, e, a, d in train]
+            rows = []
+            for t in periods:
+                for gx, gy, dy, n, d in risk.get(t, []):
+                    ev = 1 if (dy is not None and t <= dy < t + 5) else 0
+                    rows.append((t, ev, n, d))
             coefs, bins = BT.fit_pre_vintage(rows)
             if not coefs:
                 results.append({"vintage": v, "error": f"insufficient training data ({len(rows)} rows)"})
                 continue
-            SIGNAL_STATUS.update(detail=f"{v}: scoring parcels as they stood then")
-            with pool.connection() as c:
-                with c.cursor() as cur:
-                    cur.execute("DROP TABLE IF EXISTS bt_score")
-                    cur.execute(BT_SCORE_SQL, {"s": sample, "v": v})
-                    sc = cur.execute(
-                        "SELECT apn, const_year, acres, edge_miles FROM bt_score WHERE edge_miles IS NOT NULL").fetchall()
-                c.commit()
-            scored = [(apn, BT.score(coefs, bins, float(d), float(a) if a else 1.0),
-                       cy, float(a) if a else 0.0, float(d)) for apn, cy, a, d in sc]
+            SIGNAL_STATUS.update(detail=f"{v}: scoring the county as it stood then")
+            scored = [(f"{gx}:{gy}", BT.score(coefs, bins, d), dy, n, d)
+                      for gx, gy, dy, n, d in risk.get(v, [])]
             quints = BT.quintile_outcomes(scored, v)
             results.append(BT.summarise(v, quints, len(rows), sum(r[1] for r in rows)))
-            SIGNAL_STATUS.update(detail=f"{v}: done")
-        payload = {"results": results, "verdict": BT.verdict(results),
-                   "sample_fraction": sample,
-                   "method": ("hazard refit per vintage on completed periods only; "
-                              "development frontier reconstructed from parcels built by "
-                              "that year; no present-day covariates used")}
+
+        payload = {"unit": "half-mile grid cells",
+                   "cells_total": cells[0], "cells_ever_developed": cells[1],
+                   "results": results, "verdict": BT.verdict(results),
+                   "method": ("cells of fixed ground, not parcels, so subdivision cannot "
+                              "inflate the converted side; hazard refit per vintage on "
+                              "completed periods only; frontier reconstructed from cells "
+                              "developed by that year; no present-day covariates")}
         with pool.connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO model_fit(key,payload) VALUES('backtest',%s::jsonb) "
                         "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, fitted_at=now()",
                         (json.dumps(payload),))
             c.commit()
+        try:
+            with pool.connection() as c, c.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS bt_cells")
+                cur.execute("DROP TABLE IF EXISTS bt_front")
+                c.commit()
+        except Exception:
+            pass
         SIGNAL_STATUS = {"state": "done", "kind": "backtest", **payload}
     except Exception as e:
         SIGNAL_STATUS = {"state": "error", "kind": "backtest", "detail": str(e)[:250]}
 
 @app.get("/admin/backtest")
-def admin_backtest(token: str, sample: float = 0.10):
+def admin_backtest(token: str):
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if SIGNAL_STATUS.get("state") == "running":
         return {"state": "already_running", "status": SIGNAL_STATUS}
-    threading.Thread(target=run_backtest, kwargs={"sample": sample}, daemon=True).start()
+    threading.Thread(target=run_backtest, daemon=True).start()
     return {"state": "started", "kind": "backtest", "next": "poll /admin/state?token=YOUR_TOKEN"}
 
 @app.get("/admin/state")

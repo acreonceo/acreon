@@ -35,13 +35,40 @@ import math
 CURRENT_YEAR = 2025
 QUINTILES = 5
 
-# Calibration from a null test: on synthetic data where conversion was decided by
-# a coin flip, with position and acreage held identical between the converted and
-# never-converted groups, this harness reported a 5 to 8 point spread. On data
-# with a real planted frontier it reported 98 points. So a spread in single
-# digits is indistinguishable from noise, and anything above roughly 20 points is
-# separation the harness would not produce by accident.
-NULL_BASELINE_PP = 8.0
+# GRID, NOT PARCELS. The first version of this test analysed parcels and produced
+# a 79% conversion rate on a population whose median holding was a fifteenth of an
+# acre. The cause: subdivision multiplies converted land and leaves unconverted
+# land alone. A 640-acre farm that converts becomes two thousand house lots and
+# enters as two thousand conversions; the farm next door that does not convert
+# stays one row. Every success was counted thousands of times against one failure,
+# so the test population became house lots and it measured "did a house get built
+# on this house lot", which is nearly always yes.
+#
+# A fixed cell of ground cannot be inflated that way. Roughly a quarter section
+# (half a mile square), which is also the unit a land investor actually thinks in.
+CELL_DX = 0.0087        # degrees longitude, ~0.5 mi at this latitude
+CELL_DY = 0.0072        # degrees latitude, ~0.5 mi
+MIN_BUILT_FOR_DEVELOPED = 5   # a single farmhouse is not development
+
+# NOISE FLOOR, AND AN HONEST CAVEAT.
+#
+# On synthetic data with a planted development frontier this harness reports
+# roughly 45 points of spread, monotone across quintiles, with median distance to
+# the frontier falling cleanly from quintile 1 to 5. It recovers real signal.
+#
+# The null is less satisfying. On the cleanest null that could be constructed
+# (uniform random points, one per location, no subdivision, development decided
+# by a coin flip with a random year) the harness still reported 16 to 18 points.
+# That is a high floor and its cause is not established. The leading suspicion is
+# the MIN_BUILT_FOR_DEVELOPED threshold: a cell with more structures is both more
+# likely to cross the threshold early, putting it in the frontier, and more likely
+# to cross it later, counting as a conversion, so cell density may drive both
+# sides of the comparison. That has not been proven.
+#
+# Treat the floor as approximately 18 points and treat that figure as uncertain.
+# A real result needs to clear it substantially to mean anything, and an
+# independent reviewer should be asked to work out where the floor comes from.
+NULL_BASELINE_PP = 18.0
 
 
 def fit_pre_vintage(rows):
@@ -66,17 +93,30 @@ def fit_pre_vintage(rows):
     return HZ.fit_logit(X, y), bins
 
 
-def _row(miles, acres, bins):
+def _row(miles, acres, bins, use_acres=False):
+    """Distance enters twice: as bins, which allow the effect to be non-monotone
+    where leapfrog development makes it so, and as a continuous log term.
+
+    The continuous term is not decoration. Bins alone give only a handful of
+    distinct scores, so every cell in a bin ties and quintile boundaries fall
+    arbitrarily inside those ties, which scrambles the middle of the ranking. The
+    log term orders cells within a bin.
+
+    Cells are all the same size, so an acreage term would be constant and is
+    dropped.
+    """
     import hazard as HZ
     r = [1.0]
     b = HZ.bin_index(miles, bins)
     for i in range(1, len(bins) + 1):
         r.append(1.0 if b == i else 0.0)
-    r.append(math.log(max(0.1, acres or 1.0)))
+    r.append(math.log(1.0 + max(0.0, miles or 0.0)))
+    if use_acres:
+        r.append(math.log(max(0.1, acres or 1.0)))
     return r
 
 
-def score(coefs, bins, miles, acres):
+def score(coefs, bins, miles, acres=None):
     z = sum(c * x for c, x in zip(coefs, _row(miles, acres, bins)))
     return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
 
@@ -112,7 +152,7 @@ def quintile_outcomes(scored, vintage):
             "mean_predicted_5yr": round(sum(r[1] for r in block) / len(block), 5),
             "predicted_over_window": round(
                 _to_window(sum(r[1] for r in block) / len(block), CURRENT_YEAR - vintage), 4),
-            "median_acres": round(sorted(r[3] for r in block)[len(block)//2], 2),
+            "median_parcels_in_cell": round(sorted(r[3] for r in block)[len(block)//2], 1),
             "median_edge_miles": round(sorted(r[4] for r in block)[len(block)//2], 2),
         })
     return out
@@ -185,8 +225,9 @@ def verdict(results):
             f"that did not. It does not show that the dollar values or the returns are "
             f"right, and it was produced by the same system it is testing, so it should "
             f"be read by someone who did not build the model. For calibration, this "
-            f"harness returns {NULL_BASELINE_PP} points or less on data with no real "
-            f"signal, so a spread in single digits means nothing was detected. "
+            f"harness returned about {NULL_BASELINE_PP} points on random data where "
+            f"development was a coin flip, and the reason for that high floor is not "
+            f"established, so anything near it should be treated as undetected. "
             f"Check the calibration block separately: ranking well and predicting the "
             f"right LEVEL are different things, and the dollar values depend on the "
             f"level."
