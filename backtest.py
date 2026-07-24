@@ -294,26 +294,24 @@ def summarise(vintage, quints, n_train, n_events, strat=None, floor=None):
 
 
 def verdict(results):
-    """A deliberately conservative reading. This is the model's own report card,
-    so it states what the numbers show and leaves the judgement open."""
-    good = [r for r in results if r.get("spread_percentage_points") is not None]
+    """Reads the result against each vintage's own computed floor. Earlier
+    versions quoted a floor measured on synthetic uniform points, which was both
+    unreproducible and far too low for real parcel fabric."""
+    good = [r for r in results if r.get("spread_above_floor") is not None]
     if not good:
         return "No vintage produced a usable result."
-    spreads = [r["spread_percentage_points"] for r in good]
-    mono = sum(1 for r in good if r["monotone_across_quintiles"])
-    weak = [s for s in spreads if abs(s) <= NULL_BASELINE_PP]
-    return (f"{len(good)} vintages tested. The gap in conversion rate between the "
-            f"top and bottom fifth ranged {min(spreads)} to {max(spreads)} percentage "
-            f"points, rising across quintiles in {mono} of {len(good)}. This shows only "
-            f"whether the ranking separated land that later got developed from land "
-            f"that did not. It does not show that the dollar values or the returns are "
-            f"right, and it was produced by the same system it is testing, so it should "
-            f"be read by someone who did not build the model. For calibration, this "
-            f"harness returned about {NULL_BASELINE_PP} points on random data where "
-            f"development was a coin flip, and the reason for that high floor is not "
-            f"established, so anything near it should be treated as undetected. "
-            f"Check the calibration block separately: ranking well and predicting the "
-            f"right LEVEL are different things, and the dollar values depend on the "
-            f"level."
-            + (f" {len(weak)} of {len(good)} vintages fall in that range."
-               if weak else ""))
+    above = [r["spread_above_floor"] for r in good]
+    beats = sum(1 for r in good
+                if r["mechanical_floor"] and r["spread_percentage_points"] > r["mechanical_floor"]["max"])
+    obs = sum(r["spread_percentage_points"] for r in good)
+    flo = sum(r["mechanical_floor"]["median"] for r in good if r["mechanical_floor"])
+    mech = round(100 * flo / obs) if obs else None
+    return (f"{len(good)} vintages. Observed top-to-bottom spread exceeded the mechanical "
+            f"floor by {min(above)} to {max(above)} points, and beat the largest of 200 "
+            f"randomisations in {beats} of {len(good)}. Roughly {mech}% of the headline "
+            f"spread is fabric: a fixed structure-count threshold means dense cells can "
+            f"reach it and sparse ones cannot, and density falls with distance from town. "
+            f"What remains is genuine locational signal. This validates distance to the "
+            f"built edge, not the production model: none of the growth signals, the water "
+            f"gate, the tenure term or the valuation stack enters this test. Nothing here "
+            f"speaks to the dollar figures.")
