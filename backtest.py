@@ -187,7 +187,7 @@ def stratified_spread(scored, vintage, bands=((0, 3), (4, 8), (9, 20), (21, 10**
 
 
 def shuffled_floor(scored, vintage, bands=((0, 3), (4, 8), (9, 20), (21, 10**6)),
-                   reps=200, seed=11):
+                   reps=1000, seed=11):
     """The exact mechanical floor for THIS population and base rate.
 
     Permuting construction years county-wide turned out to be a poor null: it

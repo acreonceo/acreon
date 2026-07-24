@@ -279,10 +279,13 @@ function valueOf(p){
           path:c,acres,est,site,fitted:hf!==null,priceOK,basis}; }
 
 function acqOf(p){
-  let z=-1.20+0.045*Math.min(40,p.tenure||0);
+  // No recorded sale means tenure is UNKNOWN, not zero. Treating it as zero
+  // penalised inherited land, which is often the most acquirable of all.
+  const ten = (p.tenure==null) ? null : +p.tenure;
+  let z=-1.20+0.045*Math.min(40, ten==null ? 25 : ten);
   if(p.absentee) z+=0.5;
   if(p.owner_type==="Trust/LLC") z+=0.4;
-  if(!p.paid) z+=0.6;
+  if(!p.paid) z+=0.6;   // inherited / exempt transfer
   if(p.owner_type==="Builder/Developer") z-=0.8;
   else if(p.owner_type==="Investor") z-=0.2;
   return 100/(1+Math.exp(-z)); }
@@ -461,28 +464,33 @@ function markSelected(p){
 function renderDetail(p){
   curP=p;
   const held=p.acquired?`${p.acquired} (${p.tenure} yrs)`:"No recorded sale";
+  const heldTxt = p.acquired ? `${p.acquired} (${p.tenure} yrs)` : "unknown, no recorded sale";
   document.getElementById("detailBody").innerHTML=`
     <h2>${p.situs_address||p.apn}</h2>
     <div class="sub">${p.city||""} ${p.zcta||""} · ${p.use} · ${(+p.acres||0).toLocaleString()} ac · APN ${p.apn}</div>
-    ${(p.zoning||p.jurisdiction)?`<div class="sub" style="margin-top:2px">Zoning: <b>${p.zoning||"not recorded"}</b>${p.jurisdiction?` · ${p.jurisdiction}`:""}</div>`:""}
+    ${p.zoning?`<div class="sub" style="margin-top:2px">Zoning: <b>${p.zoning}</b>${p.jurisdiction?` · ${p.jurisdiction}`:""}</div>`:""}
     <div class="badges" id="badges"></div>
-    <h3>Valuation</h3>
-    <div id="valblock"></div>
-    <h3>When does it convert?</h3>
-    <div id="chart"></div>
-    <div id="timing"></div>
-    <h3>Ownership</h3>
+
+    <h3>What happened to ground ranked like this</h3>
+    <div id="evidence"><div class="sub">Loading measured outcomes…</div></div>
+
+    <h3>County record</h3>
     <div class="kv"><span class="k">Owner</span><span class="v" style="font-family:inherit">${p.owner||""}</span>
       <span class="k">Type</span><span class="v" style="font-family:inherit">${p.owner_type||""}</span>
-      <span class="k">Held since</span><span class="v">${held}</span>
-      <span class="k">Acquired for</span><span class="v">${p.paid?money(p.paid):"No recorded sale"}</span></div>
+      <span class="k">Held since</span><span class="v">${heldTxt}</span>
+      <span class="k">Last recorded sale</span><span class="v">${p.paid?money(p.paid):"none on record"}</span>
+      <span class="k">Assessed value</span><span class="v">${money(p.est)}</span>
+      <span class="k">Carrying cost</span><span class="v" id="carryv">—</span></div>
     <div id="acqblock"></div>
-    <h3>Hold or sell</h3>
-    <div id="hsblock"></div>
-    <div style="display:flex;gap:6px;margin-top:12px">
-      <button onclick="openReport('investor')" style="flex:1;padding:7px 4px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Investor brief</button>
-      <button onclick="openReport('developer')" style="flex:1;padding:7px 4px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Developer brief</button>
-    </div>`;
+
+    <h3>Zone facts</h3>
+    <div id="zonefacts"></div>
+
+    <h3>Recorded sales nearby</h3>
+    <div id="comps"><div class="sub">Loading…</div></div>
+
+    <h3>Break-even</h3>
+    <div id="breakeven"></div>`;
   document.getElementById("assumeBox").style.display="block";
   updateValuationUI();
 }
@@ -497,59 +505,97 @@ function updateValuationUI(){
   const verdictCol = over?"var(--bad)":(fair?"var(--warn)":"var(--good)");
 
   document.getElementById("badges").innerHTML=
-     (V.priceOK
-      ? `<span class="pill" style="background:${ratioRamp(V.ann)}" data-tip="${escAttr(
-        `${(V.ann*100).toFixed(1)}% per year over a ${V.H}-year hold, scoring ${V.score} of 100 where 50 is a ${(TARGET_RETURN*100).toFixed(0)}% target. Modelled ${money(V.v)}/ac against ${money(V.price)}/ac asking. Change the holding period in Model assumptions and this moves: a parcel that will not convert for twenty years earns little on a five-year view, because you would be selling unconverted dirt.`)}">${(V.ann*100).toFixed(0)}%/yr &middot; ${V.score}</span>`
-      : `<span class="pill" style="background:#7a2718" data-tip="${escAttr(
-          `The assessed value on this parcel is ${money(V.price)} per acre, far below what land trades for in this ZIP. That is a nominal or remnant assessment, not a market price, so any return computed against it would be meaningless. The parcel is excluded from rankings until a real price is known.`)}">No credible price</span>`)
-    +`<span class="pill" style="background:${WSCOL[V.state]}" data-tip="${escAttr(
-        `${WSLBL[V.state]}. A: inside a designated provider or holding an assured-supply certificate, developable now. B: irrigated agricultural land whose grandfathered irrigation right can be relinquished under SB1611 (2025) for groundwater savings credits usable within one mile. C: raw groundwater-dependent land, blocked for subdivision since ADWR halted groundwater-based assured-supply applications in 2023, and dependent on being absorbed by a provider or on policy change.`)}">${WSLBL[V.state]}</span>`
-    +`<span class="pill" style="background:#5b564d" data-tip="${escAttr(
-        `Frontier heat ${Math.round(V.gi)} of 100 for ZIP ${p.zcta}. A weighted blend of developable land share, sales velocity, transport projects and in-migration. It sets how fast development is moving toward this zone, which drives the conversion hazard. It does not set an appreciation rate.`)}">Frontier ${Math.round(V.gi)}</span>`
-    +(p.landlocked?`<span class="pill" style="background:#8b8579" data-tip="${escAttr(
-        "Flagged as fully enclosed by neighbouring parcels, which can mean no road frontage. This measure is unreliable at present: it is computed against a fabric holding only vacant and agricultural land, so it over-flags rural parcels. It is shown for information and does NOT affect the modelled value. Verify access on the plat before acting on it.")}">Check access</span>`:"")
-    +(p.flood_zone?`<span class="pill" style="background:${p.flood_zone==="FLOODWAY"?"#7a2718":"#8a6d3b"}" data-tip="${escAttr(
-        p.flood_zone==="FLOODWAY"?"In the regulatory floodway. Not developable at any water status; value cut to 10 percent."
-        :"Inside a FEMA 1-percent-annual-chance flood zone ("+p.flood_zone+"). Buildable with mitigation; value cut to 75 percent.")}">Flood ${p.flood_zone}</span>`:"")
+     `<span class="pill" style="background:${WSCOL[V.state]}" data-tip="${escAttr(
+        `${WSLBL[V.state]}. This is ADWR's issued determination, a legal status on the county record, not a forecast.`)}">${WSLBL[V.state]}</span>`
     +(V.fitted?`<span class="pill" style="background:#2f6f6a" data-tip="${escAttr(
-        "Conversion odds come from a hazard fitted on Maricopa's own construction-year history, not from a judgment parameter. Distance to the development frontier at the time is the main covariate.")}">Fitted hazard</span>`
-      :`<span class="pill" style="background:#8b8579" data-tip="${escAttr(
-        "Conversion odds are still a judgment parameter. Run the hazard fit to replace it with an estimate from county history.")}">Judgment hazard</span>`)
+        "Ranked by distance to the built edge, using a model fitted on this county's own construction history. This ranking is the one thing here that has been tested against what actually got built.")}">Ranked on tested signal</span>`
+      :`<span class="pill" style="background:#8b8579">Not yet ranked</span>`)
+    +(p.landlocked?`<span class="pill" style="background:#8b8579" data-tip="${escAttr(
+        "Flagged as enclosed by neighbouring parcels, which can mean no road frontage. This measure is unreliable and does not affect anything; verify access on the plat.")}">Check access</span>`:"")
+    +(p.flood_zone?`<span class="pill" style="background:#8a6d3b">Flood ${p.flood_zone}</span>`:"")
     +(p.status==="For sale"?`<span class="pill" style="background:var(--teal)">For sale ${money(p.list_price)}</span>`
       :`<span class="pill" style="background:#8b8579">Off-market</span>`);
+  document.getElementById("carryv").textContent=(V.carry*100).toFixed(2)+"%/yr, from the tax roll";
+  loadEvidence(p.apn);
+  loadComps(p.apn);
+  renderZoneFacts(p);
+  renderBreakEven(p,V);
+}
 
-  document.getElementById("valblock").innerHTML=`
-    <div class="hs"><div class="box"><div class="k">Asking / assessed</div><div class="v">${money(V.price)}</div><small>per acre</small></div>
-      <div class="box"><div class="k">Modelled value</div><div class="v">${money(V.v)}</div><small>per acre</small></div></div>
-    <div class="readline" style="color:${verdictCol}">${verdictTxt}</div>
-    <div class="kv" style="margin-top:6px">
-      <span class="k">Whole parcel value</span><span class="v">${money(V.v*V.acres)}</span>
-      <span class="k">Developer pays here</span><span class="v">${money(V.d0)}/ac</span>
-      <span class="k">Carrying cost</span><span class="v">${(V.carry*100).toFixed(2)}%/yr</span>
-      ${V.site<1?`<span class="k">Site discount</span><span class="v" style="color:var(--bad)">×${V.site.toFixed(2)}</span>`:""}</div>
-    <div class="sub" style="margin-top:6px">Value is the discounted expectation of one conversion payoff, not compounded appreciation. Land sits flat, then steps up.</div>`;
+/* ============ measured outcomes, records, and user arithmetic ============ */
+async function loadEvidence(apn){
+  const el=document.getElementById("evidence"); if(!el) return;
+  let e; try{ e=await (await fetch(API+"/evidence?apn="+encodeURIComponent(apn))).json(); }
+  catch(err){ el.innerHTML=`<div class="sub">Could not load measured outcomes.</div>`; return; }
+  if(!e.available){ el.innerHTML=`<div class="sub">No backtest on record yet, so there is nothing measured to show for this parcel.</div>`; return; }
+  const rows=e.observed.map(r=>`<tr><td>${r.start_year}</td><td>${r.years_observed}y</td>
+      <td>${(r.share_that_developed*100).toFixed(1)}%</td>
+      <td>${(r.bottom_fifth_same_period*100).toFixed(1)}%</td>
+      <td>${r.median_years_when_it_did??"—"}</td></tr>`).join("");
+  el.innerHTML=`
+    <div class="sub" style="margin-bottom:6px">This parcel sits in the <b>${["bottom","second","middle","fourth","top"][e.rank_band-1]} fifth</b>
+      of all Maricopa land by distance to the built edge. Below is what actually happened to ground ranked the same way,
+      starting from each year and watching until now.</div>
+    <table><tr><th>From</th><th>Watched</th><th>Developed</th><th>Bottom fifth</th><th>Median wait</th></tr>${rows}</table>
+    <div class="sub" style="margin-top:6px">${e.scope}</div>`;
+}
 
-  drawConversion(c);
-  const p50=c.p50?`${c.p50} yrs`:"beyond 30 yrs";
-  document.getElementById("timing").innerHTML=`
-    <div class="kv"><span class="k">Even odds of converting</span><span class="v">${p50}</span>
-      <span class="k">Chance within ${H} yrs</span><span class="v">${pct(c.marks[H]||0)}</span>
-      <span class="k">Chance within 30 yrs</span><span class="v">${pct(c.marks[30]||0)}</span></div>`;
+async function loadComps(apn){
+  const el=document.getElementById("comps"); if(!el) return;
+  let rows=[]; try{ rows=await (await fetch(API+"/comps?apn="+encodeURIComponent(apn))).json(); }
+  catch(err){ el.innerHTML=`<div class="sub">Could not load sales.</div>`; return; }
+  if(!rows.length){ el.innerHTML=`<div class="sub">No recorded arms-length sales of vacant or agricultural land within three miles in the last ten years.</div>`; return; }
+  const px=rows.map(r=>+r.price_per_acre).filter(v=>v>0).sort((a,b)=>a-b);
+  const med=px.length?px[Math.floor(px.length/2)]:0;
+  el.innerHTML=`
+    <div class="sub" style="margin-bottom:6px">${rows.length} recorded sales within three miles. Median <b>${money(med)}/ac</b>. These are deeds, not estimates.</div>
+    <table><tr><th>Sold</th><th>Acres</th><th>$/acre</th><th>Miles</th></tr>
+      ${rows.slice(0,8).map(r=>`<tr><td>${r.acquired}</td><td>${(+r.acres).toLocaleString()}</td><td>${money(r.price_per_acre)}</td><td>${r.miles_away}</td></tr>`).join("")}</table>
+    <div class="sub" style="margin-top:6px">Draw your own line. The system does not adjust these for condition, access, or water.</div>`;
+  window.__compMedian=med;
+}
 
-  document.getElementById("acqblock").innerHTML=`
-    <div class="kv" style="margin-top:4px"><span class="k">Acquisition score</span>
-      <span class="v" style="font-weight:800;color:${acq>60?"var(--good)":(acq>40?"var(--warn)":"var(--ink-soft)")}" 
-        data-tip="${escAttr(`How approachable this owner looks: ${Math.round(acq)} of 100. Rises with years held, out-of-state mailing address, trust or estate ownership, and no recorded sale (an inherited parcel, often the most motivated). Falls for builders and developers, who bought to build. Deliberately separate from value: a long hold does not make the dirt worth more, it makes the owner easier to approach.`)}">${Math.round(acq)}</span></div>`;
+function renderZoneFacts(p){
+  const el=document.getElementById("zonefacts"); if(!el) return;
+  const s=p.zone_signals||{};
+  const f=(k,label,fmt)=>s[k]==null?"":`<span class="k">${label}</span><span class="v">${fmt(s[k])}</span>`;
+  el.innerHTML=`<div class="kv">
+    ${f("migration","Population change signal",v=>Math.round(v)+" / 100")}
+    ${f("developable_land","Share of ZIP undeveloped",v=>Math.round(v)+"%")}
+    ${f("permit_velocity","Sales turnover signal",v=>Math.round(v)+" / 100")}
+    ${f("infra_transport","Transport projects nearby",v=>Math.round(v)+" / 100")}
+  </div>
+  <div class="sub" style="margin-top:4px">Shown individually and untested. They are not combined into a score, because no weighting of them has ever been shown to predict anything.</div>`;
+}
 
-  const sellNet=V.price*(1-ASM.sell);
-  const hold=V.v;
-  const hv = hold>sellNet*1.05?["HOLD","var(--good)","modelled value beats selling today"]
-           : hold<sellNet*0.95?["SELL","var(--bad)","selling today beats the modelled wait"]
-           : ["MARGINAL","var(--warn)","within 5%, depends on your assumptions"];
-  document.getElementById("hsblock").innerHTML=`
-    <div class="hs"><div class="box"><div class="k">Sell now, net</div><div class="v">${money(sellNet)}</div><small>per acre after ${pct(ASM.sell)}</small></div>
-      <div class="box"><div class="k">Hold, modelled</div><div class="v">${money(hold)}</div><small>per acre today</small></div></div>
-    <div class="verdict" style="background:${hv[1]}"><span class="lead">${hv[0]}</span><small>${hv[2]}</small></div>`;
+// The DCF inverted. The user supplies what a developer would pay; the system
+// contributes only the measured conversion odds, the tax-roll carry, and the
+// discounting. Every input is a record, a measurement, or visibly the user's.
+function renderBreakEven(p,V){
+  const el=document.getElementById("breakeven"); if(!el) return;
+  const c=V.path, H=V.H, k=c.byH[H]; if(!k) return;
+  const payoff = window.__compMedian ? Math.round(window.__compMedian*3) : Math.round(V.d0);
+  el.innerHTML=`
+    <div class="sld"><div class="l"><span>If a developer would pay, per acre</span><span class="v" id="bev">${money(payoff)}</span></div>
+      <input type="range" id="be_pay" min="5000" max="400000" step="5000" value="${Math.min(400000,Math.max(5000,payoff))}"></div>
+    <div class="sld"><div class="l"><span>Your required return</span><span class="v" id="behv">${(ASM.rho*100).toFixed(1)}%/yr</span></div>
+      <input type="range" id="be_h" min="4" max="20" step="0.5" value="${(ASM.rho*100).toFixed(1)}"></div>
+    <div id="be_out"></div>
+    <div class="sub" style="margin-top:6px">The system supplies only the conversion odds measured above, the carrying cost from the tax roll, and the discounting. The payoff and the hurdle are yours.</div>`;
+  const calc=()=>{
+    const pay=+document.getElementById("be_pay").value;
+    const hur=+document.getElementById("be_h").value/100;
+    document.getElementById("bev").textContent=money(pay);
+    document.getElementById("behv").textContent=(hur*100).toFixed(1)+"%/yr";
+    const disc=Math.exp(-hur*H), resid=Math.exp(G_RAW*H);
+    const denom=1 - k.survive*resid*disc + k.carry*V.carry;
+    const maxEntry = denom>0 ? (k.payoff*pay*V.site)/denom : 0;
+    document.getElementById("be_out").innerHTML=`
+      <div class="hs"><div class="box"><div class="k">Pay at most</div><div class="v">${money(maxEntry)}</div><small>per acre, ${H}-yr hold</small></div>
+        <div class="box"><div class="k">Whole parcel</div><div class="v">${money(maxEntry*(+p.acres||0))}</div><small>${(+p.acres||0).toLocaleString()} ac</small></div></div>`;
+  };
+  ["be_pay","be_h"].forEach(id=>document.getElementById(id).addEventListener("input",calc));
+  calc();
 }
 
 // Cumulative probability the parcel has converted, by year. Replaces the old
@@ -651,9 +697,9 @@ async function loadTargets(){
   if(!rows.length){ el.innerHTML=`<div class="empty">No parcels match these filters.</div>`; return; }
   el.innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
-      <div class="r1"><span><input type="checkbox" class="selbox" data-apn="${r.apn}" ${selected.has(r.apn)?"checked":""} style="margin-right:6px;vertical-align:middle"> ${r.situs_address||r.apn}</span><span class="pill" style="background:${ratioRamp(r.annual_return)}">${r.annual_return_pct!=null?r.annual_return_pct.toFixed(0)+"%/yr":""} &middot; ${r.value_score}</span></div>
-      <div class="r2"><span>${r.use} · ${(+r.acres).toLocaleString()} ac · <b>${money(r.price_per_acre)}/ac</b></span><span>${money(r.value_per_acre)}/ac value</span></div>
-      <div class="r2"><span style="color:${WSCOL[r.water_state]}">${WSLBL[r.water_state]}</span><span>${r.p50_years?("even odds "+r.p50_years+"y"):">30y"} · held ${r.tenure??"?"}y</span></div>
+      <div class="r1"><span><input type="checkbox" class="selbox" data-apn="${r.apn}" ${selected.has(r.apn)?"checked":""} style="margin-right:6px;vertical-align:middle"> ${r.situs_address||r.apn}</span><span class="pill" style="background:${WSCOL[r.water_state]||"#8b8579"}" title="water status on the county record">${(WSLBL[r.water_state]||"").split(" ")[0]}</span></div>
+      <div class="r2"><span>${r.use} · ${(+r.acres).toLocaleString()} ac · assessed <b>${money(r.price_per_acre)}/ac</b></span><span>${r.tenure!=null?("held "+r.tenure+"y"):"tenure unknown"}</span></div>
+      <div class="r2"><span style="color:${WSCOL[r.water_state]}">${WSLBL[r.water_state]}</span><span>${r.absentee?"out-of-state owner":""}</span></div>
     </div>`).join("");
   targetsDirty=false;
   el.querySelectorAll(".selbox").forEach(b=>b.addEventListener("click",e=>{

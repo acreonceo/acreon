@@ -390,6 +390,69 @@ def _valued(rows, p, horizon=10):
         out.append(r)
     return out
 
+# --- EVIDENCE: what actually happened to ground ranked like this -----------
+# The defensible object is not a fitted probability, it is a measurement. The
+# backtest produced realised conversion rates by rank band across four start
+# years; this serves them so a parcel page cites what happened rather than what a
+# model asserts.
+@app.get("/evidence")
+def evidence(apn: str = "", rank: float = None):
+    rows = qall("SELECT payload FROM model_fit WHERE key='backtest'")
+    if not rows:
+        return {"available": False, "detail": "no backtest on record; run /admin/backtest"}
+    bt = rows[0]["payload"]
+    if apn:
+        p = qall("""SELECT (SELECT count(*) FROM parcels q
+                             WHERE q.hazard_fitted IS NOT NULL
+                               AND q.hazard_fitted <= p.hazard_fitted)::float
+                           / NULLIF((SELECT count(*) FROM parcels WHERE hazard_fitted IS NOT NULL),0)
+                           AS pct
+                    FROM parcels p WHERE p.apn = %s""", (apn,))
+        if p and p[0]["pct"] is not None:
+            rank = float(p[0]["pct"])
+    band = min(5, max(1, int((rank or 0) * 5) + 1)) if rank is not None else None
+    out = []
+    for r in bt.get("results", []):
+        q = next((x for x in r.get("quintiles", []) if x["quintile"] == band), None)
+        if not q:
+            continue
+        out.append({"start_year": r["vintage"],
+                    "years_observed": r["outcome_window_years"],
+                    "cells_like_this": q["parcels"],
+                    "share_that_developed": q["conversion_rate"],
+                    "median_years_when_it_did": q["median_years_to_convert"],
+                    "bottom_fifth_same_period": r["bottom_quintile_rate"],
+                    "spread_above_floor_pp": r.get("spread_above_floor")})
+    return {"available": bool(out), "rank_band": band,
+            "rank_percentile": round(rank, 3) if rank is not None else None,
+            "observed": out,
+            "measured_against": ("a floor built by reshuffling which cells converted while "
+                                 "holding population, parcel density and totals fixed"),
+            "scope": ("Measured on half-mile cells of ground, not individual parcels. Says "
+                      "nothing about choosing between parcels equally close to the built "
+                      "edge, and nothing about ranch-scale ground that sells whole and is "
+                      "platted later.")}
+
+# --- COMPS: recorded sales near a parcel ----------------------------------
+# The most credible dollar-adjacent thing the system can show, because every row
+# is a recorded transaction rather than a model output.
+@app.get("/comps")
+def comps(apn: str, radius_miles: float = 3.0, years: int = 10, limit: int = 25):
+    return qall("""
+      SELECT c.apn, c.situs_address, c.city, c.acres, c.paid, c.acquired,
+             round(c.paid / NULLIF(c.acres,0)) AS price_per_acre,
+             c.use, COALESCE(c.water_state,'C') AS water_state,
+             round((ST_Distance(p.centroid::geography, c.centroid::geography)/1609.34)::numeric, 2) AS miles_away
+      FROM parcels p
+      JOIN parcels c ON c.apn <> p.apn
+      WHERE p.apn = %s
+        AND c.paid > 0 AND c.acres > 0 AND c.acquired >= %s
+        AND c.use IN ('Vacant','Agricultural')
+        AND ST_DWithin(p.centroid::geography, c.centroid::geography, %s)
+      ORDER BY ST_Distance(p.centroid::geography, c.centroid::geography)
+      LIMIT %s
+    """, (apn, 2026 - years, radius_miles * 1609.34, limit))
+
 @app.get("/targets")
 def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
             min_tenure: int = 0, water_state: str = "", include_public: bool = False,
@@ -829,6 +892,56 @@ def admin_migrate(token: str):
                    WHERE table_name='parcels' ORDER BY column_name""")
     res["parcel_columns"] = [c["column_name"] for c in cols]
     return res
+
+@app.get("/admin/probe_zoning")
+def admin_probe_zoning(token: str, sample: int = 600):
+    """Measure how much usable zoning the county actually publishes before
+    committing to a full reload. The field carries a placeholder on
+    unincorporated land, so 'the column exists' and 'the column is useful' are
+    different questions."""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    from collections import Counter
+    got, blank, placeholder, real = 0, 0, 0, 0
+    vals, juris = Counter(), Counter()
+    offset, last_oid = 0, -1
+    try:
+        while got < sample:
+            params = {"where": f"({COUNTY_WHERE}) AND OBJECTID > {last_oid}",
+                      "outFields": "OBJECTID,CITY_ZONING,JURISDICTION",
+                      "returnGeometry": "false", "f": "json",
+                      "orderByFields": "OBJECTID", "resultRecordCount": 200}
+            r = requests.get(COUNTY_PARCELS, params=params, timeout=90, headers={"User-Agent": UA})
+            feats = r.json().get("features", [])
+            if not feats:
+                break
+            for f in feats:
+                a = f.get("attributes") or {}
+                oid = a.get("OBJECTID")
+                if isinstance(oid, (int, float)):
+                    last_oid = max(last_oid, int(oid))
+                z = (a.get("CITY_ZONING") or "").strip()
+                j = (a.get("JURISDICTION") or "").strip()
+                got += 1
+                juris[j or "(blank)"] += 1
+                if not z:
+                    blank += 1
+                elif z.upper().startswith("CONTACT"):
+                    placeholder += 1
+                else:
+                    real += 1
+                    vals[z] += 1
+    except Exception as e:
+        return {"error": str(e)[:160], "sampled": got}
+    return {"sampled": got,
+            "usable_zoning_codes": real,
+            "placeholder_contact_jurisdiction": placeholder,
+            "blank": blank,
+            "usable_share": round(real / got, 3) if got else None,
+            "top_codes": vals.most_common(12),
+            "top_jurisdictions": juris.most_common(8),
+            "reading": ("worth reloading for" if got and real / got > 0.15
+                        else "not worth displaying; the county does not publish it for this inventory")}
 
 @app.get("/admin/probe")
 def admin_probe(token: str, zip: str = "85326"):

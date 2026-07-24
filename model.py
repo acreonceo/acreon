@@ -292,11 +292,16 @@ ACQ = {
 
 
 def acquisition_score(tenure, owner_type, absentee, has_recorded_sale, coef=None):
-    """0-100 likelihood this owner is approachable. Coefficients are judgment
-    until fit on observed listings/sales."""
+    """0-100 likelihood this owner is approachable. Judgment coefficients, and
+    presented as a configurable filter rather than knowledge.
+
+    Tenure of None means NO RECORDED SALE, not zero years. Treating it as zero
+    penalised inherited and long-held land, which is exactly the most acquirable
+    inventory the tool exists to surface.
+    """
     c = {**ACQ, **(coef or {})}
     z = c["intercept"]
-    z += c["per_year_held"] * min(40, tenure or 0)
+    z += c["per_year_held"] * min(40, 25 if tenure is None else tenure)
     if absentee:
         z += c["absentee"]
     if owner_type == "Trust/LLC":
