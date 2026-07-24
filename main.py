@@ -412,21 +412,22 @@ WHERE p.paid > 0 AND p.acres > 0 AND p.acquired IS NOT NULL
   AND p.use IN ('Vacant','Agricultural')
 """
 
-def run_fit_price(since_year=2010):
+def run_fit_price(since_year=2010, min_acres=0.0, use_screen=True):
     global SIGNAL_STATUS
     SIGNAL_STATUS = {"state": "running", "kind": "price", "detail": "loading recorded sales"}
     try:
         _ensure_columns()
         rows = qall(PRICE_SALES_SQL, (since_year,))
         SIGNAL_STATUS.update(detail=f"fitting on {len(rows):,} sales, holding back a fifth")
-        model, report = VAL.fit(rows)
+        model, report = VAL.fit(rows, use_screen=use_screen, min_acres=min_acres)
         if not model:
             SIGNAL_STATUS = {"state": "error", "kind": "price", **report}
             return
         with pool.connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO model_fit(key,payload) VALUES('price',%s::jsonb) "
                         "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, fitted_at=now()",
-                        (json.dumps({"model": model, "report": report, "since_year": since_year}),))
+                        (json.dumps({"model": model, "report": report, "since_year": since_year,
+                                     "min_acres": min_acres}),))
             c.commit()
         SIGNAL_STATUS = {"state": "done", "kind": "price", **report}
     except Exception as e:
@@ -476,12 +477,13 @@ def price(apn: str):
                        "deeds.")}
 
 @app.get("/admin/fit_price")
-def admin_fit_price(token: str, since_year: int = 2010):
+def admin_fit_price(token: str, since_year: int = 2010, min_acres: float = 0.0,
+                    screen: bool = True):
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if SIGNAL_STATUS.get("state") == "running":
         return {"state": "already_running", "status": SIGNAL_STATUS}
-    threading.Thread(target=run_fit_price, args=(since_year,), daemon=True).start()
+    threading.Thread(target=run_fit_price, args=(since_year, min_acres, screen), daemon=True).start()
     return {"state": "started", "kind": "price", "next": "poll /admin/state?token=YOUR_TOKEN"}
 
 # --- EVIDENCE: what actually happened to ground ranked like this -----------

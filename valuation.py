@@ -77,7 +77,36 @@ def _design(rows, zones, years):
     return X, y, labels
 
 
-def fit(rows, seed=7):
+def screen(rows, lo_q=0.02, hi_q=0.98):
+    """Remove the two contaminants that need no extra data.
+
+    Nominal-consideration deeds (family transfers, quitclaims) enter as prices
+    near zero. Parcel-split churn does the opposite: a price recorded against an
+    APN whose boundaries were later divided is attached to today's smaller
+    acreage, so the implied price per acre explodes. Both show up as extreme
+    values within a ZIP, so trimming each ZIP's tails removes most of both
+    without needing the recorder's validation codes.
+
+    This is a blunt instrument and it is stated as one. The proper fix is the
+    Arizona DOR verified-sales file.
+    """
+    import numpy as np
+    from collections import defaultdict
+    byz = defaultdict(list)
+    for r in rows:
+        byz[r["zcta"]].append(r)
+    keep = []
+    for z, rs in byz.items():
+        if len(rs) < 20:
+            keep.extend(rs)
+            continue
+        v = np.array([r["price_per_acre"] for r in rs], float)
+        lo, hi = np.quantile(v, lo_q), np.quantile(v, hi_q)
+        keep.extend([r for r in rs if lo <= r["price_per_acre"] <= hi])
+    return keep
+
+
+def fit(rows, seed=7, use_screen=True, min_acres=0.0):
     """Fit on 80%, score on the 20% never seen. Returns the model plus its own
     error, which is the only reason to trust any number it later produces."""
     import numpy as np
@@ -86,6 +115,11 @@ def fit(rows, seed=7):
             and r.get("zcta") and r.get("acquired")]
     rows = [r for r in rows
             if r["acres"] > 0 and MIN_PRICE_PER_ACRE <= r["price_per_acre"] <= MAX_PRICE_PER_ACRE]
+    if min_acres:
+        rows = [r for r in rows if r["acres"] >= min_acres]
+    raw_n = len(rows)
+    if use_screen:
+        rows = screen(rows)
     if len(rows) < MIN_SALES_TO_FIT:
         return None, {"error": f"only {len(rows)} usable sales; need {MIN_SALES_TO_FIT}"}
 
@@ -127,7 +161,9 @@ def fit(rows, seed=7):
     model = {"coefs": coefs.tolist(), "zones": zones, "years": years, "labels": labels,
              "resid_q": {q: float(np.quantile(resid, q)) for q in (0.1, 0.25, 0.5, 0.75, 0.9)}}
     report = {
+        "sales_before_screen": raw_n,
         "sales_used": len(rows), "train": len(train), "holdout": len(test),
+        "screened_out": raw_n - len(rows),
         "median_error_pct": round(100 * float(np.median(ape)), 1),
         "within_25pct": round(100 * float(np.mean(ape <= 0.25)), 1),
         "within_50pct": round(100 * float(np.mean(ape <= 0.50)), 1),
