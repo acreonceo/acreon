@@ -158,7 +158,35 @@ def quintile_outcomes(scored, vintage):
     return out
 
 
-def summarise(vintage, quints, n_train, n_events):
+def stratified_spread(scored, vintage, bands=((0, 3), (4, 8), (9, 20), (21, 10**6))):
+    """Quintile spread computed WITHIN bands of similar parcels-per-cell.
+
+    A fixed structure-count threshold rewards dense cells: they cross five
+    structures easily, sparse ones cannot without being subdivided first. Since
+    fabric density also falls with distance from town, the outcome partly encodes
+    the ranking's only input. Holding density roughly constant strips that out;
+    whatever spread survives is distance signal net of fabric.
+
+    Today's parcel counts are themselves outcome-contaminated (a converted cell
+    got subdivided), but that inflates counts on the converted side, which biases
+    this test AGAINST the model. A surviving spread is therefore credible.
+    """
+    out = []
+    for lo, hi in bands:
+        block = [r for r in scored if lo <= r[3] <= hi]
+        if len(block) < 500:
+            continue
+        q = quintile_outcomes(block, vintage)
+        if not q:
+            continue
+        out.append({"parcels_per_cell": f"{lo}-{hi if hi < 10**6 else '+'}",
+                    "cells": len(block),
+                    "spread_percentage_points": round((q[-1]["conversion_rate"] - q[0]["conversion_rate"]) * 100, 1),
+                    "bottom_rate": q[0]["conversion_rate"], "top_rate": q[-1]["conversion_rate"]})
+    return out
+
+
+def summarise(vintage, quints, n_train, n_events, strat=None):
     if not quints:
         return {"vintage": vintage, "error": "insufficient data"}
     top, bot = quints[-1], quints[0]
@@ -192,6 +220,7 @@ def summarise(vintage, quints, n_train, n_events):
         "top_quintile_rate": top["conversion_rate"],
         "bottom_quintile_rate": bot["conversion_rate"],
         "spread_percentage_points": spread_pp,
+        "spread_within_density_bands": strat,
         "calibration": {
             "predicted_conversion_rate": round(tot_pred, 4),
             "actual_conversion_rate": round(overall, 4),

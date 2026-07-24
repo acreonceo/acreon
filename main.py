@@ -584,11 +584,21 @@ def _zip_bbox(zcta):
 # Analysed on a fixed grid of ground, not on parcels. See backtest.py for why:
 # subdivision turns one converted farm into thousands of converted house lots,
 # which swamps the unconverted land and destroys the test.
+BT_PERMUTE_SQL = """
+DROP TABLE IF EXISTS built_perm;
+CREATE TABLE built_perm AS
+WITH a AS (SELECT apn, centroid, row_number() OVER (ORDER BY random()) rn FROM built),
+     b AS (SELECT const_year, row_number() OVER (ORDER BY random()) rn FROM built)
+SELECT a.apn, a.centroid, b.const_year FROM a JOIN b ON a.rn = b.rn;
+CREATE INDEX ON built_perm USING gist(centroid);
+ANALYZE built_perm;
+"""
+
 BT_GRID_SQL = """
 CREATE TABLE bt_cells AS
 WITH pts AS (
   SELECT floor(ST_X(centroid)/%(dx)s)::int gx, floor(ST_Y(centroid)/%(dy)s)::int gy,
-         const_year, centroid FROM built
+         const_year, centroid FROM {SRC}
   UNION ALL
   SELECT floor(ST_X(centroid)/%(dx)s)::int, floor(ST_Y(centroid)/%(dy)s)::int,
          NULL::int, centroid FROM parcels WHERE centroid IS NOT NULL
@@ -632,9 +642,21 @@ def _at_risk(t):
     with pool.connection() as c:
         return c.execute(BT_AT_RISK_SQL, {"t": t}).fetchall()
 
-def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=None):
+def run_backtest(vintages=(2000, 2005, 2010, 2015), permute=False, min_struct=None):
     """Score every undeveloped cell of ground as of each vintage using only what
-    existed then, then measure what actually happened."""
+    existed then, then measure what actually happened.
+
+    permute=True shuffles construction years across every structure in the county
+    while leaving each structure where it is. Geometry, fabric density, windows
+    and base rates are unchanged, but location can no longer carry information.
+    Whatever spread survives that is the MECHANICAL FLOOR, and skill is only what
+    the real run shows beyond it. An external audit demonstrated that a fixed
+    structure-count threshold on an uneven parcel fabric manufactures large
+    spreads on its own: with a density gradient milder than Maricopa's, pure
+    coin-flip development produced a 45-point spread. A floor measured on
+    synthetic uniform points, as this file previously used, is not the right
+    comparison and was far too low.
+    """
     global SIGNAL_STATUS
     SIGNAL_STATUS = {"state": "running", "kind": "backtest", "detail": "checking history"}
     try:
@@ -645,12 +667,21 @@ def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=None):
             SIGNAL_STATUS = {"state": "error", "kind": "backtest",
                              "detail": f"only {nb} construction records; run /admin/ingest_built first"}
             return
+        src = "built"
+        if permute:
+            SIGNAL_STATUS.update(detail="permuting construction years across the county")
+            with pool.connection() as c, c.cursor() as cur:
+                for stmt in [x for x in BT_PERMUTE_SQL.split(";") if x.strip()]:
+                    cur.execute(stmt)
+                c.commit()
+            src = "built_perm"
+        thresh = int(min_struct or BT.MIN_BUILT_FOR_DEVELOPED)
         SIGNAL_STATUS.update(detail="building the grid")
         with pool.connection() as c:
             with c.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS bt_cells")
-                cur.execute(BT_GRID_SQL, {"dx": BT.CELL_DX, "dy": BT.CELL_DY,
-                                          "minb": BT.MIN_BUILT_FOR_DEVELOPED})
+                cur.execute(BT_GRID_SQL.replace("{SRC}", src),
+                            {"dx": BT.CELL_DX, "dy": BT.CELL_DY, "minb": thresh})
                 cur.execute("CREATE INDEX ON bt_cells USING gist(centroid)")
                 cur.execute("CREATE INDEX ON bt_cells (dev_year)")
                 cur.execute("ANALYZE bt_cells")
@@ -689,9 +720,12 @@ def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=None):
             scored = [(f"{gx}:{gy}", BT.score(coefs, bins, d), dy, n, d)
                       for gx, gy, dy, n, d in risk.get(v, [])]
             quints = BT.quintile_outcomes(scored, v)
-            results.append(BT.summarise(v, quints, len(rows), sum(r[1] for r in rows)))
+            strat = BT.stratified_spread(scored, v)
+            results.append(BT.summarise(v, quints, len(rows), sum(r[1] for r in rows), strat))
 
         payload = {"unit": "half-mile grid cells",
+                   "permuted_years": permute,
+                   "structures_for_developed": thresh,
                    "cells_total": cells[0], "cells_ever_developed": cells[1],
                    "results": results, "verdict": BT.verdict(results),
                    "method": ("cells of fixed ground, not parcels, so subdivision cannot "
@@ -707,6 +741,7 @@ def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=None):
             with pool.connection() as c, c.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS bt_cells")
                 cur.execute("DROP TABLE IF EXISTS bt_front")
+                cur.execute("DROP TABLE IF EXISTS built_perm")
                 c.commit()
         except Exception:
             pass
@@ -715,13 +750,17 @@ def run_backtest(vintages=(2000, 2005, 2010, 2015), sample=None):
         SIGNAL_STATUS = {"state": "error", "kind": "backtest", "detail": str(e)[:250]}
 
 @app.get("/admin/backtest")
-def admin_backtest(token: str):
+def admin_backtest(token: str, permute: bool = False, min_struct: int = 0):
+    """permute=true gives the mechanical floor: same fabric, years shuffled."""
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
     if SIGNAL_STATUS.get("state") == "running":
         return {"state": "already_running", "status": SIGNAL_STATUS}
-    threading.Thread(target=run_backtest, daemon=True).start()
-    return {"state": "started", "kind": "backtest", "next": "poll /admin/state?token=YOUR_TOKEN"}
+    threading.Thread(target=run_backtest,
+                     kwargs={"permute": permute, "min_struct": min_struct or None},
+                     daemon=True).start()
+    return {"state": "started", "kind": "backtest", "permuted": permute,
+            "next": "poll /admin/state?token=YOUR_TOKEN"}
 
 @app.get("/admin/state")
 def admin_state(token: str):
