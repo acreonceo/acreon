@@ -132,7 +132,7 @@
         <div><label>Min parcels</label><select id="bParcels"><option value="2">2+</option><option value="3">3+</option><option value="5">5+</option></select></div>
         <div><label>Min total acres</label><select id="bAcres"><option value="10">10+</option><option value="40">40+</option><option value="160">160+</option><option value="640">640+</option></select></div>
       </div>
-      <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin:0 0 10px">Contiguous land held by one owner. A single negotiation for developable scale, which a parcel-by-parcel view hides.</p>
+      <p style="font-size:11.5px;color:var(--ink-soft);line-height:1.5;margin:0 0 10px">Contiguous land held by one owner. A single negotiation for developable scale, which a parcel-by-parcel view hides. Matched on exact owner name only, so one person holding land under two company names will not appear as a block.</p>
       <div id="blockList"></div>
     </div>
 
@@ -476,7 +476,8 @@ function renderDetail(p){
 
     <h3>County record</h3>
     <div class="kv"><span class="k">Owner</span><span class="v" style="font-family:inherit">${p.owner||""}</span>
-      <span class="k">Type</span><span class="v" style="font-family:inherit">${p.owner_type||""}</span>
+      <span class="k">Type</span><span class="v" style="font-family:inherit" data-tip="${escAttr(
+        "Classified by pattern-matching the owner name. A company with an unusual name may be mislabelled, and two entities belonging to the same person will not be linked.")}">${p.owner_type||""}</span>
       <span class="k">Held since</span><span class="v">${heldTxt}</span>
       <span class="k">Last recorded sale</span><span class="v">${p.paid?money(p.paid):"none on record"}</span>
       <span class="k">Assessed value</span><span class="v">${money(p.est)}</span>
@@ -485,6 +486,9 @@ function renderDetail(p){
 
     <h3>Zone facts</h3>
     <div id="zonefacts"></div>
+
+    <h3>What comparable sales imply</h3>
+    <div id="pricebox"><div class="sub">Loading…</div></div>
 
     <h3>Recorded sales nearby</h3>
     <div id="comps"><div class="sub">Loading…</div></div>
@@ -518,6 +522,7 @@ function updateValuationUI(){
   document.getElementById("carryv").textContent=(V.carry*100).toFixed(2)+"%/yr, from the tax roll";
   loadEvidence(p.apn);
   loadComps(p.apn);
+  loadPrice(p.apn);
   renderZoneFacts(p);
   renderBreakEven(p,V);
 }
@@ -538,6 +543,26 @@ async function loadEvidence(apn){
       starting from each year and watching until now.</div>
     <table><tr><th>From</th><th>Watched</th><th>Developed</th><th>Bottom fifth</th><th>Median wait</th></tr>${rows}</table>
     <div class="sub" style="margin-top:6px">${e.scope}</div>`;
+}
+
+async function loadPrice(apn){
+  const el=document.getElementById("pricebox"); if(!el) return;
+  let p; try{ p=await (await fetch(API+"/price?apn="+encodeURIComponent(apn))).json(); }
+  catch(e){ el.innerHTML=`<div class="sub">Could not load the price estimate.</div>`; return; }
+  if(!p.available){
+    el.innerHTML=`<div class="sub">${p.detail||"No price model fitted yet."}</div>`; return; }
+  const h=p.holdout||{};
+  window.__priceEstimate=p.per_acre;
+  el.innerHTML=`
+    <div class="hs">
+      <div class="box"><div class="k">Estimated value</div><div class="v">${money(p.per_acre)}</div><small>per acre</small></div>
+      <div class="box"><div class="k">Whole parcel</div><div class="v">${money(p.whole_parcel)}</div><small>${money(p.low)}–${money(p.high)}/ac</small></div>
+    </div>
+    <div class="kv" style="margin-top:6px">
+      <span class="k">Assessed value says</span><span class="v">${money(p.assessed_per_acre)}/ac</span>
+      <span class="k">Model error on unseen sales</span><span class="v">${h.median_error_pct}% median</span>
+      <span class="k">Within 25% of actual</span><span class="v">${h.within_25pct}% of the time</span></div>
+    <div class="sub" style="margin-top:6px">Fitted on ${(h.sales_used||0).toLocaleString()} recorded sales and scored against sales it never saw: <b>${h.reading}</b>. ${p.caveat}</div>`;
 }
 
 async function loadComps(apn){
@@ -574,7 +599,8 @@ function renderZoneFacts(p){
 function renderBreakEven(p,V){
   const el=document.getElementById("breakeven"); if(!el) return;
   const c=V.path, H=V.H, k=c.byH[H]; if(!k) return;
-  const payoff = window.__compMedian ? Math.round(window.__compMedian*3) : Math.round(V.d0);
+  const anchor = window.__priceEstimate || window.__compMedian || V.d0;
+  const payoff = Math.round(anchor*3);
   el.innerHTML=`
     <div class="sld"><div class="l"><span>If a developer would pay, per acre</span><span class="v" id="bev">${money(payoff)}</span></div>
       <input type="range" id="be_pay" min="5000" max="400000" step="5000" value="${Math.min(400000,Math.max(5000,payoff))}"></div>

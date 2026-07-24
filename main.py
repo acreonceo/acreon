@@ -8,6 +8,7 @@ import model as MODEL
 import hazard as HZ
 import report as REPORT
 import backtest as BT
+import valuation as VAL
 from fastapi import FastAPI, Response, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -395,6 +396,93 @@ def _valued(rows, p, horizon=10):
         r.pop("signals", None)
         out.append(r)
     return out
+
+# --- PRICE MODEL: what comparable land actually sold for -------------------
+# Fitted on recorded sales and scored against sales it never saw, so it reports
+# its own error before it reports a price. This estimates CURRENT value only;
+# forecasting appreciation was abandoned because it cannot be tested without
+# deed history.
+PRICE_SALES_SQL = """
+SELECT p.apn, p.zcta, p.acres, p.acquired, p.paid,
+       p.paid / NULLIF(p.acres,0) AS price_per_acre,
+       COALESCE(p.water_state,'C') AS water_state, p.edge_miles
+FROM parcels p
+WHERE p.paid > 0 AND p.acres > 0 AND p.acquired IS NOT NULL
+  AND p.acquired >= %s AND p.zcta IS NOT NULL
+  AND p.use IN ('Vacant','Agricultural')
+"""
+
+def run_fit_price(since_year=2010):
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": "price", "detail": "loading recorded sales"}
+    try:
+        _ensure_columns()
+        rows = qall(PRICE_SALES_SQL, (since_year,))
+        SIGNAL_STATUS.update(detail=f"fitting on {len(rows):,} sales, holding back a fifth")
+        model, report = VAL.fit(rows)
+        if not model:
+            SIGNAL_STATUS = {"state": "error", "kind": "price", **report}
+            return
+        with pool.connection() as c, c.cursor() as cur:
+            cur.execute("INSERT INTO model_fit(key,payload) VALUES('price',%s::jsonb) "
+                        "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, fitted_at=now()",
+                        (json.dumps({"model": model, "report": report, "since_year": since_year}),))
+            c.commit()
+        SIGNAL_STATUS = {"state": "done", "kind": "price", **report}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "kind": "price", "detail": str(e)[:250]}
+
+_PRICE_CACHE = {}
+
+def _price_model():
+    rows = qall("SELECT payload FROM model_fit WHERE key='price'")
+    if not rows:
+        return None, None
+    pay = rows[0]["payload"]
+    return pay.get("model"), pay.get("report")
+
+@app.get("/price")
+def price(apn: str):
+    """Estimated current market value per acre, with the model's own holdout
+    error attached so the number is never read without its uncertainty."""
+    model, report = _price_model()
+    if not model:
+        return {"available": False, "detail": "no price model fitted; run /admin/fit_price"}
+    rows = qall("""SELECT p.apn, p.zcta, p.acres, COALESCE(p.water_state,'C') AS water_state,
+                          p.edge_miles, p.est, p.paid, p.acquired
+                   FROM parcels p WHERE p.apn = %s""", (apn,))
+    if not rows:
+        raise HTTPException(404, "parcel not found")
+    p = rows[0]
+    est = VAL.predict(model, p)
+    if not est:
+        return {"available": False,
+                "detail": "not enough recorded sales in this ZIP to estimate a price here",
+                "holdout": report}
+    acres = float(p["acres"] or 0)
+    return {"available": True,
+            "per_acre": est["per_acre"], "low": est["low"], "high": est["high"],
+            "whole_parcel": round(est["per_acre"] * acres),
+            "whole_parcel_low": round(est["low"] * acres),
+            "whole_parcel_high": round(est["high"] * acres),
+            "assessed_per_acre": round(float(p["est"] or 0) / acres) if acres else None,
+            "holdout": {"median_error_pct": report.get("median_error_pct"),
+                        "within_25pct": report.get("within_25pct"),
+                        "sales_used": report.get("sales_used"),
+                        "reading": report.get("reading")},
+            "caveat": ("Current market value from recorded sales of comparable land. "
+                       "Not a forecast. Sales are not yet filtered for arms-length "
+                       "transfers, so the low end is dragged by nominal-consideration "
+                       "deeds.")}
+
+@app.get("/admin/fit_price")
+def admin_fit_price(token: str, since_year: int = 2010):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_fit_price, args=(since_year,), daemon=True).start()
+    return {"state": "started", "kind": "price", "next": "poll /admin/state?token=YOUR_TOKEN"}
 
 # --- EVIDENCE: what actually happened to ground ranked like this -----------
 # The defensible object is not a fitted probability, it is a measurement. The
