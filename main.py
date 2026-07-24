@@ -721,7 +721,9 @@ def run_backtest(vintages=(2000, 2005, 2010, 2015), permute=False, min_struct=No
                       for gx, gy, dy, n, d in risk.get(v, [])]
             quints = BT.quintile_outcomes(scored, v)
             strat = BT.stratified_spread(scored, v)
-            results.append(BT.summarise(v, quints, len(rows), sum(r[1] for r in rows), strat))
+            SIGNAL_STATUS.update(detail=f"{v}: computing the mechanical floor")
+            floor = BT.shuffled_floor(scored, v)
+            results.append(BT.summarise(v, quints, len(rows), sum(r[1] for r in rows), strat, floor))
 
         payload = {"unit": "half-mile grid cells",
                    "permuted_years": permute,

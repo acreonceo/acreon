@@ -186,7 +186,59 @@ def stratified_spread(scored, vintage, bands=((0, 3), (4, 8), (9, 20), (21, 10**
     return out
 
 
-def summarise(vintage, quints, n_train, n_events, strat=None):
+def shuffled_floor(scored, vintage, bands=((0, 3), (4, 8), (9, 20), (21, 10**6)),
+                   reps=200, seed=11):
+    """The exact mechanical floor for THIS population and base rate.
+
+    Permuting construction years county-wide turned out to be a poor null: it
+    destroys the temporal clustering of real development (a subdivision's five
+    structures go up together), so the fifth structure arrives far later or never.
+    That cut the base conversion rate fivefold and shrank the scored population,
+    which makes the resulting spread incomparable to the real run.
+
+    This null instead holds everything fixed except the one thing under test.
+    The at-risk cells, their density, and the exact number of conversions inside
+    each density band are all preserved; only WHICH cells converted is reshuffled
+    within a band. Distance can then carry no information beyond what fabric
+    density already implies, so the spread this produces is the floor the real
+    result has to beat.
+    """
+    import random
+    rng = random.Random(seed)
+    idx = {}
+    for i, r in enumerate(scored):
+        n = r[3]
+        for lo, hi in bands:
+            if lo <= n <= hi:
+                idx.setdefault((lo, hi), []).append(i)
+                break
+    spreads = []
+    for _ in range(reps):
+        conv = [None] * len(scored)
+        for key, members in idx.items():
+            outcomes = [1 if (scored[i][2] and vintage < scored[i][2] <= CURRENT_YEAR) else 0
+                        for i in members]
+            rng.shuffle(outcomes)
+            for i, o in zip(members, outcomes):
+                conv[i] = o
+        ranked = sorted(range(len(scored)), key=lambda i: scored[i][1])
+        n = len(ranked)
+        lo_block = ranked[:n // QUINTILES]
+        hi_block = ranked[n * (QUINTILES - 1) // QUINTILES:]
+        if not lo_block or not hi_block:
+            continue
+        spreads.append((sum(conv[i] for i in hi_block) / len(hi_block)
+                        - sum(conv[i] for i in lo_block) / len(lo_block)) * 100)
+    if not spreads:
+        return None
+    spreads.sort()
+    return {"reps": len(spreads),
+            "median": round(spreads[len(spreads) // 2], 1),
+            "p95": round(spreads[int(len(spreads) * 0.95)], 1),
+            "max": round(spreads[-1], 1)}
+
+
+def summarise(vintage, quints, n_train, n_events, strat=None, floor=None):
     if not quints:
         return {"vintage": vintage, "error": "insufficient data"}
     top, bot = quints[-1], quints[0]
@@ -221,6 +273,9 @@ def summarise(vintage, quints, n_train, n_events, strat=None):
         "bottom_quintile_rate": bot["conversion_rate"],
         "spread_percentage_points": spread_pp,
         "spread_within_density_bands": strat,
+        "mechanical_floor": floor,
+        "spread_above_floor": (round(spread_pp - floor["p95"], 1)
+                               if floor and floor.get("p95") is not None else None),
         "calibration": {
             "predicted_conversion_rate": round(tot_pred, 4),
             "actual_conversion_rate": round(overall, 4),
