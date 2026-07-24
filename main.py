@@ -397,6 +397,73 @@ def _valued(rows, p, horizon=10):
         out.append(r)
     return out
 
+# --- DEVELOPER PRICE: what builders actually paid --------------------------
+# The missing term in land value is what a developer pays for ground that is
+# ready to build. Raw fringe land almost never trades, which is why it cannot be
+# priced directly. Developable land trades constantly, and a parcel now held by a
+# homebuilder with a recorded purchase price IS that observation. This measures
+# how many such observations exist and whether they cover enough of the county to
+# be usable, before any model is built on them.
+DEV_SALES_SQL = """
+SELECT p.apn, p.zcta, p.acres, p.acquired, p.paid, p.owner, p.owner_type,
+       p.use, COALESCE(p.water_state,'C') AS water_state, p.edge_miles,
+       p.paid / NULLIF(p.acres,0) AS price_per_acre
+FROM parcels p
+WHERE p.owner_type = 'Builder/Developer'
+  AND p.paid > 0 AND p.acres > 0 AND p.acquired IS NOT NULL
+  AND p.acquired >= %s
+"""
+
+@app.get("/admin/developer_price")
+def admin_developer_price(token: str, since_year: int = 2012, min_acres: float = 1.0):
+    """Can the developer-price term be observed from data already held?"""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    import statistics as st
+    from collections import Counter, defaultdict
+    rows = [r for r in qall(DEV_SALES_SQL, (since_year,))
+            if float(r["acres"] or 0) >= min_acres]
+    if not rows:
+        return {"observations": 0,
+                "reading": "no builder acquisitions with a recorded price; the "
+                           "developer-price term is not observable from what is held"}
+    ppa = sorted(float(r["price_per_acre"]) for r in rows if r["price_per_acre"])
+    byzone = defaultdict(list)
+    for r in rows:
+        if r["price_per_acre"]:
+            byzone[r["zcta"]].append(float(r["price_per_acre"]))
+    usable = {z: v for z, v in byzone.items() if len(v) >= 5}
+    yrs = Counter(r["acquired"] for r in rows)
+    ws = defaultdict(list)
+    for r in rows:
+        if r["price_per_acre"]:
+            ws[r["water_state"]].append(float(r["price_per_acre"]))
+    def q(v, p):
+        return round(v[int(len(v) * p)]) if v else None
+    total_zones = q1("SELECT count(*) FROM zones")[0]
+    return {
+        "observations": len(rows),
+        "with_price_per_acre": len(ppa),
+        "since_year": since_year, "min_acres": min_acres,
+        "price_per_acre": {"p10": q(ppa, .10), "median": q(ppa, .50), "p90": q(ppa, .90)},
+        "acres": {"median": round(st.median([float(r["acres"]) for r in rows]), 1),
+                  "total": round(sum(float(r["acres"]) for r in rows))},
+        "zones_with_5plus": len(usable), "zones_total": total_zones,
+        "zone_coverage": round(len(usable) / total_zones, 2) if total_zones else None,
+        "by_water_state": {k: {"n": len(v), "median_per_acre": round(st.median(v))}
+                           for k, v in sorted(ws.items())},
+        "by_year": dict(sorted(yrs.items())),
+        "reading": ("usable: enough builder acquisitions to measure what developers pay"
+                    if len(usable) >= max(10, 0.15 * total_zones) else
+                    "thin: some observations, but too few zones covered to price countywide"
+                    if len(ppa) >= 50 else
+                    "not observable from held data; needs full deed history"),
+        "note": ("A parcel now owned by a homebuilder with a recorded purchase price is "
+                 "what a developer paid for ground they intended to build on. That is the "
+                 "one land price that is observed frequently, because developable land "
+                 "trades constantly while raw fringe land does not."),
+    }
+
 # --- PRICE MODEL: what comparable land actually sold for -------------------
 # Fitted on recorded sales and scored against sales it never saw, so it reports
 # its own error before it reports a price. This estimates CURRENT value only;
