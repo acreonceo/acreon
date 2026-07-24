@@ -550,7 +550,10 @@ async function loadPrice(apn){
   let p; try{ p=await (await fetch(API+"/price?apn="+encodeURIComponent(apn))).json(); }
   catch(e){ el.innerHTML=`<div class="sub">Could not load the price estimate.</div>`; return; }
   if(!p.available){
-    el.innerHTML=`<div class="sub">${p.detail||"No price model fitted yet."}</div>`; return; }
+    const h=p.holdout||{};
+    el.innerHTML=`<div class="sub">${p.detail||"No price model fitted yet."}</div>`
+      + (p.suppressed?`<div class="sub" style="margin-top:4px">Land this far from existing development almost never changes hands, so there is little to learn from. Of the sales tested, fewer than one in a hundred were more than two miles out. Nobody can price this ground from records; that is why judgment about where growth goes is worth something.</div>`:"");
+    return; }
   const h=p.holdout||{};
   window.__priceEstimate=p.per_acre;
   el.innerHTML=`

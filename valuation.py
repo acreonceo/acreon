@@ -40,6 +40,9 @@ KNOWN LIMITS, ALL MEASURED RATHER THAN ASSUMED
 import math
 
 MIN_SALES_TO_FIT = 400
+# Above this holdout error the estimate is not shown at all. Measured on real
+# Maricopa sales the model ran 60-78%, so in practice this suppresses it.
+MAX_USABLE_ERROR_PCT = 45.0
 HOLDOUT_SHARE = 0.20
 MIN_PRICE_PER_ACRE = 100.0        # below this is almost certainly not a sale
 MAX_PRICE_PER_ACRE = 5_000_000.0

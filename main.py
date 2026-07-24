@@ -455,6 +455,21 @@ def price(apn: str):
     if not rows:
         raise HTTPException(404, "parcel not found")
     p = rows[0]
+    # A model that misses by 60% is not a price, it is a rumour. Suppress the
+    # point estimate rather than printing it with a caveat: on Maricopa data the
+    # holdout error ran 60% on all sales and got WORSE when restricted to
+    # speculative acreage (74.6% at 5+ acres, 77.7% at 20+), because large fringe
+    # parcels are idiosyncratic in ways county records do not capture and because
+    # fringe land barely trades at all.
+    if (report or {}).get("median_error_pct", 999) > VAL.MAX_USABLE_ERROR_PCT:
+        return {"available": False,
+                "suppressed": True,
+                "detail": ("No price shown. Fitted on "
+                           f"{report.get('sales_used', 0):,} recorded sales, this model missed by "
+                           f"{report.get('median_error_pct')}% on sales it had never seen, and by "
+                           "more on large and distant parcels. Recorded comparable sales are "
+                           "shown below instead."),
+                "holdout": report}
     est = VAL.predict(model, p)
     if not est:
         return {"available": False,
