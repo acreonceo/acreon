@@ -260,14 +260,23 @@ function valueOf(p){
   const site=siteFactor(p), H=holdYears, k=c.byH[H];
   if(!k) return null;
   const zmed=+p.median_price_per_acre||0;
-  const priceOK = price>=250 && (zmed<=0 || price>=0.15*zmed);
+  // Arizona assesses qualifying agricultural land on a statutory income basis,
+  // not market value, so its assessed figure is not a price. Substitute the going
+  // rate for vacant land in the same ZIP.
+  let basis="assessed";
+  if(p.use==="Agricultural"){
+    const vac=+p.vacant_price_per_acre||0;
+    if(vac>0){ price=vac; basis="estimated from vacant land in this ZIP"; }
+    else basis="no market reference";
+  }
+  const priceOK = basis!=="no market reference" && price>=250 && (zmed<=0 || price>=0.15*zmed);
   const residual=price*Math.exp(G_RAW*H);
   const v=k.payoff*d0*site + k.survive*residual*k.disc - k.carry*cr*price;
   const ratio=price>0?v/price:0;
   let ann=(price>0&&ratio>0)?(1+ASM.rho)*Math.pow(ratio,1/H)-1:-1;
   ann=Math.min(ann,2.0);                       // 200%/yr display ceiling
   return {gi,state:st,price,d0,carry:cr,v,ratio,ann,score:returnScore(ann),H,
-          path:c,acres,est,site,fitted:hf!==null,priceOK}; }
+          path:c,acres,est,site,fitted:hf!==null,priceOK,basis}; }
 
 function acqOf(p){
   let z=-1.20+0.045*Math.min(40,p.tenure||0);

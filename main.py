@@ -43,7 +43,8 @@ REQUIRED_PARCEL_COLUMNS = {
     "edge_miles": "numeric", "hazard_fitted": "numeric", "landlocked": "boolean",
     "flood_zone": "text", "zoning": "text", "jurisdiction": "text",
 }
-REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric", "median_price_per_acre": "numeric"}
+REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric", "median_price_per_acre": "numeric",
+                         "vacant_price_per_acre": "numeric"}
 
 def _ensure_columns():
     added = []
@@ -311,6 +312,7 @@ def _candidates(where_sql, params):
              p.carry_rate, p.hazard_fitted, p.landlocked, p.flood_zone, p.edge_miles,
              p.zoning, p.jurisdiction,
              z.signals AS signals, z.dev_value_per_acre, z.median_price_per_acre,
+             z.vacant_price_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
       WHERE {where_sql}
@@ -338,7 +340,21 @@ def _valued(rows, p, horizon=10):
         d0 = float(r["dev_value_per_acre"] or 0) or price_ac * 3.0
         cr = float(r["carry_rate"]) if r["carry_rate"] is not None else MODEL.carry_rate(est, r["assessed"])
         zmed = float(r.get("median_price_per_acre") or 0)
-        price_ok = price_ac >= MIN_CREDIBLE_PPA and (zmed <= 0 or price_ac >= 0.15 * zmed)
+        # Agricultural land carries a statutory use value, not a market value, so
+        # its assessed figure cannot serve as a price. Substitute the going rate
+        # for vacant land in the same ZIP and mark the basis as estimated.
+        basis = "assessed"
+        if r["use"] == "Agricultural":
+            vac = float(r.get("vacant_price_per_acre") or 0)
+            if vac > 0:
+                price_ac = vac
+                basis = "estimated from vacant land in this ZIP"
+            else:
+                basis = "no market reference"
+        price_ok = (basis != "no market reference"
+                    and price_ac >= MIN_CREDIBLE_PPA
+                    and (zmed <= 0 or price_ac >= 0.15 * zmed))
+        r["price_basis"] = basis
         v_ac = MODEL.value_at_horizon(c, horizon, d0, price_ac, cr, site, p)
         ann = MODEL.annualised_return(v_ac, price_ac, horizon, p)
         r["growth_index"] = round(gi, 1)
@@ -446,11 +462,15 @@ def report(apns: str, audience: str = "investor", horizon: int = 10,
     return Response(html, media_type="text/html")
 
 @app.get("/targets/export")
-def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
+def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
                    min_tenure: int = 0, water_state: str = "", include_public: bool = False,
+                   include_builders: bool = False, include_unpriced: bool = False,
+                   absentee: bool = False, city: str = "", zcta: str = "",
+                   max_price_per_acre: float = 0, max_total_price: float = 0,
+                   min_score: int = 0, max_years: int = 0,
                    min_ratio: float = 0, horizon: int = 10,
                    lambda_p: float = None, h_max: float = None, g_d: float = None,
-                   rho: float = None, sort: str = "value_ratio", limit: int = 2000):
+                   rho: float = None, sort: str = "value_score", limit: int = 2000):
     """Outreach list with owner mailing addresses, ranked by the same model the
     map and target list use."""
     where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
@@ -490,7 +510,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
     WS = {"A": "A served/assured", "B": "B irrigated ag (SB1611 path)", "C": "C raw groundwater"}
     buf = io.StringIO(); w = csv.writer(buf)
     w.writerow(["APN", "Situs Address", "City", "ZIP", "Use", "Acres",
-                "Price $/Acre", "Modeled Value $/Acre", "Annual Return %", "Score (0-100)", "Value/Price",
+                "Price $/Acre", "Price Basis", "Modeled Value $/Acre", "Annual Return %", "Score (0-100)", "Value/Price",
                 "Developer $/Acre", "Water State", "P50 Yrs to Convert",
                 f"P(convert<={horizon}y)", "Carry %/yr",
                 "Owner", "Owner Type", "Absentee", "Years Held", "Acquired", "Paid",
@@ -498,7 +518,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0,
                 "Landlocked", "Flood Zone", "Site Factor", "Hazard Source"])
     for r in vals:
         w.writerow([r["apn"], r["situs_address"], r["city"], r["zcta"], r["use"], r["acres"],
-                    r["price_per_acre"], r["value_per_acre"], r["annual_return_pct"], r["value_score"], r["value_ratio"],
+                    r["price_per_acre"], r.get("price_basis"), r["value_per_acre"], r["annual_return_pct"], r["value_score"], r["value_ratio"],
                     r["dev_price_per_acre"], WS.get(r["water_state"], r["water_state"]),
                     r["p50_years"] if r["p50_years"] else ">60",
                     round(r["p_convert"], 3) if r["p_convert"] is not None else "",
@@ -1260,9 +1280,20 @@ own AS (
   FROM parcels
   WHERE water_state = 'A' AND acres >= 1 AND est > 0
   GROUP BY zcta HAVING count(*) >= 3
+),
+-- Market reference for agricultural land. Arizona assesses qualifying ag land by
+-- statutory income capitalisation, not market comparison, so its full cash value
+-- is not a price and must not be used as one. Vacant-class land in the same ZIP
+-- is the nearest market observation available without transaction data.
+vac AS (
+  SELECT zcta, percentile_cont(0.5) WITHIN GROUP (ORDER BY est/acres) AS med_vac
+  FROM parcels
+  WHERE use = 'Vacant' AND acres >= 1 AND est > 0
+  GROUP BY zcta HAVING count(*) >= 5
 )
 UPDATE zones z SET
   median_price_per_acre = (SELECT med_all FROM base WHERE base.zcta = z.zcta),
+  vacant_price_per_acre = (SELECT med_vac FROM vac WHERE vac.zcta = z.zcta),
   dev_value_per_acre = LEAST(
   COALESCE(
     (SELECT v FROM own WHERE own.zcta = z.zcta),
