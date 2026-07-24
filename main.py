@@ -95,6 +95,12 @@ def _apply_schema():
 def _init_db():
     import transform as T
     _apply_schema()
+    # Guarantee every column the code reads, not just the ones schema.sql knows
+    # about. Read paths were failing in production because a column added with a
+    # feature only got created when an ingest job happened to run: deploying the
+    # code without running a job left /targets querying a column that did not
+    # exist yet.
+    _ensure_columns()
     with pool.connection() as c:
         zn = c.execute("SELECT count(*) FROM zones").fetchone()[0]
         if zn == 0:
@@ -870,7 +876,6 @@ def admin_state(token: str):
         "model": SIGNAL_STATUS,
         "counts": {
             "parcels": one("SELECT count(*) FROM parcels", 0),
-            "with_zoning": one("SELECT count(*) FROM parcels WHERE coalesce(zoning,'') <> ''", 0),
             "with_water_state": one("SELECT count(*) FROM parcels WHERE water_state IS NOT NULL", 0),
             "with_fitted_hazard": one("SELECT count(*) FROM parcels WHERE hazard_fitted IS NOT NULL", 0),
             "construction_records": one("SELECT count(*) FROM built", 0),
@@ -1040,10 +1045,12 @@ def _transform_feature(ft):
         sub, lot = (a.get("SUBNAME") or "").strip(), (a.get("LOT_NUM") or "").strip()
         addr = f"{sub} Lot {lot}".strip() if sub else f"Parcel {apn}"
     mail = (a.get("MAIL_ADDRESS") or "").strip()
-    zoning = (a.get("CITY_ZONING") or "").strip()
     juris = (a.get("JURISDICTION") or "").strip()
-    if zoning.upper().startswith("CONTACT"):
-        zoning = ""                      # placeholder text, not a zoning code
+    # CITY_ZONING is not published here: a 600-parcel sample returned the
+    # "CONTACT LOCAL JURISDICTION" placeholder every time, in incorporated
+    # cities as well as unincorporated land. Real zoning would have to come from
+    # each municipality's own GIS, which is a separate data pull.
+    zoning = ""
     return (apn, json.dumps(geom), addr, city, use, acres, int(est), int(assessed),
             owner, owner_type, absentee, acquired, tenure, paid, "Off-market", None, mail,
             zoning, juris)
