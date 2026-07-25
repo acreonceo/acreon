@@ -1351,9 +1351,26 @@ def run_ingest_all(cap_per_zip=2500, replace_first=True):
         n = c.execute("SELECT count(*) FROM parcels").fetchone()[0]
     INGEST_STATUS = {"state": "done", "mode": "county", "zips_loaded": loaded_zips, "errors": errors, "loaded": n}
 
-def _fetch_page(offset, where, n=1000):
-    params = {"where": where, "outFields": "*", "returnGeometry": "true", "outSR": "4326",
-              "f": "geojson", "orderByFields": "OBJECTID", "resultOffset": offset, "resultRecordCount": n}
+def _oid(ft):
+    a = ft.get("properties") or ft.get("attributes") or {}
+    for k in ("OBJECTID", "objectid", "OBJECTID_1", "FID", "OID"):
+        v = a.get(k)
+        if isinstance(v, (int, float)):
+            return int(v)
+    v = ft.get("id")
+    return int(v) if isinstance(v, (int, float)) else None
+
+def _fetch_page(last_oid, where, n=1000):
+    """Keyset paging on OBJECTID, matching run_ingest_built.
+
+    resultOffset is unreliable on these layers: some ignore it and return the
+    first page forever, which silently caps a pull. The where clause is wrapped
+    in brackets because COUNTY_WHERE contains an OR, and an unbracketed AND
+    would bind to its right-hand side only and never advance.
+    """
+    params = {"where": f"({where}) AND OBJECTID > {int(last_oid)}",
+              "outFields": "*", "returnGeometry": "true", "outSR": "4326",
+              "f": "geojson", "orderByFields": "OBJECTID", "resultRecordCount": n}
     r = requests.get(COUNTY_PARCELS, params=params, timeout=120, headers={"User-Agent": UA})
     try:
         return r.json().get("features", [])
@@ -1362,34 +1379,71 @@ def _fetch_page(offset, where, n=1000):
 
 def run_ingest_county(include_all=False, chunk=5000, cap=2_000_000):
     _ensure_columns()
-    """Page the whole county (no per-ZIP bbox), loading in chunks. Replaces once on
-    the first flush then appends, so it's a clean full rebuild. Handles ~250k
-    vacant/ag parcels, or everything with include_all."""
+    """Page the whole county (no per-ZIP bbox), loading in chunks.
+
+    Nothing is deleted while the pull is running. Rows are upserted, which stamps
+    updated_at, and stale rows are swept only after the pull is verified complete
+    against the server's own count. The old version deleted everything on the
+    first chunk, so any interruption left a partial table that still reported
+    done. A failed run now leaves the previous data intact.
+    """
     global INGEST_STATUS
     where = "1=1" if include_all else COUNTY_WHERE
-    INGEST_STATUS = {"state": "running", "mode": "county-all", "fetched": 0, "loaded": 0, "detail": "starting"}
-    offset = 0; loaded = 0; buf = []; replaced = False
+    total = _county_count(where)
+    INGEST_STATUS = {"state": "running", "mode": "county-all", "fetched": 0, "loaded": 0,
+                     "server_count": total, "detail": "starting"}
+    last_oid, fetched, loaded, buf, stalls = -1, 0, 0, [], 0
     try:
-        while offset < cap:
-            feats = _fetch_page(offset, where)
+        with pool.connection() as c:
+            started = c.execute("SELECT now()").fetchone()[0]
+        while fetched < cap:
+            feats = _fetch_page(last_oid, where)
             if not feats:
                 break
-            offset += len(feats)
+            prev = last_oid
             for f in feats:
+                o = _oid(f)
+                if o is not None:
+                    last_oid = max(last_oid, o)
                 row = _transform_feature(f)
                 if row:
                     buf.append(row)
-            INGEST_STATUS.update(fetched=offset, detail=f"fetching ({offset})")
+            fetched += len(feats)
+            if last_oid <= prev:
+                stalls += 1
+                if stalls >= 2:
+                    raise RuntimeError(f"server did not advance past OBJECTID {last_oid}; "
+                                       "pagination unsupported on this layer")
+            else:
+                stalls = 0
+            INGEST_STATUS.update(fetched=fetched, detail=f"fetching ({fetched}"
+                                 + (f" of {total}" if total else "") + ")")
             if len(buf) >= chunk:
-                loaded = _load_parcels(buf, replace=(not replaced)); replaced = True; buf = []
+                loaded = _load_parcels(buf); buf = []
                 INGEST_STATUS.update(loaded=loaded, detail=f"loaded {loaded}")
-            if len(feats) < 1000:
-                break
         if buf:
-            loaded = _load_parcels(buf, replace=(not replaced))
-        INGEST_STATUS = {"state": "done", "mode": "county-all", "fetched": offset, "loaded": loaded}
+            loaded = _load_parcels(buf)
+        short = bool(total) and fetched < total * 0.95
+        if short:
+            INGEST_STATUS = {"state": "error", "mode": "county-all", "fetched": fetched,
+                             "loaded": loaded, "server_count": total,
+                             "detail": (f"incomplete: fetched {fetched:,} of {total:,} on the "
+                                        "server. Nothing was deleted; previous rows are intact. "
+                                        "Re-run before using this build.")}
+            return
+        with pool.connection() as c, c.cursor() as cur:
+            cur.execute("DELETE FROM parcels WHERE updated_at < %s", (started,))
+            swept = cur.rowcount
+            c.commit()
+        with pool.connection() as c:
+            final = c.execute("SELECT count(*) FROM parcels").fetchone()[0]
+        INGEST_STATUS = {"state": "done", "mode": "county-all", "fetched": fetched,
+                         "server_count": total, "parcels": final, "stale_removed": swept,
+                         "detail": "complete"}
     except Exception as e:
-        INGEST_STATUS = {"state": "error", "detail": str(e)[:200], "fetched": offset, "loaded": loaded}
+        INGEST_STATUS = {"state": "error", "mode": "county-all", "detail": str(e)[:200],
+                         "fetched": fetched, "loaded": loaded, "server_count": total,
+                         "note": "nothing deleted; previous parcels are intact"}
 
 # --- ZONE REBUILD: precise, complete Census ZIP boundaries -----------------
 ZCTA_URL = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/PUMA_TAD_TAZ_UGA_ZCTA/MapServer/7/query"
