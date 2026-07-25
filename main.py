@@ -2824,15 +2824,21 @@ ORDER BY p.apn
 """
 
 def _sample_elevations(pts, url=USGS_3DEP):
-    """pts: [(lon,lat), ...] -> [metres or None]. One multipoint request."""
+    """pts: [(lon,lat), ...] -> [metres or None]. One multipoint request.
+
+    POST, not GET: a few hundred points of geometry JSON in a query string
+    exceeds the server's URI limit and comes back as a 414 with an HTML body.
+    ArcGIS REST accepts the same parameters form-encoded.
+    """
     geom = {"points": [[x, y] for x, y in pts],
             "spatialReference": {"wkid": 4326}}
-    r = requests.get(url, timeout=120, headers={"User-Agent": BROWSER_UA},
-                     params={"geometry": json.dumps(geom),
-                             "geometryType": "esriGeometryMultipoint",
-                             "returnFirstValueOnly": "true",
-                             "interpolation": "RSP_BilinearInterpolation",
-                             "f": "json"})
+    body = {"geometry": json.dumps(geom),
+            "geometryType": "esriGeometryMultipoint",
+            "returnFirstValueOnly": "true",
+            "interpolation": "RSP_BilinearInterpolation",
+            "f": "json"}
+    r = requests.post(url, data=body, timeout=180,
+                      headers={"User-Agent": BROWSER_UA})
     try:
         j = r.json()
     except Exception:
@@ -2868,7 +2874,19 @@ def run_terrain(min_acres=5.0):
         done = 0
         for i in range(0, len(rows), TERRAIN_BATCH):
             chunk = rows[i:i + TERRAIN_BATCH]
-            vals = _sample_elevations([(r["lon"], r["lat"]) for r in chunk])
+            vals = None
+            for size in (len(chunk), max(1, len(chunk) // 4), 25):
+                try:
+                    vals = []
+                    for j0 in range(0, len(chunk), size):
+                        vals += _sample_elevations(
+                            [(r["lon"], r["lat"]) for r in chunk[j0:j0 + size]])
+                    break
+                except RuntimeError:
+                    vals = None
+                    continue
+            if vals is None:
+                raise RuntimeError("3DEP rejected this batch at every size tried")
             for r, v in zip(chunk, vals):
                 if v is not None:
                     elev.setdefault(r["apn"], []).append(v)
@@ -2912,17 +2930,25 @@ def admin_probe_terrain(token: str):
     hundred feet above the first, the elevation service is not answering."""
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
+    # Two known points for correctness, then padded to a full batch so the probe
+    # exercises the same request size the job uses. The first version sent two
+    # points, passed, and the job then failed with a 414 on 240.
     pts = [(-112.074, 33.448), (-112.048, 33.335)]
+    pad = [(-112.20 + 0.001 * i, 33.40 + 0.001 * (i % 30))
+           for i in range(TERRAIN_BATCH - len(pts))]
     try:
-        v = _sample_elevations(pts)
-        ft = [round(x * 3.28084) if x is not None else None for x in v]
-        ok = all(x is not None for x in ft) and (ft[1] - ft[0]) > 300
+        v = _sample_elevations(pts + pad)
+        ft = [round(x * 3.28084) if x is not None else None for x in v[:2]]
+        got = sum(1 for x in v if x is not None)
+        ok = all(x is not None for x in ft) and (ft[1] - ft[0]) > 300 and got > len(v) * 0.8
         return {"downtown_phoenix_ft": ft[0], "south_mountain_ft": ft[1],
-                "usable": ok,
+                "batch_size_tested": len(pts + pad),
+                "values_returned": got, "usable": ok,
                 "verdict": ("run /admin/terrain?token=YOUR_TOKEN" if ok
-                            else "elevation service not returning usable values")}
+                            else "elevation service not returning usable values at this batch size")}
     except Exception as e:
-        return {"error": str(e)[:200], "usable": False}
+        return {"error": str(e)[:220], "usable": False,
+                "batch_size_tested": TERRAIN_BATCH}
 
 @app.get("/admin/terrain")
 def admin_terrain(token: str, min_acres: float = 5.0):
