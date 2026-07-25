@@ -72,8 +72,23 @@ td.t{font-family:Georgia,serif}
 .risk{background:#fdf6f3;border-left:3px solid var(--bad);padding:10px 14px;margin:14px 0;font-size:12.5px}
 .foot{margin-top:34px;padding-top:12px;border-top:1px solid var(--line);
       font-size:10.5px;color:var(--faint);line-height:1.5}
-.parcel{page-break-inside:avoid;margin-top:26px}
-@media print{body{background:#fff}.page{padding:0;max-width:none}@page{margin:16mm}}
+.parcel{page-break-inside:avoid;margin-top:26px;page-break-before:auto}
+h4{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
+   margin:16px 0 4px;font-family:Georgia,serif}
+.aerial{margin:12px 0 6px}
+.shot{position:relative;overflow:hidden;border-radius:6px;border:1px solid var(--line);max-width:100%}
+.shot img,.shot svg{position:absolute;top:0;left:0;max-width:100%}
+.imgcap{font-size:10.5px;color:var(--faint);margin-top:5px}
+@media print{
+  body{background:#fff}
+  .page{padding:0;max-width:none}
+  @page{margin:16mm}
+  h2{page-break-after:avoid}
+  h3,h4{page-break-after:avoid}
+  table,.kpis,.note,.risk,.aerial{page-break-inside:avoid}
+  .shot img{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  a{text-decoration:none;color:inherit}
+}
 """
 
 
@@ -98,6 +113,133 @@ def _num(v, d=0):
         return "n/a"
 
 
+# --- AERIAL -----------------------------------------------------------------
+# Esri's World Imagery export endpoint returns a PNG for a bounding box, so the
+# browser fetches it directly at print time and no server-side image pipeline or
+# rendering dependency is needed. The parcel is drawn over it as inline SVG,
+# which makes the shape self-evident: a reader seeing a two-mile ribbon
+# understands the problem without being told what an inscribed radius is.
+ESRI_IMG = ("https://services.arcgisonline.com/arcgis/rest/services/World_Imagery"
+            "/MapServer/export")
+IMG_W, IMG_H = 760, 470
+
+
+def _rings(gj):
+    """Every coordinate ring in a GeoJSON polygon or multipolygon. Returns an
+    empty list for anything unusable, so a parcel with no stored geometry simply
+    prints without an aerial rather than failing the whole document."""
+    import json as _json
+    if not gj:
+        return []
+    try:
+        g = _json.loads(gj) if isinstance(gj, (str, bytes)) else gj
+    except Exception:
+        return []
+    if not isinstance(g, dict):
+        return []
+    t, c = g.get("type"), g.get("coordinates") or []
+    if t == "Polygon":
+        return [r for r in c if len(r) > 2]
+    if t == "MultiPolygon":
+        return [r for poly in c for r in poly if len(r) > 2]
+    return []
+
+
+def _aerial(r, pad=0.55, caption=None):
+    rings = _rings(r.get("geom_json"))
+    if not rings:
+        return ""
+    xs = [p[0] for ring in rings for p in ring]
+    ys = [p[1] for ring in rings for p in ring]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    # pad, then force the box to the image aspect so nothing is stretched
+    w = max((x1 - x0) * (1 + pad), 0.0016)
+    h = max((y1 - y0) * (1 + pad), 0.0016)
+    import math as _m
+    aspect = IMG_W / IMG_H
+    lat_scale = max(0.2, _m.cos(_m.radians(cy)))     # degrees of lon per degree of lat
+    if (w * lat_scale) / h < aspect:
+        w = (h * aspect) / lat_scale
+    else:
+        h = (w * lat_scale) / aspect
+    bx0, bx1, by0, by1 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+    url = (f"{ESRI_IMG}?bbox={bx0:.6f},{by0:.6f},{bx1:.6f},{by1:.6f}"
+           f"&bboxSR=4326&imageSR=3857&size={IMG_W},{IMG_H}&format=png&f=image")
+    paths = []
+    for ring in rings:
+        pts = " ".join(
+            f"{(p[0]-bx0)/(bx1-bx0)*IMG_W:.1f},{(1-(p[1]-by0)/(by1-by0))*IMG_H:.1f}"
+            for p in ring)
+        paths.append(f'<polygon points="{pts}" fill="rgba(255,214,0,.16)" '
+                     f'stroke="#ffd600" stroke-width="2.5" />')
+    cap = f'<div class="imgcap">{caption}</div>' if caption else ""
+    return (f'<div class="aerial"><div class="shot" style="width:{IMG_W}px;height:{IMG_H}px">'
+            f'<img src="{url}" width="{IMG_W}" height="{IMG_H}" alt="aerial view">'
+            f'<svg viewBox="0 0 {IMG_W} {IMG_H}" width="{IMG_W}" height="{IMG_H}">'
+            f'{"".join(paths)}</svg></div>{cap}</div>')
+
+
+def _ground(r):
+    """Plain-language read of what the geometry will physically hold."""
+    rad = r.get("usable_radius_ft")
+    lp = r.get("largest_part_acres")
+    ac = float(r.get("acres") or 0)
+    parts = r.get("parts")
+    road = r.get("road_ft")
+    out = []
+    if rad is not None:
+        rad = float(rad)
+        if rad < 100:
+            out.append(f"The widest point of this parcel fits a circle of only "
+                       f"{rad:,.0f} feet radius. That is a corridor, not a site: it "
+                       f"supports signage, utilities and drainage, and cannot hold a "
+                       f"development pad regardless of total acreage.")
+        elif rad < 200:
+            out.append(f"Largest circle that fits inside is {rad:,.0f} feet radius, "
+                       f"below the depth a commercial pad needs.")
+        elif rad < 300:
+            out.append(f"Largest circle that fits inside is {rad:,.0f} feet radius, "
+                       f"workable for commercial but tight for two-sided residential "
+                       f"blocks.")
+        else:
+            out.append(f"Largest circle that fits inside is {rad:,.0f} feet radius, "
+                       f"enough depth for conventional subdivision blocks.")
+    if lp is not None and ac > 0 and float(lp) < ac * 0.9:
+        out.append(f"The ground is in {parts or 'several'} separate pieces and the "
+                   f"largest is {float(lp):,.1f} acres, so it should be judged at that "
+                   f"scale rather than at {ac:,.1f}.")
+    if road is not None:
+        road = float(road)
+        out.append(f"Nearest road centreline is {road:,.0f} feet away."
+                   + ("" if road <= 150 else
+                      " Access would have to be established before anything is built."))
+    return " ".join(out) or "Parcel geometry has not been measured."
+
+
+def _comps_table(r):
+    cs = r.get("comps") or []
+    if not cs:
+        return ('<p class="sub">No recorded arm\'s-length sales of vacant or '
+                'agricultural land within three miles in the last ten years. On fringe '
+                'ground that is common, and it is the reason a comparable-sales '
+                'valuation cannot be produced here.</p>')
+    rowsh = "".join(
+        f"<tr><td class='t'>{c.get('situs_address') or c.get('apn')}</td>"
+        f"<td style='text-align:right'>{_num(c.get('acres'),1)}</td>"
+        f"<td style='text-align:right'>{money(c.get('paid'))}</td>"
+        f"<td style='text-align:right'>{money(c.get('price_per_acre'))}</td>"
+        f"<td style='text-align:right'>{c.get('acquired') or ''}</td>"
+        f"<td style='text-align:right'>{_num(c.get('miles_away'),1)}</td></tr>"
+        for c in cs)
+    return (f"<table><tr><th>Recorded sale</th><th style='text-align:right'>Acres</th>"
+            f"<th style='text-align:right'>Paid</th><th style='text-align:right'>$/acre</th>"
+            f"<th style='text-align:right'>Year</th><th style='text-align:right'>Miles</th></tr>"
+            f"{rowsh}</table>"
+            f"<p class='sub'>Recorded transactions, not estimates. These are the only "
+            f"observed dollar figures in this document.</p>")
+
+
 def _portfolio(rows):
     ac = sum(float(r.get("acres") or 0) for r in rows)
     ask = sum(float(r.get("est") or 0) for r in rows)
@@ -111,7 +253,7 @@ def _portfolio(rows):
     }
 
 
-def _investor_body(rows, tot):
+def _investor_body(rows, tot, meta=None):
     out = []
     out.append(f"""
     <h2>The case</h2>
@@ -134,9 +276,7 @@ def _investor_body(rows, tot):
     from Maricopa County's own construction history: every improved parcel carries a
     build year, so the development frontier can be reconstructed for any past year and
     the relationship between distance-to-frontier and subsequent conversion measured
-    directly. The fit spans 219,509 parcel-periods and independently reproduces the
-    2008 collapse, which is a check that it is reading real history rather than
-    noise.</div>""")
+    directly.{tot['fit_line']}</div>""")
 
     for r in rows:
         ws = r.get("water_state") or "C"
@@ -162,18 +302,152 @@ def _investor_body(rows, tot):
         </div>""")
 
     out.append("""
-    <div class="risk"><b>What would make this wrong.</b> Value rests on the assessor's
-    full cash value as the price basis, and on raw land that figure commonly lags the
-    market, so the discount to model may be overstated. Conversion odds are fitted on
+    <div class="risk"><b>What would make this wrong.</b> Both sides of the value
+    comparison come from the assessor. The price basis is the parcel's full cash
+    value, and the developer price it is measured against is the median full cash
+    value per acre of assured-supply land in the same ZIP. Neither is a transaction.
+    A ratio between them therefore measures how this parcel is assessed relative to
+    its neighbours, which is informative but is not a market valuation, and a large
+    ratio is as likely to indicate an assessment anomaly as an opportunity. Raw
+    fringe land trades too rarely to build comparable sales, and without a full deed
+    chain a repeat-sales index cannot be constructed either, so no valuation here has
+    been validated against realised transactions. Conversion odds are fitted on
     construction dates, which trail the speculator's actual payoff by one to four
     years. The probability that Arizona groundwater policy shifts over thirty years is
-    a judgment input, not an estimate, and it moves the value of any parcel that is not
-    already water-served. Nothing here has been validated against realised
-    transactions.</div>""")
+    a judgment input, not an estimate.</div>""")
     return "".join(out)
 
 
-def _developer_body(rows, tot):
+def _partner_body(rows, tot, meta=None):
+    """A partner is not buying a parcel, they are buying a method. So the method
+    leads, what it cannot do is stated before what it can, and the parcels appear
+    as worked examples rather than as the ask."""
+    meta = meta or {}
+    bt = meta.get("backtest") or []
+    out = []
+    out.append(f"""
+    <h2>The thesis</h2>
+    <p>Raw fringe land is not a growth asset. It sits near its holding value for
+    years and then steps up sharply when it becomes developable. What is being
+    bought is the probability and the timing of that single event, discounted for
+    the wait and net of the cost of carrying the land meanwhile. Everything in this
+    brief follows from treating conversion as the event to be predicted, rather
+    than treating price as a trend to be extrapolated.</p>
+
+    <h2>What this method can and cannot do</h2>
+    <p><b>It can date conversion.</b> Every improved parcel in Maricopa County
+    carries a construction year, which is a census of development events going back
+    decades. The frontier can be reconstructed for any past year, each parcel's
+    distance to that frontier measured, and the relationship between distance and
+    subsequent conversion estimated from what actually happened.{tot['fit_line']}</p>
+    <p><b>It cannot appraise land.</b> Fringe parcels trade too rarely to build
+    comparable sales, and county records carry only the most recent transaction, so
+    a repeat-sales index cannot be constructed either. Any per-acre value in this
+    document is a model output resting on assessor opinion, not a market
+    observation. We treat that as a screen, not as a valuation, and we do not
+    represent it as one. Recorded sales, shown per parcel below, are the only
+    observed dollar figures here.</p>
+    <div class="note"><b>Why that distinction is the edge.</b> Timing is the part
+    of this asset class that is genuinely knowable and almost never measured.
+    Valuation is the part everyone claims and no one can evidence. Being explicit
+    about which is which is what makes the timing work credible.</div>""")
+
+    if bt:
+        trs = "".join(
+            f"<tr><td>{b.get('vintage')}</td>"
+            f"<td style='text-align:right'>{b.get('outcome_window_years')}y</td>"
+            f"<td style='text-align:right'>{_pct(_top_q(b,'conversion_rate'))}</td>"
+            f"<td style='text-align:right'>{_pct(b.get('bottom_quintile_rate'))}</td>"
+            f"<td style='text-align:right'>{_num(b.get('spread_above_floor'),1)} pp</td></tr>"
+            for b in bt if not b.get("error"))
+        out.append(f"""
+        <h2>The test</h2>
+        <p>The ranking was run forward from four past start years using only what
+        was knowable then, and scored against what was subsequently built. It was
+        then run again against a permutation floor: which cells converted was
+        reshuffled while population, parcel density and totals were held fixed, so
+        location could no longer carry information. Whatever spread survives that
+        shuffle is skill rather than geometry.</p>
+        <table>
+          <tr><th>Ranked from</th><th style="text-align:right">Watched</th>
+              <th style="text-align:right">Top fifth converted</th>
+              <th style="text-align:right">Bottom fifth</th>
+              <th style="text-align:right">Above the shuffled floor</th></tr>
+          {trs}
+        </table>
+        <p class="sub">Measured on half-mile cells of fixed ground, not parcels, so
+        subdivision cannot inflate the converted side. Cells already developed at
+        the start year are excluded, so these figures describe frontier expansion
+        and say nothing about infill.</p>""")
+
+    out.append(f"""
+    <h2>How the universe narrows</h2>
+    <p>Every vacant and agricultural parcel in the county enters. Public bodies,
+    homebuilders who already assembled their sites, and parcels whose assessed
+    figure is not a credible price are removed, because none of them are sellers.
+    What survives is screened on water status, tenure, owner type, parcel geometry
+    and road access, then ranked on modelled conversion timing. The {tot['n']}
+    parcel{'s' if tot['n']!=1 else ''} below came through that process and total
+    {_num(tot['acres'],1)} acres carried at {money(tot['ask'])}.</p>""")
+
+    for r in rows:
+        ws = r.get("water_state") or "C"
+        out.append(f"""
+        <div class="parcel">
+        <h3>{r.get('situs_address') or r.get('apn')} &middot; {_num(r.get('acres'),2)} acres</h3>
+        <div class="sub">APN {r.get('apn')} &middot; {r.get('city') or ''} {r.get('zcta') or ''}
+          &middot; {r.get('use')} &middot; {WS_LABEL.get(ws, ws)}</div>
+        {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
+        <h4>On record</h4>
+        <table>
+          <tr><td class="t">Owner</td><td style="text-align:right">{r.get('owner') or 'n/a'} ({r.get('owner_type') or 'n/a'})</td></tr>
+          <tr><td class="t">Held</td><td style="text-align:right">{str(r.get('tenure')) + ' years' if r.get('tenure') is not None else 'no recorded sale'}</td></tr>
+          <tr><td class="t">Last recorded sale</td><td style="text-align:right">{(money(r.get('paid')) + ' in ' + str(r.get('acquired'))) if r.get('paid') and r.get('acquired') else 'none on record'}</td></tr>
+          <tr><td class="t">Assessed full cash value</td><td style="text-align:right">{money(r.get('est'))} &middot; {money(r.get('price_per_acre'))}/ac</td></tr>
+          <tr><td class="t">Annual carry, from the tax roll</td><td style="text-align:right">{r.get('carry_pct')}%</td></tr>
+        </table>
+        <h4>What the ground will hold</h4>
+        <p>{_ground(r)}</p>
+        <h4>Water</h4>
+        <p>{WS_INVESTOR.get(ws, '')}</p>
+        <h4>Recorded sales within three miles</h4>
+        {_comps_table(r)}
+        <h4>Modelled timing</h4>
+        <p>Even odds of conversion at
+        {str(r.get('p50_years')) + ' years' if r.get('p50_years') else 'beyond the 30-year horizon'},
+        on a {tot['horizon']}-year view. This is the model output we stand behind;
+        the per-acre value figures elsewhere in the system are a screen and are not
+        reproduced here.</p>
+        </div>""")
+
+    out.append("""
+    <div class="risk"><b>What would make this wrong.</b> Conversion odds are fitted
+    on construction dates, which trail the speculator's payoff by one to four years,
+    so the timing shown is late rather than early. Land platted before 2008 and never
+    built reads as unconverted even though the owner was paid. The probability that
+    Arizona groundwater policy shifts over a thirty-year hold is a judgment input,
+    not an estimate, and it moves every parcel that is not already water-served. No
+    figure in this document has been validated against realised transactions,
+    because on this asset class there are not enough of them to validate against.
+    Legal access, easements, mineral and grazing rights, topography, utility
+    distances, zoning and any Luke AFB overlay have not been verified.</div>""")
+    return "".join(out)
+
+
+def _top_q(b, key):
+    qs = b.get("quintiles") or []
+    top = next((q for q in qs if q.get("quintile") == 5), None)
+    return (top or {}).get(key)
+
+
+def _pct(v):
+    try:
+        return f"{float(v)*100:.1f}%" if float(v) <= 1 else f"{float(v):.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _developer_body(rows, tot, meta=None):
     out = []
     out.append(f"""
     <h2>Summary</h2>
@@ -249,14 +523,21 @@ def _readiness(r):
     return " ".join(bits)
 
 
-def build(rows, audience="investor", horizon=10):
+def build(rows, audience="investor", horizon=10, meta=None):
+    meta = meta or {}
     tot = _portfolio(rows)
     tot["horizon"] = horizon
-    investor = audience != "developer"
-    title = "Investment Brief" if investor else "Development Opportunity Brief"
-    body = _investor_body(rows, tot) if investor else _developer_body(rows, tot)
-    aud = ("Prepared for prospective investors" if investor
-           else "Prepared for builders and developers")
+    n = meta.get("hazard_rows")
+    ev = meta.get("hazard_events")
+    tot["fit_line"] = (f" The current fit spans {n:,} parcel-periods carrying "
+                       f"{ev:,} recorded conversions." if n and ev else "")
+    title = {"partner": "Partnership Brief",
+             "developer": "Development Opportunity Brief"}.get(audience, "Investment Brief")
+    body = ({"partner": _partner_body,
+             "developer": _developer_body}.get(audience, _investor_body))(rows, tot, meta)
+    aud = {"partner": "Prepared for prospective partners",
+           "developer": "Prepared for builders and developers"}.get(
+               audience, "Prepared for prospective investors")
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Acreon {title}</title><style>{CSS}</style></head><body><div class="page">
 <div class="meta"><div><div class="brand">Acreon</div>

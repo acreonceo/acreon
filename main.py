@@ -767,7 +767,32 @@ def report(apns: str, audience: str = "investor", horizon: int = 10,
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
     vals.sort(key=lambda r: r["value_score"] or 0, reverse=True)
-    html = REPORT.build(vals, audience, _snap_horizon(horizon))
+    # Geometry for the aerial outline, and recorded sales nearby. Comps are the
+    # only dollar figures in the system that are transactions rather than
+    # opinions, so a document meant for a third party leads with them.
+    apns = [r["apn"] for r in vals]
+    geo = {g["apn"]: g["gj"] for g in qall(
+        "SELECT apn, ST_AsGeoJSON(ST_SimplifyPreserveTopology(geom, 0.00002)) AS gj "
+        "FROM parcels WHERE apn = ANY(%s)", (apns,))}
+    for r in vals:
+        r["geom_json"] = geo.get(r["apn"])
+        try:
+            r["comps"] = comps(r["apn"], radius_miles=3.0, years=10, limit=6)
+        except Exception:
+            r["comps"] = []
+    meta = {}
+    try:
+        fit = qall("SELECT payload FROM model_fit WHERE key='hazard'")
+        bt = qall("SELECT payload FROM model_fit WHERE key='backtest'")
+        if fit:
+            meta["hazard_rows"] = fit[0]["payload"].get("n")
+            meta["hazard_events"] = fit[0]["payload"].get("events")
+        if bt:
+            meta["backtest"] = bt[0]["payload"].get("results")
+            meta["verdict"] = bt[0]["payload"].get("verdict")
+    except Exception:
+        pass
+    html = REPORT.build(vals, audience, _snap_horizon(horizon), meta)
     return Response(html, media_type="text/html")
 
 @app.get("/targets/export")

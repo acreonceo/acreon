@@ -123,6 +123,7 @@
       <div style="display:flex;gap:6px;margin-bottom:10px">
         <button id="repInv" style="flex:1;padding:7px 4px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Investor brief</button>
         <button id="repDev" style="flex:1;padding:7px 4px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Developer brief</button>
+        <button id="repPar" style="flex:1;padding:7px 4px;border:1px solid var(--ink);background:var(--paper);color:var(--ink);font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Partner brief</button>
       </div>
       <button id="exportBtn" style="width:100%;margin:2px 0 12px;padding:8px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-weight:600;border-radius:8px;cursor:pointer">Export this list to CSV (with owner mailing addresses)</button>
       <div id="targetList"></div>
@@ -718,7 +719,8 @@ const selected=new Set();
 function syncSel(){
   const n=selected.size;
   document.getElementById("selCount").textContent = n ? `${n} selected` : "";
-  document.getElementById("repInv").disabled = document.getElementById("repDev").disabled = false;
+  document.getElementById("repInv").disabled = document.getElementById("repDev").disabled =
+    document.getElementById("repPar").disabled = false;
 }
 function openReport(aud){
   const apns=[...selected];
@@ -808,6 +810,7 @@ document.getElementById("selAll").addEventListener("change",e=>{
     if(b.checked) selected.add(b.dataset.apn); else selected.delete(b.dataset.apn);});
   syncSel();});
 document.getElementById("repInv").addEventListener("click",()=>openReport("investor"));
+document.getElementById("repPar").addEventListener("click",()=>openReport("partner"));
 document.getElementById("repDev").addEventListener("click",()=>openReport("developer"));
 document.getElementById("exportBtn").addEventListener("click",()=>{
   const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),water_state:val("fWater"),
