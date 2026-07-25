@@ -2808,10 +2808,20 @@ def admin_fit_hazard(token: str, sample_vacant: float = 0.06, sample_built: floa
 # USGS 3DEP and turned into a slope proxy: vertical range over the parcel's
 # characteristic width. Subdivision economics break somewhere around 15%, and
 # above 30% the ground is cut-and-fill or nothing.
+# Three independent elevation services, tried in order. The first version bet
+# the whole job on one endpoint and reported "rejected at every size tried",
+# which threw away the server's actual complaint. Errors are now preserved and
+# surfaced.
 USGS_3DEP = ("https://elevation.nationalmap.gov/arcgis/rest/services/"
              "3DEPElevation/ImageServer/getSamples")
+OPEN_METEO = "https://api.open-meteo.com/v1/elevation"
+OPEN_ELEV = "https://api.open-elevation.com/api/v1/lookup"
+ELEV_SOURCES = [
+    {"kind": "openmeteo", "url": OPEN_METEO, "batch": 100},
+    {"kind": "arcgis",    "url": USGS_3DEP,  "batch": 200},
+    {"kind": "openelev",  "url": OPEN_ELEV,  "batch": 200},
+]
 TERRAIN_POINTS = 12          # samples per parcel
-TERRAIN_BATCH = 240          # points per request
 
 TERRAIN_SAMPLE_SQL = """
 SELECT p.apn, ST_X(g.geom) AS lon, ST_Y(g.geom) AS lat
@@ -2823,76 +2833,141 @@ WHERE p.geom IS NOT NULL AND p.acres >= %(min_acres)s
 ORDER BY p.apn
 """
 
-def _sample_elevations(pts, url=USGS_3DEP):
-    """pts: [(lon,lat), ...] -> [metres or None]. One multipoint request.
+def _sample_elevations(pts, src):
+    """pts: [(lon,lat), ...] -> [metres or None]. Raises RuntimeError with the
+    server's own message so a failure can be diagnosed rather than guessed at."""
+    kind, url = src["kind"], src["url"]
+    if kind == "openmeteo":
+        r = requests.get(url, timeout=120, headers={"User-Agent": BROWSER_UA},
+                         params={"latitude": ",".join(f"{y:.6f}" for _, y in pts),
+                                 "longitude": ",".join(f"{x:.6f}" for x, _ in pts)})
+        try:
+            j = r.json()
+        except Exception:
+            raise RuntimeError(f"open-meteo {r.status_code}: {r.text[:160]}")
+        if j.get("error") or "elevation" not in j:
+            raise RuntimeError(f"open-meteo: {str(j.get('reason') or j)[:160]}")
+        vals = j["elevation"]
+        return [(float(v) if v is not None else None) for v in vals][:len(pts)]
 
-    POST, not GET: a few hundred points of geometry JSON in a query string
-    exceeds the server's URI limit and comes back as a 414 with an HTML body.
-    ArcGIS REST accepts the same parameters form-encoded.
-    """
-    geom = {"points": [[x, y] for x, y in pts],
-            "spatialReference": {"wkid": 4326}}
-    body = {"geometry": json.dumps(geom),
-            "geometryType": "esriGeometryMultipoint",
-            "returnFirstValueOnly": "true",
-            "interpolation": "RSP_BilinearInterpolation",
-            "f": "json"}
-    r = requests.post(url, data=body, timeout=180,
-                      headers={"User-Agent": BROWSER_UA})
+    if kind == "openelev":
+        r = requests.post(url, timeout=180, headers={"User-Agent": BROWSER_UA,
+                                                     "Content-Type": "application/json"},
+                          data=json.dumps({"locations": [{"latitude": y, "longitude": x}
+                                                         for x, y in pts]}))
+        try:
+            j = r.json()
+        except Exception:
+            raise RuntimeError(f"open-elevation {r.status_code}: {r.text[:160]}")
+        res = j.get("results")
+        if not res:
+            raise RuntimeError(f"open-elevation: {str(j)[:160]}")
+        return [(float(o.get("elevation")) if o.get("elevation") is not None else None)
+                for o in res][:len(pts)]
+
+    # ArcGIS ImageServer getSamples. POST, because a few hundred points of
+    # geometry JSON in a query string exceeds the URI limit and returns 414.
+    geom = {"points": [[x, y] for x, y in pts], "spatialReference": {"wkid": 4326}}
+    r = requests.post(url, timeout=180, headers={"User-Agent": BROWSER_UA},
+                      data={"geometry": json.dumps(geom),
+                            "geometryType": "esriGeometryMultipoint",
+                            "returnFirstValueOnly": "true",
+                            "f": "json"})
     try:
         j = r.json()
     except Exception:
-        raise RuntimeError(f"3DEP {r.status_code}: {r.text[:140]}")
+        raise RuntimeError(f"3DEP {r.status_code}: {r.text[:160]}")
     if j.get("error"):
-        raise RuntimeError(f"3DEP error: {str(j['error'])[:160]}")
+        raise RuntimeError(f"3DEP: {str(j['error'])[:160]}")
     out = [None] * len(pts)
-    for s in j.get("samples", []):
+    for smp in j.get("samples", []):
         try:
-            idx = int(s.get("locationId", -1))
-            v = float(s.get("value"))
+            idx = int(smp.get("locationId", -1))
+            v = float(smp.get("value"))
             if 0 <= idx < len(out) and v > -1000:
                 out[idx] = v
         except (TypeError, ValueError):
             continue
+    if not any(v is not None for v in out):
+        raise RuntimeError("3DEP returned no usable samples")
     return out
+
+
+def _pick_elev_source():
+    """First source that answers correctly at its own batch size, checked on two
+    known points padded to a real payload."""
+    known = [(-112.074, 33.448), (-112.048, 33.335)]   # downtown, South Mountain
+    errs = []
+    for src in ELEV_SOURCES:
+        pad = [(-112.20 + 0.001 * i, 33.40 + 0.001 * (i % 30))
+               for i in range(src["batch"] - len(known))]
+        try:
+            v = _sample_elevations(known + pad, src)
+            ft = [round(x * 3.28084) if x is not None else None for x in v[:2]]
+            got = sum(1 for x in v if x is not None)
+            if (all(x is not None for x in ft) and ft[1] - ft[0] > 300
+                    and got > len(v) * 0.8):
+                return src, {"source": src["kind"], "downtown_ft": ft[0],
+                             "south_mountain_ft": ft[1], "batch": src["batch"],
+                             "values_returned": got}
+            errs.append(f"{src['kind']}: returned {got}/{len(v)} values, "
+                        f"downtown {ft[0]}, mountain {ft[1]}")
+        except Exception as e:
+            errs.append(f"{src['kind']}: {str(e)[:150]}")
+    return None, {"error": "no elevation source usable", "tried": errs}
+
 
 def run_terrain(min_acres=5.0):
     """Sample relief for every parcel at or above min_acres. Small parcels are
-    skipped: sampling a quarter-acre lot returns twelve readings of the same
-    flat spot and burns the request budget for nothing."""
+    skipped: sampling a quarter-acre lot returns twelve readings of the same flat
+    spot and burns the request budget for nothing."""
     global SIGNAL_STATUS
-    SIGNAL_STATUS = {"state": "running", "kind": "terrain", "detail": "listing parcels"}
+    SIGNAL_STATUS = {"state": "running", "kind": "terrain", "detail": "choosing a source"}
     try:
+        src, info = _pick_elev_source()
+        if not src:
+            SIGNAL_STATUS = {"state": "error", "kind": "terrain", **info}
+            return
+        SIGNAL_STATUS.update(source=src["kind"], detail="listing parcels")
         rows = qall(TERRAIN_SAMPLE_SQL, {"n": TERRAIN_POINTS, "min_acres": min_acres})
         if not rows:
             SIGNAL_STATUS = {"state": "error", "kind": "terrain",
                              "detail": f"no parcels at or above {min_acres} acres"}
             return
+        batch = src["batch"]
         n_parcels = len({r["apn"] for r in rows})
-        SIGNAL_STATUS.update(detail=f"{n_parcels:,} parcels, {len(rows):,} sample points")
-        elev = {}
-        done = 0
-        for i in range(0, len(rows), TERRAIN_BATCH):
-            chunk = rows[i:i + TERRAIN_BATCH]
+        SIGNAL_STATUS.update(detail=f"{n_parcels:,} parcels, {len(rows):,} points "
+                                    f"via {src['kind']}")
+        elev, done, last_err, skipped = {}, 0, None, 0
+        for i in range(0, len(rows), batch):
+            chunk = rows[i:i + batch]
             vals = None
             for size in (len(chunk), max(1, len(chunk) // 4), 25):
                 try:
                     vals = []
                     for j0 in range(0, len(chunk), size):
                         vals += _sample_elevations(
-                            [(r["lon"], r["lat"]) for r in chunk[j0:j0 + size]])
+                            [(r["lon"], r["lat"]) for r in chunk[j0:j0 + size]], src)
                     break
-                except RuntimeError:
+                except Exception as e:
+                    last_err = str(e)[:180]
                     vals = None
-                    continue
             if vals is None:
-                raise RuntimeError("3DEP rejected this batch at every size tried")
-            for r, v in zip(chunk, vals):
-                if v is not None:
-                    elev.setdefault(r["apn"], []).append(v)
+                # one bad batch should not cost a 30-minute run
+                skipped += len(chunk)
+                if skipped > len(rows) * 0.25:
+                    SIGNAL_STATUS = {"state": "error", "kind": "terrain",
+                                     "source": src["kind"],
+                                     "detail": f"too many batches failed. Last error: {last_err}"}
+                    return
+            else:
+                for r, v in zip(chunk, vals):
+                    if v is not None:
+                        elev.setdefault(r["apn"], []).append(v)
             done += len(chunk)
             SIGNAL_STATUS.update(detail=f"sampled {done:,}/{len(rows):,} points, "
-                                        f"{len(elev):,} parcels with relief")
+                                        f"{len(elev):,} parcels"
+                                        + (f", {skipped:,} skipped" if skipped else ""))
         upd = []
         for apn, vs in elev.items():
             if len(vs) < 3:
@@ -2903,8 +2978,6 @@ def run_terrain(min_acres=5.0):
         with pool.connection() as c, c.cursor() as cur:
             cur.executemany("UPDATE parcels SET elev_min_ft=%s, elev_max_ft=%s, "
                             "relief_ft=%s WHERE apn=%s", upd)
-            # slope proxy: vertical range over the parcel's characteristic width,
-            # which is the side of a square of the same area
             cur.execute("""
               UPDATE parcels SET slope_pct = round(
                 (100.0 * relief_ft / NULLIF(sqrt(acres*43560.0),0))::numeric, 1)
@@ -2916,39 +2989,43 @@ def run_terrain(min_acres=5.0):
                                     round(percentile_cont(0.9) WITHIN GROUP (ORDER BY slope_pct)::numeric,1),
                                     count(*) FILTER (WHERE slope_pct >= 25)
                              FROM parcels WHERE slope_pct IS NOT NULL""").fetchone()
-        SIGNAL_STATUS = {"state": "done", "kind": "terrain", "parcels_scored": d[0],
+        SIGNAL_STATUS = {"state": "done", "kind": "terrain", "source": src["kind"],
+                         "parcels_scored": d[0],
                          "slope_pct_p50": float(d[1]) if d[1] is not None else None,
                          "slope_pct_p90": float(d[2]) if d[2] is not None else None,
-                         "steep_over_25pct": d[3], "min_acres": min_acres}
+                         "steep_over_25pct": d[3], "points_skipped": skipped,
+                         "min_acres": min_acres}
     except Exception as e:
-        SIGNAL_STATUS = {"state": "error", "kind": "terrain", "detail": str(e)[:220]}
+        SIGNAL_STATUS = {"state": "error", "kind": "terrain", "detail": str(e)[:250]}
 
 @app.get("/admin/probe_terrain")
 def admin_probe_terrain(token: str):
-    """Sample two known points before committing to a long run: a flat spot in
-    central Phoenix and a peak in South Mountain. If the second is not several
-    hundred feet above the first, the elevation service is not answering."""
+    """Test every elevation source at the batch size the job actually uses, and
+    report each one's own error rather than a summary. Checks two known points:
+    downtown Phoenix against a South Mountain peak."""
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
-    # Two known points for correctness, then padded to a full batch so the probe
-    # exercises the same request size the job uses. The first version sent two
-    # points, passed, and the job then failed with a 414 on 240.
-    pts = [(-112.074, 33.448), (-112.048, 33.335)]
-    pad = [(-112.20 + 0.001 * i, 33.40 + 0.001 * (i % 30))
-           for i in range(TERRAIN_BATCH - len(pts))]
-    try:
-        v = _sample_elevations(pts + pad)
-        ft = [round(x * 3.28084) if x is not None else None for x in v[:2]]
-        got = sum(1 for x in v if x is not None)
-        ok = all(x is not None for x in ft) and (ft[1] - ft[0]) > 300 and got > len(v) * 0.8
-        return {"downtown_phoenix_ft": ft[0], "south_mountain_ft": ft[1],
-                "batch_size_tested": len(pts + pad),
-                "values_returned": got, "usable": ok,
-                "verdict": ("run /admin/terrain?token=YOUR_TOKEN" if ok
-                            else "elevation service not returning usable values at this batch size")}
-    except Exception as e:
-        return {"error": str(e)[:220], "usable": False,
-                "batch_size_tested": TERRAIN_BATCH}
+    known = [(-112.074, 33.448), (-112.048, 33.335)]
+    out = []
+    for src in ELEV_SOURCES:
+        pad = [(-112.20 + 0.001 * i, 33.40 + 0.001 * (i % 30))
+               for i in range(src["batch"] - len(known))]
+        rec = {"source": src["kind"], "url": src["url"], "batch_tested": src["batch"]}
+        try:
+            v = _sample_elevations(known + pad, src)
+            ft = [round(x * 3.28084) if x is not None else None for x in v[:2]]
+            got = sum(1 for x in v if x is not None)
+            rec.update(downtown_phoenix_ft=ft[0], south_mountain_ft=ft[1],
+                       values_returned=got,
+                       usable=bool(all(x is not None for x in ft)
+                                   and ft[1] - ft[0] > 300 and got > len(v) * 0.8))
+        except Exception as e:
+            rec.update(error=str(e)[:200], usable=False)
+        out.append(rec)
+    good = [o["source"] for o in out if o.get("usable")]
+    return {"sources": out, "usable": good,
+            "verdict": ("run /admin/terrain?token=YOUR_TOKEN" if good
+                        else "no elevation source usable; see the per-source errors above")}
 
 @app.get("/admin/terrain")
 def admin_terrain(token: str, min_acres: float = 5.0):
