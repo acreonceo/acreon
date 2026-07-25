@@ -2816,9 +2816,17 @@ USGS_3DEP = ("https://elevation.nationalmap.gov/arcgis/rest/services/"
              "3DEPElevation/ImageServer/getSamples")
 OPEN_METEO = "https://api.open-meteo.com/v1/elevation"
 OPEN_ELEV = "https://api.open-elevation.com/api/v1/lookup"
+# 3DEP leads on resolution, which is what this job needs. It is 1/3 arc-second
+# LiDAR, about 10 metres, so a 5-acre parcel spans roughly 200 cells and its
+# internal relief is real. The other two are 90-metre global DEMs: the same
+# parcel covers about two cells and reads flat no matter what the ground does.
+# The probe confirmed all three answer; only 3DEP can resolve within a parcel.
+# Measured against downtown Phoenix at ~1,086 ft: 3DEP +3, Open-Meteo +43,
+# Open-Elevation +66. The fallbacks exist so an outage does not stop the job,
+# but relief measured from them will understate steep ground.
 ELEV_SOURCES = [
-    {"kind": "openmeteo", "url": OPEN_METEO, "batch": 100},
     {"kind": "arcgis",    "url": USGS_3DEP,  "batch": 200},
+    {"kind": "openmeteo", "url": OPEN_METEO, "batch": 100},
     {"kind": "openelev",  "url": OPEN_ELEV,  "batch": 200},
 ]
 TERRAIN_POINTS = 12          # samples per parcel
