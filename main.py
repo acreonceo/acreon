@@ -1479,6 +1479,67 @@ def admin_ingest_county(token: str, all: bool = False):
     return {"state": "started", "mode": "county-all", "include_all": all,
             "note": "full-county rebuild; pages the whole layer; poll /admin/status?token=YOUR_TOKEN"}
 
+@app.get("/admin/reclassify")
+def admin_reclassify(token: str):
+    """Recompute owner_type and absentee from data already in the table.
+
+    A full /admin/ingest_county DELETEs parcels on its first flush, which drops
+    every column written by a later job: edge_miles, hazard_fitted, water_state,
+    carry_rate, landlocked and flood_zone. Re-running the whole chain to fix two
+    classifier columns is not worth it when owner and mail_address are already
+    stored locally. This touches those two columns and the target score that
+    depends on them, and nothing else.
+    """
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if INGEST_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": INGEST_STATUS}
+    threading.Thread(target=run_reclassify, daemon=True).start()
+    return {"state": "started", "mode": "reclassify",
+            "note": "in-place; no county fetch, no derived columns lost; poll /admin/status?token=YOUR_TOKEN"}
+
+def run_reclassify():
+    global INGEST_STATUS
+    import transform as T          # imported locally, as everywhere else in this file
+    INGEST_STATUS = {"state": "running", "mode": "reclassify", "detail": "reading owners"}
+    try:
+        with pool.connection() as c:
+            before = dict(c.execute(
+                "SELECT coalesce(owner_type,'?'), count(*) FROM parcels GROUP BY 1").fetchall())
+            before["absentee_true"] = c.execute(
+                "SELECT count(*) FROM parcels WHERE absentee IS TRUE").fetchone()[0]
+            rows = c.execute("SELECT apn, owner, mail_address FROM parcels").fetchall()
+        INGEST_STATUS.update(detail=f"classifying {len(rows):,} parcels")
+        upd = []
+        for apn, owner, mail in rows:
+            ot, ab = T.classify_owner_type(owner, None, mail)
+            upd.append((ot, ab, apn))
+        INGEST_STATUS.update(detail="writing")
+        with pool.connection() as c, c.cursor() as cur:
+            cur.executemany(
+                "UPDATE parcels SET owner_type=%s, absentee=%s WHERE apn=%s", upd)
+            # target_score carries the owner-type multiplier, so it moves with it
+            cur.execute("""
+              UPDATE parcels p SET target_score = round(
+                  0.5*coalesce(p.growth_score,0)
+                + 0.3*greatest(0,least(100,(coalesce(p.tenure,0)-2)*4.2))
+                      * CASE p.owner_type WHEN 'Builder/Developer' THEN 0.35
+                                          WHEN 'Investor' THEN 0.8 ELSE 1.0 END
+                + 0.2*CASE p.use WHEN 'Vacant' THEN 100
+                                 WHEN 'Agricultural' THEN 85 ELSE 25 END, 1)""")
+            c.commit()
+        with pool.connection() as c:
+            after = dict(c.execute(
+                "SELECT coalesce(owner_type,'?'), count(*) FROM parcels GROUP BY 1").fetchall())
+            after["absentee_true"] = c.execute(
+                "SELECT count(*) FROM parcels WHERE absentee IS TRUE").fetchone()[0]
+            after["absentee_unknown"] = c.execute(
+                "SELECT count(*) FROM parcels WHERE absentee IS NULL").fetchone()[0]
+        INGEST_STATUS = {"state": "done", "mode": "reclassify",
+                         "parcels": len(rows), "before": before, "after": after}
+    except Exception as e:
+        INGEST_STATUS = {"state": "error", "mode": "reclassify", "detail": str(e)[:220]}
+
 @app.get("/admin/rebuild_zones")
 def admin_rebuild_zones(token: str):
     if token != os.environ.get("ADMIN_TOKEN", ""):
