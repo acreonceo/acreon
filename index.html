@@ -114,6 +114,7 @@
         <div><label>Owner location</label><select id="fAbs"><option value="">Any</option><option value="1">Out of state only</option></select></div>
         <div><label>Sort by</label><select id="fSort"><option value="value_score">Value score</option><option value="soonest">Soonest to convert</option><option value="value_total">Total value</option><option value="acq_score">Acquirability</option></select></div>
       </div>
+      <div id="mapSync" style="font-size:11px;line-height:1.35;color:var(--ink-soft);margin:2px 0 8px"></div>
       <div style="display:flex;gap:6px;align-items:center;margin:2px 0 8px">
         <label style="font-size:11.5px;color:var(--ink-soft);display:flex;align-items:center;gap:5px;cursor:pointer">
           <input type="checkbox" id="selAll"> select all shown</label>
@@ -367,8 +368,27 @@ function parcelColorExpr(){
 }
 // The map shows the same population the Targets list does. Filtering the list
 // without filtering the map left you reading two different universes.
+// The map and the Targets list must resolve to the same population. Every
+// clause below has a counterpart in the /targets WHERE builder in main.py; if
+// you add a filter to one, add it to the other or the two views drift apart.
+// Model-derived filters (score, years to convert) cannot be expressed here
+// because they do not exist until the parcel is valued server-side, so they are
+// applied by whitelisting the APNs the list returned. See gateApns.
+let gateApns=null;   // non-null only while a model-derived filter is active
+
 function mapFilterExpr(){
   const f=["all"];
+  // --- base population: identical to the fixed clauses in targets() ---
+  f.push(["==",["get","status"],"Off-market"]);
+  f.push(["in",["get","use"],["literal",["Vacant","Agricultural"]]]);
+  f.push([">",["to-number",["get","acres"],0],0]);
+  f.push([">",["to-number",["get","est"],0],0]);
+  // builders are not sellers, public bodies do not sell, and a nominal
+  // assessment is not a price
+  f.push(["!=",["get","owner_type"],"Builder/Developer"]);
+  f.push(["==",["to-number",["get","public_owner"],0],0]);
+  f.push(["==",["to-number",["get","price_ok"],0],1]);
+  // --- user filters ---
   const use=val("fUse");        if(use) f.push(["==",["get","use"],use]);
   const ot=val("fOwner");       if(ot)  f.push(["==",["get","owner_type"],ot]);
   const ws=val("fWater");       if(ws)  f.push(["==",["get","water_state"],ws]);
@@ -376,16 +396,15 @@ function mapFilterExpr(){
   const mx=+val("fAcresMax")||0;if(mx)  f.push(["<=",["to-number",["get","acres"],0],mx]);
   const tn=+val("fTen")||0;     if(tn)  f.push([">=",["to-number",["get","tenure"],0],tn]);
   const tot=+val("fTotal")||0;  if(tot) f.push(["<=",["to-number",["get","est"],0],tot]);
-  const ppa=+val("fPpa")||0;
-  const perAcre=["/",["to-number",["get","est"],0],["max",0.01,["to-number",["get","acres"],1]]];
-  if(ppa) f.push(["<=",perAcre,ppa]);
-  if(val("fAbs")) f.push(["==",["get","absentee"],true]);
-  // same two exclusions the list applies: builders are not sellers, and
-  // nominal assessments are not prices
-  f.push(["!=",["get","owner_type"],"Builder/Developer"]);
-  f.push(["==",["to-number",["get","price_ok"],0],1]);
+  // ppa is computed in the tile on the same basis the valuation uses, so
+  // agricultural land compares on its vacant-land reference, not its use value
+  const ppa=+val("fPpa")||0;    if(ppa) f.push(["<=",["to-number",["get","ppa"],0],ppa]);
+  if(val("fAbs")) f.push(["==",["to-number",["get","absentee"],0],1]);
+  if(gateApns) f.push(["in",["get","apn"],["literal",gateApns]]);
   return f;
 }
+// True when a filter is active that only exists after server-side valuation.
+const modelFiltersOn=()=>!!(+val("fScore")||+val("fYears"));
 function applyMapFilter(){
   const f=mapFilterExpr();
   try{
@@ -713,8 +732,18 @@ function markDirty(){ targetsDirty=true; blocksDirty=true;
   if(document.getElementById("pane-targets").style.display!=="none") loadTargets();
   if(document.getElementById("pane-blocks").style.display!=="none") loadBlocks(); }
 
+// A broad filter set values tens of thousands of parcels and can take seconds,
+// while a narrow one returns almost at once. Changing several filters in a row
+// therefore used to let an older, slower response land last and repaint the
+// list for a filter set the user had already moved past. Every request now
+// carries a sequence number and anything stale is discarded on arrival.
+let targetsSeq=0, targetsInFlight=null;
+
 async function loadTargets(){
   const el=document.getElementById("targetList");
+  const seq=++targetsSeq;
+  if(targetsInFlight) targetsInFlight.abort();
+  const ctl=new AbortController(); targetsInFlight=ctl;
   el.innerHTML=`<div class="empty">Valuing parcels…</div>`;
   const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),water_state:val("fWater"),
     min_acres:val("fAcres"),max_acres:val("fAcresMax"),min_tenure:val("fTen"),
@@ -722,7 +751,15 @@ async function loadTargets(){
     max_years:val("fYears"),absentee:val("fAbs")?"true":"false",sort:val("fSort"),
     limit:80,...modelParams()});
   let rows=[];
-  try{ rows=await (await fetch(API+"/targets?"+pr)).json(); }catch(e){ el.innerHTML=`<div class="empty">Could not load targets.</div>`; return; }
+  try{ rows=await (await fetch(API+"/targets?"+pr,{signal:ctl.signal})).json(); }
+  catch(e){
+    if(e.name==="AbortError"||seq!==targetsSeq) return;   // superseded, leave the newer request alone
+    el.innerHTML=`<div class="empty">Could not load targets.</div>`; syncMapCaption(0); return; }
+  if(seq!==targetsSeq) return;                            // a newer request already answered
+  targetsInFlight=null;
+  gateApns=modelFiltersOn()?rows.map(r=>r.apn):null;
+  applyMapFilter();
+  syncMapCaption(rows.length);
   if(!rows.length){ el.innerHTML=`<div class="empty">No parcels match these filters.</div>`; return; }
   el.innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
@@ -743,8 +780,23 @@ async function loadTargets(){
   if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
     geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.value_ratio||0}}))});
 }
+// States plainly whether the shaded parcels are the same set as the list, so a
+// mismatch is never left for the user to discover by counting.
+function syncMapCaption(n){
+  const el=document.getElementById("mapSync"); if(!el) return;
+  if(modelFiltersOn())
+    el.textContent=`Map is showing the ${n} ranked parcels below. Score and timing are model outputs, so the map can only show them once the list is valued.`;
+  else if(n>=80)
+    el.textContent="Map shows every parcel matching these filters. The list is capped at the top 80 by the chosen sort.";
+  else
+    el.textContent=`Map and list are showing the same ${n} parcels.`;
+}
 ["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fSort"]
-  .forEach(id=>document.getElementById(id).addEventListener("change",()=>{ applyMapFilter(); loadTargets(); }));
+  .forEach(id=>document.getElementById(id).addEventListener("change",()=>{
+    // clear a stale whitelist first, otherwise the previous list's APNs keep
+    // constraining the map while the new query is still running
+    if(!modelFiltersOn()) gateApns=null;
+    applyMapFilter(); loadTargets(); }));
 document.getElementById("selAll").addEventListener("change",e=>{
   document.querySelectorAll("#targetList .selbox").forEach(b=>{
     b.checked=e.target.checked;
@@ -756,7 +808,7 @@ document.getElementById("exportBtn").addEventListener("click",()=>{
   const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),water_state:val("fWater"),
     min_acres:val("fAcres"),max_acres:val("fAcresMax"),min_tenure:val("fTen"),
     max_price_per_acre:val("fPpa"),max_total_price:val("fTotal"),min_score:val("fScore"),
-    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",
+    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",sort:val("fSort"),
     limit:2000,...modelParams()});
   window.location.href=API+"/targets/export?"+p; });
 

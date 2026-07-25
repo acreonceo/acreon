@@ -174,37 +174,57 @@ def healthz():
 # --- MAP TILES -------------------------------------------------------------
 # Zoom LOD: when zoomed out, only render meaningful land (drops built-out noise
 # and keeps tiles small across 1.8M parcels).
+# Every screening attribute the Targets list can filter on has to ride along in
+# the tile, or the map silently shows a different population than the list.
+# ppa mirrors the price basis in _valued(): agricultural land is assessed at a
+# statutory use value, so it is repriced off vacant land in the same ZIP, and
+# marked unpriceable when that reference is missing.
 TILE_SQL = """
 WITH b AS (SELECT ST_TileEnvelope(%(z)s,%(x)s,%(y)s) g)
 SELECT ST_AsMVT(t,'parcels') FROM (
-  SELECT p.apn, p.use, p.status, p.acres, p.zcta,
-         (CASE WHEN p.acres > 0 AND p.est > 0
-                AND p.est / p.acres >= 250
-                AND (z.median_price_per_acre IS NULL
-                     OR p.est / p.acres >= 0.15 * z.median_price_per_acre)
+  SELECT s.apn, s.use, s.status, s.acres, s.zcta,
+         (CASE WHEN s.acres > 0 AND s.est > 0 AND s.ppa IS NOT NULL
+                AND s.ppa >= %(min_ppa)s
+                AND (s.zmed IS NULL OR s.ppa >= 0.15 * s.zmed)
                THEN 1 ELSE 0 END) AS price_ok,
-         coalesce(p.tenure,0)::int AS tenure,
-         p.owner_type,
-         p.est::bigint AS est,
-         COALESCE(p.water_state,'C') AS water_state,
-         COALESCE(p.landlocked,false) AS landlocked,
-         COALESCE(p.flood_zone,'') AS flood_zone,
-         round(COALESCE(p.carry_rate,0.003)::numeric,4)::float8 AS carry_rate,
-         round(p.target_score)::int AS target_score,
-         round(p.growth_score)::int AS growth_score,
-         ST_AsMVTGeom(ST_Transform(p.geom,3857), b.g) geom
-  FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta, b
-  WHERE ST_Transform(p.geom,3857) && b.g
-    AND ( %(z)s >= 13
-          OR (p.use IN ('Vacant','Agricultural')
-              AND p.acres >= CASE WHEN %(z)s < 10 THEN 20
-                                  WHEN %(z)s < 12 THEN 5 ELSE 1 END) )
+         round(COALESCE(s.ppa,0))::bigint AS ppa,
+         s.tenure, s.owner_type, s.est, s.water_state,
+         s.absentee, s.public_owner,
+         s.landlocked, s.flood_zone, s.carry_rate, s.target_score, s.growth_score,
+         s.geom
+  FROM (
+    SELECT p.apn, p.use, p.status, p.acres, p.zcta,
+           (CASE WHEN p.acres <= 0 OR p.est <= 0 THEN NULL
+                 WHEN p.use = 'Agricultural'
+                   THEN NULLIF(z.vacant_price_per_acre, 0)
+                 ELSE p.est / p.acres END) AS ppa,
+           z.median_price_per_acre AS zmed,
+           coalesce(p.tenure,0)::int AS tenure,
+           p.owner_type,
+           p.est::bigint AS est,
+           COALESCE(p.water_state,'C') AS water_state,
+           (CASE WHEN p.absentee IS TRUE THEN 1 ELSE 0 END) AS absentee,
+           (CASE WHEN coalesce(p.owner,'') ILIKE ANY(%(pub)s) THEN 1 ELSE 0 END) AS public_owner,
+           COALESCE(p.landlocked,false) AS landlocked,
+           COALESCE(p.flood_zone,'') AS flood_zone,
+           round(COALESCE(p.carry_rate,0.003)::numeric,4)::float8 AS carry_rate,
+           round(p.target_score)::int AS target_score,
+           round(p.growth_score)::int AS growth_score,
+           ST_AsMVTGeom(ST_Transform(p.geom,3857), b.g) geom
+    FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta, b
+    WHERE ST_Transform(p.geom,3857) && b.g
+      AND ( %(z)s >= 13
+            OR (p.use IN ('Vacant','Agricultural')
+                AND p.acres >= CASE WHEN %(z)s < 10 THEN 20
+                                    WHEN %(z)s < 12 THEN 5 ELSE 1 END) )
+  ) s
 ) t
 """
 
 @app.get("/tiles/{z}/{x}/{y}.mvt")
 def tiles(z: int, x: int, y: int):
-    row = q1(TILE_SQL, {"z": z, "x": x, "y": y})
+    row = q1(TILE_SQL, {"z": z, "x": x, "y": y,
+                        "pub": PUBLIC_OWNER_PATTERNS, "min_ppa": MIN_CREDIBLE_PPA})
     data = row[0] if row and row[0] else b""
     return Response(bytes(data), media_type="application/vnd.mapbox-vector-tile")
 
@@ -324,6 +344,58 @@ def _candidates(where_sql, params):
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
       WHERE {where_sql}
     """, params)
+
+# --- SHARED SCREEN ---------------------------------------------------------
+# The Targets list, the CSV export and the map all have to resolve to the same
+# population. The list and export build it here so the two cannot drift; the map
+# mirrors these clauses in mapFilterExpr() in index.html, and the tile carries a
+# property for every one of them.
+SORT_KEYS = {
+    "value_ratio":   lambda r: r["value_ratio"] or 0,
+    "value_score":   lambda r: r["value_score"] or 0,
+    "annual_return": lambda r: r["annual_return"] or -1,
+    "value_total":   lambda r: r["value_total"] or 0,
+    "acq_score":     lambda r: r["acq_score"] or 0,
+    "soonest":       lambda r: -(r["p50_years"] or 999),
+}
+
+def _screen_where(use, owner_type, water_state, min_acres, max_acres, min_tenure,
+                  absentee, city, zcta, max_total_price, include_public, include_builders):
+    where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
+             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", "p.est > 0", "p.acres > 0"]
+    args = [min_acres, min_tenure]
+    if use:          where.append("p.use = %s");          args.append(use)
+    if owner_type:   where.append("p.owner_type = %s");   args.append(owner_type)
+    if water_state:  where.append("COALESCE(p.water_state,'C') = %s"); args.append(water_state)
+    if max_acres:    where.append("p.acres <= %s");       args.append(max_acres)
+    if absentee:     where.append("p.absentee IS TRUE")
+    if city:         where.append("p.city ILIKE %s");     args.append(f"%{city}%")
+    if zcta:         where.append("p.zcta = %s");         args.append(zcta)
+    if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
+    if not include_public:
+        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
+    if not include_builders:
+        # A homebuilder that already assembled the site is not a seller: they
+        # bought it to build on. Their land is real and stays on the map, but it
+        # does not belong in an acquisition list.
+        where.append("coalesce(p.owner_type,'') <> 'Builder/Developer'")
+    return " AND ".join(where), tuple(args)
+
+def _screen_rank(vals, include_unpriced, min_ratio, max_price_per_acre,
+                 min_score, max_years, sort, limit):
+    """Filters that only exist once a parcel has been valued, then the ranking."""
+    if not include_unpriced:
+        vals = [r for r in vals if r.get("price_reliable")]
+    if min_ratio:
+        vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
+    if max_price_per_acre:
+        vals = [r for r in vals if (r["price_per_acre"] or 0) <= max_price_per_acre]
+    if min_score:
+        vals = [r for r in vals if (r["value_score"] or 0) >= min_score]
+    if max_years:
+        vals = [r for r in vals if r["p50_years"] and r["p50_years"] <= max_years]
+    vals.sort(key=SORT_KEYS.get(sort, SORT_KEYS["value_ratio"]), reverse=True)
+    return vals[:limit]
 
 def _valued(rows, p, horizon=10):
     """Attach V, V/P, timing and acquisition score. The hazard path depends only
@@ -641,48 +713,17 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres
             min_ratio: float = 0, horizon: int = 10,
             lambda_p: float = None, h_max: float = None, g_d: float = None,
             rho: float = None, sort: str = "value_score", limit: int = 100):
-    where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
-             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", "p.est > 0", "p.acres > 0"]
-    args = [min_acres, min_tenure]
-    if use:          where.append("p.use = %s");          args.append(use)
-    if owner_type:   where.append("p.owner_type = %s");   args.append(owner_type)
-    if water_state:  where.append("COALESCE(p.water_state,'C') = %s"); args.append(water_state)
-    if max_acres:    where.append("p.acres <= %s");       args.append(max_acres)
-    if absentee:     where.append("p.absentee IS TRUE")
-    if city:         where.append("p.city ILIKE %s");     args.append(f"%{city}%")
-    if zcta:         where.append("p.zcta = %s");         args.append(zcta)
-    if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
-    if not include_public:
-        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
-    if not include_builders:
-        # A homebuilder that already assembled the site is not a seller: they
-        # bought it to build on. Their land is real and stays on the map, but it
-        # does not belong in an acquisition list.
-        where.append("coalesce(p.owner_type,'') <> 'Builder/Developer'")
-    rows = _candidates(" AND ".join(where), tuple(args))
+    where, args = _screen_where(use, owner_type, water_state, min_acres, max_acres,
+                                min_tenure, absentee, city, zcta, max_total_price,
+                                include_public, include_builders)
+    rows = _candidates(where, args)
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
-    if not include_unpriced:
-        vals = [r for r in vals if r.get("price_reliable")]
-    if min_ratio:
-        vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
-    if max_price_per_acre:
-        vals = [r for r in vals if (r["price_per_acre"] or 0) <= max_price_per_acre]
-    if min_score:
-        vals = [r for r in vals if (r["value_score"] or 0) >= min_score]
-    if max_years:
-        vals = [r for r in vals if r["p50_years"] and r["p50_years"] <= max_years]
-    keyf = {"value_ratio": lambda r: r["value_ratio"] or 0,
-            "value_score": lambda r: r["value_score"] or 0,
-            "annual_return": lambda r: r["annual_return"] or -1,
-            "value_total": lambda r: r["value_total"] or 0,
-            "acq_score":   lambda r: r["acq_score"] or 0,
-            "soonest":     lambda r: -(r["p50_years"] or 999)}.get(sort,
-              lambda r: r["value_ratio"] or 0)
-    vals.sort(key=keyf, reverse=True)
+    vals = _screen_rank(vals, include_unpriced, min_ratio, max_price_per_acre,
+                        min_score, max_years, sort, limit)
     for r in vals:
         r.pop("mail_address", None)
-    return vals[:limit]
+    return vals
 
 @app.get("/report")
 def report(apns: str, audience: str = "investor", horizon: int = 10,
@@ -714,39 +755,14 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0, ma
                    rho: float = None, sort: str = "value_score", limit: int = 2000):
     """Outreach list with owner mailing addresses, ranked by the same model the
     map and target list use."""
-    where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
-             "p.acres >= %s", "coalesce(p.tenure,0) >= %s", "p.est > 0", "p.acres > 0"]
-    args = [min_acres, min_tenure]
-    if use:          where.append("p.use = %s");          args.append(use)
-    if owner_type:   where.append("p.owner_type = %s");   args.append(owner_type)
-    if water_state:  where.append("COALESCE(p.water_state,'C') = %s"); args.append(water_state)
-    if max_acres:    where.append("p.acres <= %s");       args.append(max_acres)
-    if absentee:     where.append("p.absentee IS TRUE")
-    if city:         where.append("p.city ILIKE %s");     args.append(f"%{city}%")
-    if zcta:         where.append("p.zcta = %s");         args.append(zcta)
-    if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
-    if not include_public:
-        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s))"); args.append(PUBLIC_OWNER_PATTERNS)
-    if not include_builders:
-        # A homebuilder that already assembled the site is not a seller: they
-        # bought it to build on. Their land is real and stays on the map, but it
-        # does not belong in an acquisition list.
-        where.append("coalesce(p.owner_type,'') <> 'Builder/Developer'")
-    rows = _candidates(" AND ".join(where), tuple(args))
+    where, args = _screen_where(use, owner_type, water_state, min_acres, max_acres,
+                                min_tenure, absentee, city, zcta, max_total_price,
+                                include_public, include_builders)
+    rows = _candidates(where, args)
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
-    if not include_unpriced:
-        vals = [r for r in vals if r.get("price_reliable")]
-    if min_ratio:
-        vals = [r for r in vals if (r["value_ratio"] or 0) >= min_ratio]
-    if max_price_per_acre:
-        vals = [r for r in vals if (r["price_per_acre"] or 0) <= max_price_per_acre]
-    if min_score:
-        vals = [r for r in vals if (r["value_score"] or 0) >= min_score]
-    if max_years:
-        vals = [r for r in vals if r["p50_years"] and r["p50_years"] <= max_years]
-    vals.sort(key=lambda r: r["value_ratio"] or 0, reverse=True)
-    vals = vals[:limit]
+    vals = _screen_rank(vals, include_unpriced, min_ratio, max_price_per_acre,
+                        min_score, max_years, sort, limit)
 
     WS = {"A": "A served/assured", "B": "B irrigated ag (SB1611 path)", "C": "C raw groundwater"}
     buf = io.StringIO(); w = csv.writer(buf)
