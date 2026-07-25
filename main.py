@@ -2252,12 +2252,28 @@ WHERE p.apn = sub.apn;
 # rate of a few percent, and the parcels it flagged hardest were exactly the
 # rural fringe ground this product is about. Access is now measured against a
 # road centreline layer, which does not care who the neighbours are.
-ROAD_URLS = [
-    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/2/query",
-    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/1/query",
-    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/0/query",
-    "https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services/Streets/MapServer/0/query",
+# TIGERweb's Transportation service carries primary and secondary roads only: a
+# probe over the whole county returned 99 features. Local streets in TIGER ship
+# as per-county files, not through that MapServer, so it cannot answer "is there
+# a road next to this parcel". OpenStreetMap can, it needs no key, and it is
+# queried by tag rather than by a layer number that moves when a server is
+# rebuilt. ArcGIS sources are kept as a fallback and discovered by name.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
 ]
+# Drivable ways only. Footways, cycleways and paths are not legal vehicle access
+# and would make genuinely enclosed ground read as served.
+OSM_HIGHWAY = ("motorway|trunk|primary|secondary|tertiary|unclassified|"
+               "residential|living_street|service|road")
+# Walked with ?f=json to list layers by name, so a moved layer index is visible
+# instead of silently returning nothing.
+ARCGIS_ROAD_SERVICES = [
+    "https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services",
+    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer",
+]
+ROAD_URLS = list(OVERPASS_MIRRORS)
 # Half-width of a section-line right of way plus margin. A parcel fronting a
 # road sits this far from its centreline, so anything beyond it has no frontage.
 LANDLOCK_ROAD_M = 40
@@ -2275,7 +2291,45 @@ FROM (
 WHERE p.apn = sub.apn AND sub.d IS NOT NULL;
 """
 
-def _fetch_roads(bbox, url, tiles=8, per_page=500):
+def _fetch_roads_overpass(bbox, url, tiles=8, pause=2.0):
+    """Yield road geometries as WKT from Overpass, one tile at a time.
+
+    `out geom` returns each way's coordinates inline, so no second pass for
+    nodes is needed. Tiles are sequential with a pause because Overpass runs a
+    slot queue and parallel requests get refused.
+    """
+    import time
+    x0, y0, x1, y1 = bbox
+    dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
+    boxes = [(x0 + i * dx, y0 + k * dy, x0 + (i + 1) * dx, y0 + (k + 1) * dy)
+             for i in range(tiles) for k in range(tiles)]
+    for n, (bx0, by0, bx1, by1) in enumerate(boxes, 1):
+        q = (f'[out:json][timeout:180];'
+             f'way["highway"~"^({OSM_HIGHWAY})$"]({by0},{bx0},{by1},{bx1});'
+             f'out geom;')
+        r = requests.post(url, data={"data": q}, timeout=300,
+                          headers={"User-Agent": BROWSER_UA})
+        if r.status_code in (429, 504):
+            time.sleep(30)
+            r = requests.post(url, data={"data": q}, timeout=300,
+                              headers={"User-Agent": BROWSER_UA})
+        try:
+            els = r.json().get("elements", [])
+        except Exception:
+            raise RuntimeError(f"overpass {r.status_code}: {r.text[:140]}")
+        wkt = []
+        for e in els:
+            g = e.get("geometry") or []
+            if len(g) < 2:
+                continue
+            pts = ",".join(f"{p['lon']} {p['lat']}" for p in g
+                           if p.get("lon") is not None and p.get("lat") is not None)
+            if pts.count(",") >= 1:
+                wkt.append(f"LINESTRING({pts})")
+        yield n, len(boxes), wkt
+        time.sleep(pause)
+
+def _fetch_roads_arcgis(bbox, url, tiles=8, per_page=500):
     """Yield road geometries in batches. Tiled because a county's worth of
     centrelines exceeds any single response, paged within each tile."""
     x0, y0, x1, y1 = bbox
@@ -2300,12 +2354,15 @@ def _fetch_roads(bbox, url, tiles=8, per_page=500):
                 raise RuntimeError(f"road source {r.status_code}: {r.text[:140]}")
             if not feats:
                 break
-            yield n, len(boxes), [f.get("geometry") for f in feats if f.get("geometry")]
+            yield n, len(boxes), [json.dumps(f["geometry"]) for f in feats if f.get("geometry")]
             if len(feats) < per_page:
                 break
             offset += len(feats)
 
-def run_ingest_roads(source=None):
+def run_ingest_roads(source=None, tiles=8):
+    """Load road centrelines. Overpass sources are queried by tag; anything else
+    is treated as an ArcGIS query endpoint. Each candidate is tried in turn and
+    the first that delivers a plausible count wins."""
     global SIGNAL_STATUS
     SIGNAL_STATUS = {"state": "running", "kind": "roads", "detail": "starting"}
     try:
@@ -2318,6 +2375,7 @@ def run_ingest_roads(source=None):
             return
         errors = []
         for url in ([source] if source else ROAD_URLS):
+            is_osm = "overpass" in url
             SIGNAL_STATUS.update(source=url, detail=f"trying {url.split('/')[2]}")
             written = 0
             try:
@@ -2325,20 +2383,25 @@ def run_ingest_roads(source=None):
                     cur.execute("DROP TABLE IF EXISTS roads")
                     cur.execute("CREATE TABLE roads(geom geometry(Geometry,4326))")
                     c.commit()
-                for i, total, batch in _fetch_roads(bb, url):
+                fetch = _fetch_roads_overpass if is_osm else _fetch_roads_arcgis
+                sql = ("INSERT INTO roads(geom) VALUES (ST_SetSRID(ST_GeomFromText(%s),4326))"
+                       if is_osm else
+                       "INSERT INTO roads(geom) VALUES "
+                       "(ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))")
+                for i, total, batch in fetch(bb, url, tiles=tiles):
                     if not batch:
+                        SIGNAL_STATUS.update(detail=f"tile {i}/{total}, {written:,} segments")
                         continue
                     with pool.connection() as c, c.cursor() as cur:
-                        cur.executemany(
-                            "INSERT INTO roads(geom) VALUES "
-                            "(ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))",
-                            [(json.dumps(g),) for g in batch])
+                        cur.executemany(sql, [(g,) for g in batch])
                         c.commit()
                     written += len(batch)
                     SIGNAL_STATUS.update(detail=f"tile {i}/{total}, {written:,} segments")
-                if written < 1000:
-                    errors.append(f"{url.split('/')[2]}: only {written} segments")
+                if written < 5000:
+                    errors.append(f"{url.split('/')[2]}: only {written} segments, "
+                                  "too sparse to measure access")
                     continue
+                SIGNAL_STATUS.update(detail="indexing")
                 with pool.connection() as c, c.cursor() as cur:
                     cur.execute("CREATE INDEX ON roads USING gist(geom)")
                     cur.execute("CREATE INDEX ON roads USING gist((geom::geography))")
@@ -2673,7 +2736,7 @@ def admin_fit_hazard(token: str, sample_vacant: float = 0.06, sample_built: floa
     return {"state": "started", "kind": "hazard", "next": "poll /admin/signals_status"}
 
 @app.get("/admin/ingest_roads")
-def admin_ingest_roads(token: str, source: str = None):
+def admin_ingest_roads(token: str, source: str = None, tiles: int = 8):
     """Pull road centrelines so access can be measured directly. Several sources
     are tried in turn because layer numbering on public servers moves; pass
     ?source= to force one."""
@@ -2681,35 +2744,60 @@ def admin_ingest_roads(token: str, source: str = None):
         raise HTTPException(403, "forbidden")
     if SIGNAL_STATUS.get("state") == "running":
         return {"state": "already_running", "status": SIGNAL_STATUS}
-    threading.Thread(target=run_ingest_roads, kwargs={"source": source}, daemon=True).start()
+    threading.Thread(target=run_ingest_roads,
+                     kwargs={"source": source, "tiles": tiles}, daemon=True).start()
     return {"state": "started", "kind": "roads", "next": "poll /admin/signals_status"}
 
 @app.get("/admin/probe_roads")
 def admin_probe_roads(token: str):
-    """Ask each candidate source for a count without writing anything, so a dead
-    layer is visible before a long ingest is started."""
+    """Test every road source without writing anything.
+
+    Overpass mirrors are asked for a count over a small city block. ArcGIS
+    servers are walked with ?f=json so their layers are listed BY NAME, because
+    a probe against a guessed layer number cannot tell an empty layer from a
+    renumbered one. TIGERweb answered a county-wide query with 99 features,
+    which is highways only, so name discovery is the way to find a real
+    centreline layer if one exists.
+    """
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
-    with pool.connection() as c:
-        bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
-                       "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
-    out = []
-    for url in ROAD_URLS:
+    out = {"overpass": [], "arcgis": []}
+    q = ('[out:json][timeout:25];'
+         f'way["highway"~"^({OSM_HIGHWAY})$"](33.44,-112.08,33.46,-112.06);out count;')
+    for url in OVERPASS_MIRRORS:
         try:
-            r = requests.get(url, timeout=45, headers={"User-Agent": BROWSER_UA},
-                             params={"where": "1=1", "returnCountOnly": "true", "f": "json",
-                                     "geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
-                                     "geometryType": "esriGeometryEnvelope", "inSR": "4326",
-                                     "spatialRel": "esriSpatialRelIntersects"})
-            j = r.json()
-            out.append({"url": url, "status": r.status_code,
-                        "count": j.get("count"), "error": str(j.get("error"))[:120] if j.get("error") else None})
+            r = requests.post(url, data={"data": q}, timeout=60,
+                              headers={"User-Agent": BROWSER_UA})
+            els = r.json().get("elements", [])
+            n = int((els[0].get("tags") or {}).get("ways", 0)) if els else 0
+            out["overpass"].append({"url": url, "status": r.status_code,
+                                    "ways_in_test_block": n, "usable": n > 20})
         except Exception as e:
-            out.append({"url": url, "error": str(e)[:120]})
-    usable = [o for o in out if isinstance(o.get("count"), int) and o["count"] > 1000]
-    return {"candidates": out,
-            "usable": [o["url"] for o in usable],
-            "recommended": usable[0]["url"] if usable else None}
+            out["overpass"].append({"url": url, "error": str(e)[:120]})
+    for root in ARCGIS_ROAD_SERVICES:
+        try:
+            r = requests.get(root, params={"f": "json"}, timeout=45,
+                             headers={"User-Agent": BROWSER_UA})
+            j = r.json()
+            layers = [{"id": l.get("id"), "name": l.get("name")}
+                      for l in (j.get("layers") or [])]
+            svcs = [x.get("name") for x in (j.get("services") or [])]
+            hits = [l for l in layers
+                    if any(k in (l["name"] or "").lower()
+                           for k in ("road", "street", "centerline", "centreline"))]
+            svc_hits = [x for x in svcs
+                        if any(k in (x or "").lower()
+                               for k in ("road", "street", "centerline", "transport"))]
+            out["arcgis"].append({"root": root, "status": r.status_code,
+                                  "layers": layers or None, "road_layers": hits or None,
+                                  "services": svc_hits or None})
+        except Exception as e:
+            out["arcgis"].append({"root": root, "error": str(e)[:120]})
+    good = [o["url"] for o in out["overpass"] if o.get("usable")]
+    out["recommended"] = good[0] if good else None
+    out["verdict"] = ("run /admin/ingest_roads?token=YOUR_TOKEN" if good else
+                      "no source usable; check the arcgis layer names listed above")
+    return out
 
 @app.get("/admin/screens")
 def admin_screens(token: str, flood: bool = False, flood_source: str = None):
