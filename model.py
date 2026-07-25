@@ -100,13 +100,36 @@ def hazard_base(growth_index, p):
 # neighbours are built parcels absent from the table, so nothing reads as
 # enclosed. The measure therefore flags rural land for being rural: it marked
 # 46,106 of 152,359 parcels, roughly 30%, where the true rate is a few percent.
-# It stays recorded but MUST NOT move value until it is validated against a road
-# centreline layer. Flip this on only after that check.
+# That measure has been replaced: access is now the distance from the parcel to
+# the nearest road centreline, which does not depend on which neighbours happen
+# to be in the table. Enable this only after /admin/screens reports a landlocked
+# share at or below 5%, which is the check the old measure could never pass.
 APPLY_LANDLOCK_DISCOUNT = False
 
 
+def landlock_factor(landlocked, road_ft=None):
+    """Discount for no road frontage, graded on how far access must be run.
+
+    Arizona provides a statutory private way of necessity, so a landlocked
+    parcel here is a cost-and-delay problem rather than a permanent defect. The
+    50-90% discounts commonly quoted come from states without that remedy, so a
+    flat 0.35 overstates it. What actually scales the cost is the length of the
+    easement or road that has to be built, which is the distance to the nearest
+    centreline.
+    """
+    if not landlocked or not APPLY_LANDLOCK_DISCOUNT:
+        return 1.0
+    if road_ft is None:
+        return 0.70
+    d = float(road_ft)
+    if d <= 300:    return 0.85     # a driveway
+    if d <= 1320:   return 0.70     # up to a quarter mile
+    if d <= 2640:   return 0.55     # up to half a mile
+    return 0.40                     # a genuine access problem
+
+
 def site_factor(landlocked, flood_zone, usable_radius_ft=None, largest_part_acres=None,
-                acres=None):
+                acres=None, road_ft=None):
     """Multiplier on what a developer will pay. Floodway land is not developable
     at any water status; the 1-percent-annual-chance zones are buildable with
     mitigation.
@@ -126,9 +149,7 @@ def site_factor(landlocked, flood_zone, usable_radius_ft=None, largest_part_acre
     the sum. Where it is materially smaller than total acreage, the difference
     is discounted rather than dropped, since fragments still carry option value.
     """
-    f = 1.0
-    if landlocked and APPLY_LANDLOCK_DISCOUNT:
-        f *= 0.35                      # no legal access: a 50-90% discount
+    f = landlock_factor(landlocked, road_ft)
     z = (flood_zone or "").upper()
     if z == "FLOODWAY":
         f *= 0.10                      # not developable at any water status

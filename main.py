@@ -44,7 +44,7 @@ REQUIRED_PARCEL_COLUMNS = {
     "edge_miles": "numeric", "hazard_fitted": "numeric", "landlocked": "boolean",
     "flood_zone": "text", "zoning": "text", "jurisdiction": "text",
     "usable_radius_ft": "numeric", "largest_part_acres": "numeric",
-    "compactness": "numeric", "parts": "integer",
+    "compactness": "numeric", "parts": "integer", "road_ft": "numeric",
 }
 REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric", "median_price_per_acre": "numeric",
                          "vacant_price_per_acre": "numeric"}
@@ -361,7 +361,7 @@ def _candidates(where_sql, params):
              p.mail_address, COALESCE(p.water_state,'C') AS water_state,
              p.carry_rate, p.hazard_fitted, p.landlocked, p.flood_zone, p.edge_miles,
              p.zoning, p.jurisdiction,
-             p.usable_radius_ft, p.largest_part_acres, p.compactness, p.parts,
+             p.usable_radius_ft, p.largest_part_acres, p.compactness, p.parts, p.road_ft,
              z.signals AS signals, z.dev_value_per_acre, z.median_price_per_acre,
              z.vacant_price_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
@@ -441,7 +441,7 @@ def _valued(rows, p, horizon=10):
         c = cache[key]
         site = MODEL.site_factor(r.get("landlocked"), r.get("flood_zone"),
                                  r.get("usable_radius_ft"), r.get("largest_part_acres"),
-                                 acres)
+                                 acres, r.get("road_ft"))
         price_ac = est / acres
         d0 = float(r["dev_value_per_acre"] or 0) or price_ac * 3.0
         cr = float(r["carry_rate"]) if r["carry_rate"] is not None else MODEL.carry_rate(est, r["assessed"])
@@ -2243,25 +2243,118 @@ FROM (
 WHERE p.apn = sub.apn;
 """
 
+# --- ROAD ACCESS -----------------------------------------------------------
+# The old frontage test measured what share of a parcel's boundary touched
+# ANOTHER PARCEL IN THIS TABLE. The table holds only vacant and agricultural
+# land, so a rural parcel sees every neighbour and reads as enclosed while an
+# infill parcel's built neighbours are absent and it reads as open. That inverts
+# the signal: it flagged 46,106 of 152,359 parcels, about 30%, against a true
+# rate of a few percent, and the parcels it flagged hardest were exactly the
+# rural fringe ground this product is about. Access is now measured against a
+# road centreline layer, which does not care who the neighbours are.
+ROAD_URLS = [
+    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/2/query",
+    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/1/query",
+    "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer/0/query",
+    "https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services/Streets/MapServer/0/query",
+]
+# Half-width of a section-line right of way plus margin. A parcel fronting a
+# road sits this far from its centreline, so anything beyond it has no frontage.
+LANDLOCK_ROAD_M = 40
+
 LANDLOCK_SQL = """
-UPDATE parcels p SET landlocked = COALESCE(sub.shared, 0) > 0.97
+UPDATE parcels p SET
+  road_ft = round((sub.d * 3.28084)::numeric, 0),
+  landlocked = sub.d > %(m)s
 FROM (
   SELECT p2.apn,
-         LEAST(1.0,
-           SUM(ST_Length(ST_Intersection(
-                 ST_Boundary(ST_CollectionExtract(ST_MakeValid(p2.geom), 3)),
-                 ST_Buffer(ST_CollectionExtract(ST_MakeValid(n.geom), 3), 0.00002)
-               )::geography))
-           / NULLIF(ST_Perimeter(ST_CollectionExtract(ST_MakeValid(p2.geom), 3)::geography), 0)
-         ) AS shared
-  FROM parcels p2
-  JOIN parcels n ON n.apn <> p2.apn AND ST_DWithin(p2.geom, n.geom, 0.00002)
-  WHERE ST_GeometryType(p2.geom) IN ('ST_Polygon','ST_MultiPolygon')
-  GROUP BY p2.apn, p2.geom
+         (SELECT ST_Distance(p2.geom::geography, r.geom::geography)
+            FROM roads r ORDER BY p2.geom <-> r.geom LIMIT 1) AS d
+  FROM parcels p2 WHERE p2.geom IS NOT NULL
 ) sub
-WHERE p.apn = sub.apn;
-UPDATE parcels SET landlocked = false WHERE landlocked IS NULL;
+WHERE p.apn = sub.apn AND sub.d IS NOT NULL;
 """
+
+def _fetch_roads(bbox, url, tiles=8, per_page=500):
+    """Yield road geometries in batches. Tiled because a county's worth of
+    centrelines exceeds any single response, paged within each tile."""
+    x0, y0, x1, y1 = bbox
+    dx, dy = (x1 - x0) / tiles, (y1 - y0) / tiles
+    boxes = [(x0 + i * dx, y0 + k * dy, x0 + (i + 1) * dx, y0 + (k + 1) * dy)
+             for i in range(tiles) for k in range(tiles)]
+    for n, box in enumerate(boxes, 1):
+        offset = 0
+        while True:
+            params = {"where": "1=1", "outFields": "", "outSR": "4326",
+                      "returnGeometry": "true", "f": "geojson",
+                      "geometry": f"{box[0]},{box[1]},{box[2]},{box[3]}",
+                      "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                      "spatialRel": "esriSpatialRelIntersects",
+                      "geometryPrecision": 6,
+                      "resultOffset": offset, "resultRecordCount": per_page}
+            r = requests.get(url, params=params, timeout=120,
+                             headers={"User-Agent": BROWSER_UA})
+            try:
+                feats = r.json().get("features", [])
+            except Exception:
+                raise RuntimeError(f"road source {r.status_code}: {r.text[:140]}")
+            if not feats:
+                break
+            yield n, len(boxes), [f.get("geometry") for f in feats if f.get("geometry")]
+            if len(feats) < per_page:
+                break
+            offset += len(feats)
+
+def run_ingest_roads(source=None):
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": "roads", "detail": "starting"}
+    try:
+        with pool.connection() as c:
+            bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
+                           "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+        if not bb or bb[0] is None:
+            SIGNAL_STATUS = {"state": "error", "kind": "roads",
+                             "detail": "no zones on record; cannot bound the search"}
+            return
+        errors = []
+        for url in ([source] if source else ROAD_URLS):
+            SIGNAL_STATUS.update(source=url, detail=f"trying {url.split('/')[2]}")
+            written = 0
+            try:
+                with pool.connection() as c, c.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS roads")
+                    cur.execute("CREATE TABLE roads(geom geometry(Geometry,4326))")
+                    c.commit()
+                for i, total, batch in _fetch_roads(bb, url):
+                    if not batch:
+                        continue
+                    with pool.connection() as c, c.cursor() as cur:
+                        cur.executemany(
+                            "INSERT INTO roads(geom) VALUES "
+                            "(ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))",
+                            [(json.dumps(g),) for g in batch])
+                        c.commit()
+                    written += len(batch)
+                    SIGNAL_STATUS.update(detail=f"tile {i}/{total}, {written:,} segments")
+                if written < 1000:
+                    errors.append(f"{url.split('/')[2]}: only {written} segments")
+                    continue
+                with pool.connection() as c, c.cursor() as cur:
+                    cur.execute("CREATE INDEX ON roads USING gist(geom)")
+                    cur.execute("CREATE INDEX ON roads USING gist((geom::geography))")
+                    cur.execute("ANALYZE roads")
+                    c.commit()
+                SIGNAL_STATUS = {"state": "done", "kind": "roads", "source": url,
+                                 "segments": written,
+                                 "next": "run /admin/screens to re-derive access"}
+                return
+            except Exception as e:
+                errors.append(f"{url.split('/')[2]}: {str(e)[:110]}")
+        SIGNAL_STATUS = {"state": "error", "kind": "roads",
+                         "detail": "no road source delivered", "tried": errors}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "kind": "roads", "detail": str(e)[:220]}
+
 # NOTE: county parcel fabrics contain self-intersecting rings and slivers, so
 # every geometry is repaired with ST_MakeValid and reduced to polygons before
 # use. Neighbours are buffered ~2m rather than unioned: ST_Union over a set
@@ -2464,14 +2557,30 @@ def run_screens(do_flood=True, flood_source=None):
     try:
         with pool.connection() as c:
             with c.cursor() as cur:
-                for stmt in [s for s in LANDLOCK_SQL.split(";") if s.strip()]:
-                    cur.execute(stmt)
-            c.commit()
+                pass
+            n_roads = 0
+            if c.execute("SELECT to_regclass('public.roads') IS NOT NULL").fetchone()[0]:
+                n_roads = c.execute("SELECT count(*) FROM roads").fetchone()[0]
+            if n_roads >= 1000:
+                with c.cursor() as cur:
+                    cur.execute(LANDLOCK_SQL, {"m": LANDLOCK_ROAD_M})
+                c.commit()
+            else:
+                # Without a road layer there is no honest access measure, so the
+                # column is cleared rather than left holding the old inverted one.
+                with c.cursor() as cur:
+                    cur.execute("UPDATE parcels SET landlocked=NULL, road_ft=NULL")
+                c.commit()
             SIGNAL_STATUS["detail"] = "measuring parcel geometry"
             with c.cursor() as cur:
                 cur.execute(SHAPE_SQL)
             c.commit()
             ll = c.execute("SELECT count(*) FROM parcels WHERE landlocked").fetchone()[0]
+            tot = c.execute("SELECT count(*) FROM parcels").fetchone()[0] or 1
+            dist = c.execute("""SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY road_ft)),
+                                       round(percentile_cont(0.9) WITHIN GROUP (ORDER BY road_ft)),
+                                       round(percentile_cont(0.99) WITHIN GROUP (ORDER BY road_ft))
+                                FROM parcels WHERE road_ft IS NOT NULL""").fetchone()
             shp = c.execute("""SELECT count(*) FILTER (WHERE usable_radius_ft IS NOT NULL),
                                       count(*) FILTER (WHERE usable_radius_ft < 100),
                                       count(*) FILTER (WHERE parts > 1)
@@ -2530,6 +2639,12 @@ def run_screens(do_flood=True, flood_source=None):
                 flood_err = "; ".join(errors)[:220]
         out = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood,
                "shape_measured": shp[0], "under_100ft_wide": shp[1], "multi_part": shp[2],
+               "road_segments": n_roads,
+               "landlocked_pct": round(100.0 * ll / tot, 2),
+               "road_ft_p50_p90_p99": list(dist) if dist else None,
+               "access_check": ("plausible, safe to enable APPLY_LANDLOCK_DISCOUNT"
+                                if n_roads >= 1000 and ll / tot <= 0.05 else
+                                "NOT validated: leave APPLY_LANDLOCK_DISCOUNT False"),
                "flood_source": SIGNAL_STATUS.get("flood_source"),
                "flood_polygons": SIGNAL_STATUS.get("flood_polygons")}
         if flood_err:
@@ -2556,6 +2671,45 @@ def admin_fit_hazard(token: str, sample_vacant: float = 0.06, sample_built: floa
         return {"state": "already_running", "status": SIGNAL_STATUS}
     threading.Thread(target=run_fit_hazard, args=(sample_vacant, sample_built), daemon=True).start()
     return {"state": "started", "kind": "hazard", "next": "poll /admin/signals_status"}
+
+@app.get("/admin/ingest_roads")
+def admin_ingest_roads(token: str, source: str = None):
+    """Pull road centrelines so access can be measured directly. Several sources
+    are tried in turn because layer numbering on public servers moves; pass
+    ?source= to force one."""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_ingest_roads, kwargs={"source": source}, daemon=True).start()
+    return {"state": "started", "kind": "roads", "next": "poll /admin/signals_status"}
+
+@app.get("/admin/probe_roads")
+def admin_probe_roads(token: str):
+    """Ask each candidate source for a count without writing anything, so a dead
+    layer is visible before a long ingest is started."""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    with pool.connection() as c:
+        bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
+                       "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+    out = []
+    for url in ROAD_URLS:
+        try:
+            r = requests.get(url, timeout=45, headers={"User-Agent": BROWSER_UA},
+                             params={"where": "1=1", "returnCountOnly": "true", "f": "json",
+                                     "geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
+                                     "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                                     "spatialRel": "esriSpatialRelIntersects"})
+            j = r.json()
+            out.append({"url": url, "status": r.status_code,
+                        "count": j.get("count"), "error": str(j.get("error"))[:120] if j.get("error") else None})
+        except Exception as e:
+            out.append({"url": url, "error": str(e)[:120]})
+    usable = [o for o in out if isinstance(o.get("count"), int) and o["count"] > 1000]
+    return {"candidates": out,
+            "usable": [o["url"] for o in usable],
+            "recommended": usable[0]["url"] if usable else None}
 
 @app.get("/admin/screens")
 def admin_screens(token: str, flood: bool = False, flood_source: str = None):
