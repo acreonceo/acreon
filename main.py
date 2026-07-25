@@ -1216,7 +1216,8 @@ def _transform_feature(ft):
     ls = a.get("LAND_SIZE")
     acres = round(ls/43560.0, 3) if isinstance(ls, (int, float)) and ls > 0 else None
     owner = (a.get("OWNER_NAME") or "").strip()
-    owner_type, absentee = T.classify_owner_type(owner, a.get("MAIL_STATE"))
+    owner_type, absentee = T.classify_owner_type(owner, a.get("MAIL_STATE"),
+                                                 a.get("MAIL_ADDRESS"))
     use = _classify_use(a, acres)
     price = _num(a.get("SALE_PRICE"))
     est = _num(a.get("FCV_CUR")) or price or 1000
@@ -2022,9 +2023,13 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
             return
         SIGNAL_STATUS["detail"] = f"fitting on {len(rows):,} parcel-periods"
         bins, counts, exposure = HZ.pool_bins(rows)
-        X = [HZ.design_row(int(p), float(d), float(a) if a else 1.0, bins) for p, e, a, d in rows]
+        rows = [r for r in rows if r[3] is not None]
+        X = [HZ.design_row(int(p), float(d), bins=bins) for p, e, a, d in rows]
         y = [int(e) for p, e, a, d in rows]
-        coefs = HZ.fit_logit(X, y)
+        # Acres is the exposure weight, not a covariate: it makes the fit measure
+        # the share of land that converts, which subdivision cannot inflate.
+        wt = [float(a) if a and float(a) > 0 else 0.1 for p, e, a, d in rows]
+        coefs = HZ.fit_logit(X, y, w=wt)
         events = sum(y)
         summary = HZ.summarize(coefs, bins, counts, exposure)
 
@@ -2047,7 +2052,7 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
                 rows2 = cur.execute("SELECT apn, edge_miles, acres FROM parcels WHERE edge_miles IS NOT NULL").fetchall()
                 upd = []
                 for apn, d, ac in rows2:
-                    p5 = HZ.predict_p5(coefs, HZ.PERIODS[-1], float(d), float(ac) if ac else 1.0, bins)
+                    p5 = HZ.predict_p5(coefs, HZ.PERIODS[-1], float(d), bins=bins)
                     upd.append((HZ.annual_hazard(p5), apn))
                 cur.executemany("UPDATE parcels SET hazard_fitted=%s WHERE apn=%s", upd)
             c.commit()
