@@ -181,39 +181,52 @@ def _aerial(r, pad=0.55, caption=None):
 
 
 def _ground(r):
-    """Plain-language read of what the geometry will physically hold."""
+    """Plain-language read of what the geometry will physically hold.
+
+    Shape is stated as a ratio against a compact parcel of the same area, so a
+    small lot is never described as a corridor merely for being small.
+    """
+    import math as _m
     rad = r.get("usable_radius_ft")
     lp = r.get("largest_part_acres")
     ac = float(r.get("acres") or 0)
     parts = r.get("parts")
     road = r.get("road_ft")
     out = []
-    if rad is not None:
+    if rad is not None and ac > 0:
         rad = float(rad)
-        if rad < 100:
-            out.append(f"The widest point of this parcel fits a circle of only "
-                       f"{rad:,.0f} feet radius. That is a corridor, not a site: it "
+        r_equiv = _m.sqrt(ac * 43560.0 / _m.pi)
+        ratio = rad / r_equiv if r_equiv > 0 else 1.0
+        if ratio < 0.15:
+            out.append(f"The widest point of this parcel fits a circle of {rad:,.0f} "
+                       f"feet radius, against {r_equiv:,.0f} feet for a compact parcel "
+                       f"of the same {ac:,.1f} acres. That is a corridor, not a site: it "
                        f"supports signage, utilities and drainage, and cannot hold a "
                        f"development pad regardless of total acreage.")
-        elif rad < 200:
-            out.append(f"Largest circle that fits inside is {rad:,.0f} feet radius, "
-                       f"below the depth a commercial pad needs.")
-        elif rad < 300:
-            out.append(f"Largest circle that fits inside is {rad:,.0f} feet radius, "
-                       f"workable for commercial but tight for two-sided residential "
-                       f"blocks.")
+        elif ratio < 0.28:
+            out.append(f"The parcel is markedly elongated: {rad:,.0f} feet of usable "
+                       f"width against {r_equiv:,.0f} for a compact parcel of the same "
+                       f"area. Usable depth, not acreage, is the binding constraint.")
+        elif ratio < 0.45:
+            out.append(f"Somewhat elongated, with {rad:,.0f} feet of usable width "
+                       f"against {r_equiv:,.0f} for a compact parcel of the same area. "
+                       f"Workable, but the layout is constrained.")
         else:
-            out.append(f"Largest circle that fits inside is {rad:,.0f} feet radius, "
-                       f"enough depth for conventional subdivision blocks.")
+            out.append(f"Compact enough to plan conventionally, with {rad:,.0f} feet of "
+                       f"usable width across the widest point.")
     if lp is not None and ac > 0 and float(lp) < ac * 0.9:
         out.append(f"The ground is in {parts or 'several'} separate pieces and the "
                    f"largest is {float(lp):,.1f} acres, so it should be judged at that "
                    f"scale rather than at {ac:,.1f}.")
     if road is not None:
         road = float(road)
-        out.append(f"Nearest road centreline is {road:,.0f} feet away."
-                   + ("" if road <= 150 else
-                      " Access would have to be established before anything is built."))
+        if road <= 150:
+            out.append(f"It sits {road:,.0f} feet from the nearest mapped road "
+                       f"centreline, which is street frontage.")
+        else:
+            out.append(f"The nearest mapped road centreline is {road:,.0f} feet away, "
+                       f"so that much access would have to be built. This is a distance, "
+                       f"not a title finding: legal access must be confirmed separately.")
     return " ".join(out) or "Parcel geometry has not been measured."
 
 

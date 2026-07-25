@@ -2311,9 +2311,11 @@ TIGER_ROADS = "|".join([f"{_TIGER_TR}/8/query",    # Local Roads
 # TIGER first: a government bulk endpoint with no queue. Overpass is the
 # fallback, and is a volunteer mirror that should not be hammered for a county.
 ROAD_URLS = [TIGER_ROADS] + OVERPASS_MIRRORS
-# Half-width of a section-line right of way plus margin. A parcel fronting a
-# road sits this far from its centreline, so anything beyond it has no frontage.
-LANDLOCK_ROAD_M = 40
+# The binary is informational only now; valuation runs off the continuous
+# gradient in model.access_factor. 40 metres flagged 36.7% of the county, which
+# measured "has no direct frontage", a common and unremarkable condition, rather
+# than "cannot be reached". A quarter mile flags genuinely remote ground.
+LANDLOCK_ROAD_M = 400
 
 LANDLOCK_SQL = """
 UPDATE parcels p SET
@@ -2694,10 +2696,18 @@ def run_screens(do_flood=True, flood_source=None):
                                        round(percentile_cont(0.9) WITHIN GROUP (ORDER BY road_ft)),
                                        round(percentile_cont(0.99) WITHIN GROUP (ORDER BY road_ft))
                                 FROM parcels WHERE road_ft IS NOT NULL""").fetchone()
-            shp = c.execute("""SELECT count(*) FILTER (WHERE usable_radius_ft IS NOT NULL),
-                                      count(*) FILTER (WHERE usable_radius_ft < 100),
-                                      count(*) FILTER (WHERE parts > 1)
-                               FROM parcels""").fetchone()
+            # Shape is scored scale-free: inscribed radius against the radius a
+            # circle of the same area would have. Raw radius confounds thin with
+            # small, so a bare "under 100 ft" count is not a shape statistic.
+            shp = c.execute("""
+              WITH s AS (SELECT usable_radius_ft
+                              / NULLIF(sqrt(acres*43560.0/pi()),0) AS ratio, parts
+                         FROM parcels WHERE usable_radius_ft IS NOT NULL AND acres > 0)
+              SELECT count(*), count(*) FILTER (WHERE ratio < 0.28),
+                     count(*) FILTER (WHERE parts > 1),
+                     round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ratio)::numeric,3),
+                     round(percentile_cont(0.05) WITHIN GROUP (ORDER BY ratio)::numeric,3)
+              FROM s""").fetchone()
         flood, flood_err = 0, None
         if do_flood:
             # FEMA serves a single polygon but resets on tiled queries, so each
@@ -2751,13 +2761,17 @@ def run_screens(do_flood=True, flood_source=None):
             else:
                 flood_err = "; ".join(errors)[:220]
         out = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood,
-               "shape_measured": shp[0], "under_100ft_wide": shp[1], "multi_part": shp[2],
+               "shape_measured": shp[0], "ribbon_like": shp[1], "multi_part": shp[2],
+               "shape_ratio_p50": float(shp[3]) if shp[3] is not None else None,
+               "shape_ratio_p05": float(shp[4]) if shp[4] is not None else None,
+               "ribbon_pct": round(100.0 * (shp[1] or 0) / (shp[0] or 1), 2),
                "road_segments": n_roads,
                "landlocked_pct": round(100.0 * ll / tot, 2),
                "road_ft_p50_p90_p99": list(dist) if dist else None,
-               "access_check": ("plausible, safe to enable APPLY_LANDLOCK_DISCOUNT"
-                                if n_roads >= 1000 and ll / tot <= 0.05 else
-                                "NOT validated: leave APPLY_LANDLOCK_DISCOUNT False"),
+               "access_check": ("road distances measured; valuation uses the continuous "
+                                "gradient in model.access_factor, not this flag"
+                                if n_roads >= 1000 else
+                                "no road layer: run /admin/ingest_roads first"),
                "flood_source": SIGNAL_STATUS.get("flood_source"),
                "flood_polygons": SIGNAL_STATUS.get("flood_polygons")}
         if flood_err:
