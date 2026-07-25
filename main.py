@@ -1778,17 +1778,33 @@ WHERE z.zcta = za.zcta;
 # Water gate from real ADWR data: fraction of each zone covered by issued
 # Assured/Adequate Water Supply determinations -> water_status.
 AAWS_URL = "https://services.arcgis.com/C34zQ7veRS0V1t04/ArcGIS/rest/services/AAWS_Issued_Determination_2024/FeatureServer/0/query"
+# zones.water_status and zones.signals->>'water_status' were two different
+# numbers wearing one name. The column is derived here from real AAWS polygon
+# coverage and is what GROWTH_DEFAULT_EXPR gates on. The JSONB key is a seed
+# value written once when the zone is first inserted and never refreshed, since
+# the zone upsert deliberately touches only geometry. So the score was computed
+# from measured coverage while the UI and the briefs displayed the stale seed:
+# 85045 scored as groundwater-constrained (gate 0.30) while showing "assured",
+# and 85335 scored as assured (gate 1.00) while showing "alternative_pending".
+# Both are now written from the same CASE, so what is shown is what was scored.
 WATER_OVERLAY_SQL = """
 WITH cov AS (
   SELECT z.zcta,
     COALESCE(SUM(ST_Area(ST_Intersection(z.geom, a.geom))),0) / NULLIF(ST_Area(z.geom),0) AS frac
   FROM zones z LEFT JOIN aaws a ON ST_Intersects(z.geom, a.geom)
-  GROUP BY z.zcta, z.geom)
-UPDATE zones z SET water_status = CASE
-  WHEN c.frac > 0.30 THEN 'assured'
-  WHEN c.frac > 0.05 THEN 'alternative_pending'
-  ELSE 'groundwater_constrained' END
-FROM cov c WHERE z.zcta = c.zcta;
+  GROUP BY z.zcta, z.geom),
+ws AS (
+  SELECT zcta, round(frac::numeric,4) AS frac,
+         CASE WHEN frac > 0.30 THEN 'assured'
+              WHEN frac > 0.05 THEN 'alternative_pending'
+              ELSE 'groundwater_constrained' END AS status
+  FROM cov)
+UPDATE zones z SET
+  water_status = ws.status,
+  signals = jsonb_set(jsonb_set(coalesce(z.signals,'{}'::jsonb),
+                                '{water_status}', to_jsonb(ws.status)),
+                      '{aaws_coverage}', to_jsonb(ws.frac))
+FROM ws WHERE z.zcta = ws.zcta;
 """
 
 
@@ -1950,6 +1966,9 @@ def run_signals(kind="migration"):
                     cur.execute("DROP TABLE IF EXISTS aaws; CREATE TEMP TABLE aaws(geom geometry(Geometry,4326));")
                     cur.executemany("INSERT INTO aaws(geom) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))", [(g,) for g in geoms])
                     cur.execute("CREATE INDEX ON aaws USING gist(geom); ANALYZE aaws;")
+                    before = dict(c.execute(
+                        "SELECT coalesce(signals->>'water_status','?'), count(*) "
+                        "FROM zones GROUP BY 1").fetchall())
                     cur.execute(WATER_OVERLAY_SQL)
                     updated = cur.rowcount
                     # per-parcel water state: A served, B irrigated ag (SB1611
@@ -1972,6 +1991,16 @@ def run_signals(kind="migration"):
                     cur.execute(f"UPDATE zones SET growth_default = {GROWTH_DEFAULT_EXPR}")
                     cur.execute(RESCORE_SQL)
                 c.commit()
+                after = dict(c.execute(
+                    "SELECT coalesce(signals->>'water_status','?'), count(*) "
+                    "FROM zones GROUP BY 1").fetchall())
+                drift = c.execute(
+                    "SELECT count(*) FROM zones "
+                    "WHERE coalesce(signals->>'water_status','') "
+                    "IS DISTINCT FROM coalesce(water_status,'')").fetchone()[0]
+                SIGNAL_STATUS["water_status_before"] = before
+                SIGNAL_STATUS["water_status_after"] = after
+                SIGNAL_STATUS["zones_still_disagreeing"] = drift
         elif kind == "velocity":
             import transform as T
             SIGNAL_STATUS["detail"] = "computing sales velocity from parcels"
