@@ -2259,9 +2259,11 @@ WHERE p.apn = sub.apn;
 # queried by tag rather than by a layer number that moves when a server is
 # rebuilt. ArcGIS sources are kept as a fallback and discovered by name.
 OVERPASS_MIRRORS = [
-    "https://overpass-api.de/api/interpreter",
+    # kumi answered a probe with 1,493 ways in one downtown block. The .de host
+    # returned a non-JSON body (queue full) and osm.ch returned zero, so kumi
+    # leads and the others stay only as fallbacks.
     "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.osm.ch/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
 ]
 # Drivable ways only. Footways, cycleways and paths are not legal vehicle access
 # and would make genuinely enclosed ground read as served.
@@ -2273,7 +2275,17 @@ ARCGIS_ROAD_SERVICES = [
     "https://gis.mcassessor.maricopa.gov/ArcGIS/rest/services",
     "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer",
 ]
-ROAD_URLS = list(OVERPASS_MIRRORS)
+# Layer discovery found the real street network: TIGERweb Transportation carries
+# "Local Roads" at layer 8, three past the primary-road layers a guessed index
+# landed on. Local plus secondary plus primary is merged into one table, since
+# access can come off any of them. Entries joined by | are loaded together.
+_TIGER_TR = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer"
+TIGER_ROADS = "|".join([f"{_TIGER_TR}/8/query",    # Local Roads
+                        f"{_TIGER_TR}/6/query",    # Secondary Roads 72_1k scale
+                        f"{_TIGER_TR}/2/query"])   # Primary Roads
+# TIGER first: a government bulk endpoint with no queue. Overpass is the
+# fallback, and is a volunteer mirror that should not be hammered for a county.
+ROAD_URLS = [TIGER_ROADS] + OVERPASS_MIRRORS
 # Half-width of a section-line right of way plus margin. A parcel fronting a
 # road sits this far from its centreline, so anything beyond it has no frontage.
 LANDLOCK_ROAD_M = 40
@@ -2337,8 +2349,9 @@ def _fetch_roads_arcgis(bbox, url, tiles=8, per_page=500):
     boxes = [(x0 + i * dx, y0 + k * dy, x0 + (i + 1) * dx, y0 + (k + 1) * dy)
              for i in range(tiles) for k in range(tiles)]
     for n, box in enumerate(boxes, 1):
-        offset = 0
-        while True:
+        offset, pages, seen_first = 0, 0, None
+        while pages < 60:
+            pages += 1
             params = {"where": "1=1", "outFields": "", "outSR": "4326",
                       "returnGeometry": "true", "f": "geojson",
                       "geometry": f"{box[0]},{box[1]},{box[2]},{box[3]}",
@@ -2354,6 +2367,12 @@ def _fetch_roads_arcgis(bbox, url, tiles=8, per_page=500):
                 raise RuntimeError(f"road source {r.status_code}: {r.text[:140]}")
             if not feats:
                 break
+            # A server that ignores resultOffset returns the same page forever.
+            # Comparing the first geometry catches that instead of looping.
+            first = json.dumps(feats[0].get("geometry"))[:200]
+            if first == seen_first:
+                break
+            seen_first = first
             yield n, len(boxes), [json.dumps(f["geometry"]) for f in feats if f.get("geometry")]
             if len(feats) < per_page:
                 break
@@ -2388,15 +2407,21 @@ def run_ingest_roads(source=None, tiles=8):
                        if is_osm else
                        "INSERT INTO roads(geom) VALUES "
                        "(ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))")
-                for i, total, batch in fetch(bb, url, tiles=tiles):
-                    if not batch:
-                        SIGNAL_STATUS.update(detail=f"tile {i}/{total}, {written:,} segments")
-                        continue
-                    with pool.connection() as c, c.cursor() as cur:
-                        cur.executemany(sql, [(g,) for g in batch])
-                        c.commit()
-                    written += len(batch)
-                    SIGNAL_STATUS.update(detail=f"tile {i}/{total}, {written:,} segments")
+                # A single candidate may list several layers to merge, since
+                # local, secondary and primary roads live in separate layers and
+                # frontage can come off any of them.
+                parts = [u for u in url.split("|") if u.strip()]
+                for pi, part in enumerate(parts, 1):
+                    label = part.rstrip("/").split("/")[-2] if not is_osm else "osm"
+                    for i, total, batch in fetch(bb, part, tiles=tiles):
+                        if batch:
+                            with pool.connection() as c, c.cursor() as cur:
+                                cur.executemany(sql, [(g,) for g in batch])
+                                c.commit()
+                            written += len(batch)
+                        SIGNAL_STATUS.update(
+                            detail=f"layer {pi}/{len(parts)} ({label}), "
+                                   f"tile {i}/{total}, {written:,} segments")
                 if written < 5000:
                     errors.append(f"{url.split('/')[2]}: only {written} segments, "
                                   "too sparse to measure access")
