@@ -1789,6 +1789,46 @@ WHERE z.zcta = za.zcta;
 ADWR_ORG = "https://services.arcgis.com/C34zQ7veRS0V1t04/ArcGIS/rest/services"
 AAWS_URL = f"{ADWR_ORG}/AAWS_Issued_Determination_2024/FeatureServer/0/query"
 AAWS_URLS = [AAWS_URL]
+# Community water system service areas: the missing half. A parcel inside a
+# municipal provider's area is water-secure even though it holds no individual
+# certificate, which is why Ahwatukee measured 0.0 coverage. The layer carries no
+# designation flag, so provider scale stands in for it: POPULATION separates a
+# trailer-park well serving 85 people from a municipal system serving a million,
+# and AMA marks whether Arizona's assured-supply rules apply at all.
+CWS_URL = f"{ADWR_ORG}/CWS_Service_Area/FeatureServer/0/query"
+CWS_MIN_POPULATION = 10000     # below this a provider cannot serve a subdivision
+
+def _fetch_cws(bbox, cap=6000):
+    """Service-area polygons with the attributes needed to grade them."""
+    out, last = [], -1
+    while len(out) < cap:
+        r = requests.get(CWS_URL, timeout=120, headers={"User-Agent": BROWSER_UA},
+                         params={"where": f"OBJECTID > {last}",
+                                 "outFields": "OBJECTID,CWS_NAME,RIGHT_TYPE,AMA,POPULATION,STATUS",
+                                 "returnGeometry": "true", "outSR": "4326", "f": "geojson",
+                                 "orderByFields": "OBJECTID", "resultRecordCount": 500,
+                                 "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+                                 "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                                 "spatialRel": "esriSpatialRelIntersects"})
+        try:
+            feats = r.json().get("features", [])
+        except Exception:
+            raise RuntimeError(f"CWS {r.status_code}: {r.text[:140]}")
+        if not feats:
+            break
+        for f in feats:
+            p = f.get("properties") or {}
+            if f.get("geometry"):
+                out.append((json.dumps(f["geometry"]), p.get("CWS_NAME"),
+                            p.get("RIGHT_TYPE"), p.get("AMA"),
+                            float(p.get("POPULATION") or 0), p.get("STATUS")))
+            try:
+                last = max(last, int(p.get("OBJECTID") or last))
+            except (TypeError, ValueError):
+                pass
+        if len(feats) < 500:
+            break
+    return out
 # zones.water_status and zones.signals->>'water_status' were two different
 # numbers wearing one name. The column is derived here from real AAWS polygon
 # coverage and is what GROWTH_DEFAULT_EXPR gates on. The JSONB key is a seed
@@ -1799,10 +1839,14 @@ AAWS_URLS = [AAWS_URL]
 # and 85335 scored as assured (gate 1.00) while showing "alternative_pending".
 # Both are now written from the same CASE, so what is shown is what was scored.
 WATER_OVERLAY_SQL = """
-WITH cov AS (
+WITH served AS (
+  SELECT geom FROM aaws
+  UNION ALL
+  SELECT geom FROM cws WHERE population >= %(minpop)s AND coalesce(status,'A') = 'A'
+), cov AS (
   SELECT z.zcta,
     COALESCE(SUM(ST_Area(ST_Intersection(z.geom, a.geom))),0) / NULLIF(ST_Area(z.geom),0) AS frac
-  FROM zones z LEFT JOIN aaws a ON ST_Intersects(z.geom, a.geom)
+  FROM zones z LEFT JOIN served a ON ST_Intersects(z.geom, a.geom)
   GROUP BY z.zcta, z.geom),
 ws AS (
   SELECT zcta, round(frac::numeric,4) AS frac,
@@ -1971,22 +2015,43 @@ def run_signals(kind="migration"):
             geoms = _fetch_aaws(bb)
             if not geoms:
                 SIGNAL_STATUS = {"state": "error", "detail": "ADWR returned 0 determination polygons"}; return
-            SIGNAL_STATUS["detail"] = f"overlaying {len(geoms)} determination areas"
+            SIGNAL_STATUS["detail"] = "fetching water provider service areas"
+            try:
+                cws_rows = _fetch_cws(bb)
+            except Exception as e:
+                cws_rows = []
+                SIGNAL_STATUS["cws_error"] = str(e)[:160]
+            SIGNAL_STATUS["detail"] = (f"overlaying {len(geoms)} determinations and "
+                                       f"{len(cws_rows)} service areas")
             with pool.connection() as c:
                 with c.cursor() as cur:
                     cur.execute("DROP TABLE IF EXISTS aaws; CREATE TEMP TABLE aaws(geom geometry(Geometry,4326));")
                     cur.executemany("INSERT INTO aaws(geom) VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))", [(g,) for g in geoms])
                     cur.execute("CREATE INDEX ON aaws USING gist(geom); ANALYZE aaws;")
+                    cur.execute("DROP TABLE IF EXISTS cws")
+                    cur.execute("CREATE TEMP TABLE cws(geom geometry(Geometry,4326), "
+                                "name text, right_type text, ama text, "
+                                "population double precision, status text)")
+                    if cws_rows:
+                        cur.executemany(
+                            "INSERT INTO cws(geom,name,right_type,ama,population,status) "
+                            "VALUES (ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)),"
+                            "%s,%s,%s,%s,%s)", cws_rows)
+                    cur.execute("CREATE INDEX ON cws USING gist(geom)")
+                    cur.execute("ANALYZE cws")
                     before = dict(c.execute(
                         "SELECT coalesce(signals->>'water_status','?'), count(*) "
                         "FROM zones GROUP BY 1").fetchall())
-                    cur.execute(WATER_OVERLAY_SQL)
+                    cur.execute(WATER_OVERLAY_SQL, {"minpop": CWS_MIN_POPULATION})
                     updated = cur.rowcount
                     # per-parcel water state: A served, B irrigated ag (SB1611
                     # conversion path), C raw groundwater-dependent
                     cur.execute("""
                       UPDATE parcels p SET water_state = CASE
                         WHEN EXISTS (SELECT 1 FROM aaws a WHERE ST_Contains(a.geom, p.centroid)) THEN 'A'
+                        WHEN EXISTS (SELECT 1 FROM cws w WHERE ST_Contains(w.geom, p.centroid)
+                                       AND w.population >= 10000
+                                       AND coalesce(w.status,'A') = 'A') THEN 'A'
                         WHEN p.use = 'Agricultural' THEN 'B' ELSE 'C' END
                     """)
                     # carry from the tax roll, not a flat assumption
@@ -2009,6 +2074,19 @@ def run_signals(kind="migration"):
                     "SELECT count(*) FROM zones "
                     "WHERE coalesce(signals->>'water_status','') "
                     "IS DISTINCT FROM coalesce(water_status,'')").fetchone()[0]
+                SIGNAL_STATUS["cws_areas"] = len(cws_rows)
+                SIGNAL_STATUS["cws_large_providers"] = sum(
+                    1 for r in cws_rows if (r[4] or 0) >= CWS_MIN_POPULATION)
+                types = {}
+                amas = {}
+                for r in cws_rows:
+                    types[r[2] or "?"] = types.get(r[2] or "?", 0) + 1
+                    amas[r[3] or "?"] = amas.get(r[3] or "?", 0) + 1
+                SIGNAL_STATUS["cws_right_types"] = types
+                SIGNAL_STATUS["cws_amas"] = amas
+                SIGNAL_STATUS["water_state_counts"] = dict(c.execute(
+                    "SELECT coalesce(water_state,'?'), count(*) FROM parcels GROUP BY 1"
+                ).fetchall())
                 SIGNAL_STATUS["water_status_before"] = before
                 SIGNAL_STATUS["water_status_after"] = after
                 SIGNAL_STATUS["zones_still_disagreeing"] = drift
