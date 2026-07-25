@@ -89,17 +89,22 @@
     <div class="brand"><span class="lg">Acreon<b>.</b></span><span class="live">MARICOPA COUNTY · LIVE</span></div>
     <div class="search"><input id="q" placeholder="Search APN, address, or owner" autocomplete="off"><div class="res" id="res"></div></div>
     <div class="tabs">
-      <button data-t="detail" aria-selected="true">Parcel</button>
-      <button data-t="targets" aria-selected="false">Targets</button>
+      <button data-t="detail" aria-selected="false">Parcel</button>
+      <button data-t="targets" aria-selected="true">Targets</button>
       <button data-t="blocks" aria-selected="false">Blocks</button>
     </div>
 
-    <div class="body" id="pane-detail">
+    <div class="body" id="pane-detail" style="display:none">
+      <div id="parcelReports" style="display:none;gap:6px;margin-bottom:10px">
+        <button data-a="investor" style="flex:1;padding:7px 4px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Investor</button>
+        <button data-a="developer" style="flex:1;padding:7px 4px;border:1px solid var(--teal);background:var(--teal);color:#fff;font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Developer</button>
+        <button data-a="partner" style="flex:1;padding:7px 4px;border:1px solid var(--ink);background:var(--paper);color:var(--ink);font:inherit;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer">Partner</button>
+      </div>
       <div id="detailBody"><div class="empty">Search a parcel or click one on the map to see its ownership, growth outlook, and buy / hold / sell read.</div></div>
       <div id="assumeBox" style="display:none"></div>
     </div>
 
-    <div class="body" id="pane-targets" style="display:none">
+    <div class="body" id="pane-targets">
       <div class="filters">
         <div><label>Use</label><select id="fUse"><option value="">Vacant + Ag</option><option>Vacant</option><option>Agricultural</option></select></div>
         <div><label>Owner</label><select id="fOwner"><option value="">Any</option><option>Individual</option><option>Trust/LLC</option><option>Investor</option></select></div>
@@ -114,6 +119,7 @@
         <div><label>Owner location</label><select id="fAbs"><option value="">Any</option><option value="1">Out of state only</option></select></div>
         <div><label>Sort by</label><select id="fSort"><option value="value_score">Value score</option><option value="soonest">Soonest to convert</option><option value="value_total">Total value</option><option value="acq_score">Acquirability</option></select></div>
       </div>
+      <button id="resetF" style="width:100%;margin:0 0 8px;padding:6px;border:1px solid var(--line-strong);background:#fff;color:var(--ink-soft);font:inherit;font-size:11.5px;font-weight:600;border-radius:7px;cursor:pointer">Reset all filters</button>
       <div id="mapSync" style="font-size:11px;line-height:1.35;color:var(--ink-soft);margin:2px 0 8px"></div>
       <div style="display:flex;gap:6px;align-items:center;margin:2px 0 8px">
         <label style="font-size:11.5px;color:var(--ink-soft);display:flex;align-items:center;gap:5px;cursor:pointer">
@@ -470,6 +476,7 @@ map.on("load",()=>{
 
 /* ===================== PARCEL DETAIL ============================ */
 async function openParcel(apn){ showTab("detail"); selApn=apn;
+  const pr=document.getElementById("parcelReports"); if(pr) pr.style.display="flex";
   const p=await (await fetch(API+"/parcels/"+apn)).json();
   markSelected(p); renderDetail(p); }
 
@@ -804,6 +811,20 @@ function syncMapCaption(n){
     // constraining the map while the new query is still running
     if(!modelFiltersOn()) gateApns=null;
     applyMapFilter(); loadTargets(); }));
+// Restores every control to its first option, which is "any" for all of them,
+// then runs one query rather than one per control.
+// The parcel pane's buttons always report on the parcel that is open, never on
+// whatever happens to be ticked in the Targets list.
+document.querySelectorAll("#parcelReports button").forEach(b=>b.addEventListener("click",()=>{
+  if(!selApn){ alert("Open a parcel first."); return; }
+  const p=new URLSearchParams({apns:selApn,audience:b.dataset.a,...modelParams()});
+  window.open(API+"/report?"+p,"_blank");
+}));
+document.getElementById("resetF").addEventListener("click",()=>{
+  ["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fSort"]
+    .forEach(id=>{ const el=document.getElementById(id); if(el) el.selectedIndex=0; });
+  gateApns=null; applyMapFilter(); loadTargets();
+});
 document.getElementById("selAll").addEventListener("change",e=>{
   document.querySelectorAll("#targetList .selbox").forEach(b=>{
     b.checked=e.target.checked;
@@ -870,6 +891,9 @@ function showTab(t){
   else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
 }
 document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.t)));
+// Targets is the working view; the parcel pane is where you land after picking
+// something, so the app opens on the list rather than on an empty detail panel.
+showTab("targets");
 
 // Model assumptions live over the map rather than in a tab, so weights and
 // water parameters can be moved while a parcel or the target list is open and

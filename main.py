@@ -45,6 +45,8 @@ REQUIRED_PARCEL_COLUMNS = {
     "flood_zone": "text", "zoning": "text", "jurisdiction": "text",
     "usable_radius_ft": "numeric", "largest_part_acres": "numeric",
     "compactness": "numeric", "parts": "integer", "road_ft": "numeric",
+    "elev_min_ft": "numeric", "elev_max_ft": "numeric", "relief_ft": "numeric",
+    "slope_pct": "numeric",
 }
 REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric", "median_price_per_acre": "numeric",
                          "vacant_price_per_acre": "numeric"}
@@ -362,6 +364,7 @@ def _candidates(where_sql, params):
              p.carry_rate, p.hazard_fitted, p.landlocked, p.flood_zone, p.edge_miles,
              p.zoning, p.jurisdiction,
              p.usable_radius_ft, p.largest_part_acres, p.compactness, p.parts, p.road_ft,
+             p.relief_ft, p.slope_pct, p.elev_min_ft, p.elev_max_ft,
              z.signals AS signals, z.dev_value_per_acre, z.median_price_per_acre,
              z.vacant_price_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
@@ -441,7 +444,7 @@ def _valued(rows, p, horizon=10):
         c = cache[key]
         site = MODEL.site_factor(r.get("landlocked"), r.get("flood_zone"),
                                  r.get("usable_radius_ft"), r.get("largest_part_acres"),
-                                 acres, r.get("road_ft"))
+                                 acres, r.get("road_ft"), r.get("slope_pct"))
         price_ac = est / acres
         d0 = float(r["dev_value_per_acre"] or 0) or price_ac * 3.0
         cr = float(r["carry_rate"]) if r["carry_rate"] is not None else MODEL.carry_rate(est, r["assessed"])
@@ -2798,6 +2801,138 @@ def admin_fit_hazard(token: str, sample_vacant: float = 0.06, sample_built: floa
         return {"state": "already_running", "status": SIGNAL_STATUS}
     threading.Thread(target=run_fit_hazard, args=(sample_vacant, sample_built), daemon=True).start()
     return {"state": "started", "kind": "hazard", "next": "poll /admin/signals_status"}
+
+# --- TERRAIN ----------------------------------------------------------------
+# Acreage and shape both say a 185-acre parcel on a mountainside can hold a
+# subdivision. Neither can see that it is a mountainside. Relief is sampled from
+# USGS 3DEP and turned into a slope proxy: vertical range over the parcel's
+# characteristic width. Subdivision economics break somewhere around 15%, and
+# above 30% the ground is cut-and-fill or nothing.
+USGS_3DEP = ("https://elevation.nationalmap.gov/arcgis/rest/services/"
+             "3DEPElevation/ImageServer/getSamples")
+TERRAIN_POINTS = 12          # samples per parcel
+TERRAIN_BATCH = 240          # points per request
+
+TERRAIN_SAMPLE_SQL = """
+SELECT p.apn, ST_X(g.geom) AS lon, ST_Y(g.geom) AS lat
+FROM parcels p
+CROSS JOIN LATERAL (
+  SELECT (ST_Dump(ST_GeneratePoints(p.geom, %(n)s, 1978))).geom AS geom
+) g
+WHERE p.geom IS NOT NULL AND p.acres >= %(min_acres)s
+ORDER BY p.apn
+"""
+
+def _sample_elevations(pts, url=USGS_3DEP):
+    """pts: [(lon,lat), ...] -> [metres or None]. One multipoint request."""
+    geom = {"points": [[x, y] for x, y in pts],
+            "spatialReference": {"wkid": 4326}}
+    r = requests.get(url, timeout=120, headers={"User-Agent": BROWSER_UA},
+                     params={"geometry": json.dumps(geom),
+                             "geometryType": "esriGeometryMultipoint",
+                             "returnFirstValueOnly": "true",
+                             "interpolation": "RSP_BilinearInterpolation",
+                             "f": "json"})
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"3DEP {r.status_code}: {r.text[:140]}")
+    if j.get("error"):
+        raise RuntimeError(f"3DEP error: {str(j['error'])[:160]}")
+    out = [None] * len(pts)
+    for s in j.get("samples", []):
+        try:
+            idx = int(s.get("locationId", -1))
+            v = float(s.get("value"))
+            if 0 <= idx < len(out) and v > -1000:
+                out[idx] = v
+        except (TypeError, ValueError):
+            continue
+    return out
+
+def run_terrain(min_acres=5.0):
+    """Sample relief for every parcel at or above min_acres. Small parcels are
+    skipped: sampling a quarter-acre lot returns twelve readings of the same
+    flat spot and burns the request budget for nothing."""
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": "terrain", "detail": "listing parcels"}
+    try:
+        rows = qall(TERRAIN_SAMPLE_SQL, {"n": TERRAIN_POINTS, "min_acres": min_acres})
+        if not rows:
+            SIGNAL_STATUS = {"state": "error", "kind": "terrain",
+                             "detail": f"no parcels at or above {min_acres} acres"}
+            return
+        n_parcels = len({r["apn"] for r in rows})
+        SIGNAL_STATUS.update(detail=f"{n_parcels:,} parcels, {len(rows):,} sample points")
+        elev = {}
+        done = 0
+        for i in range(0, len(rows), TERRAIN_BATCH):
+            chunk = rows[i:i + TERRAIN_BATCH]
+            vals = _sample_elevations([(r["lon"], r["lat"]) for r in chunk])
+            for r, v in zip(chunk, vals):
+                if v is not None:
+                    elev.setdefault(r["apn"], []).append(v)
+            done += len(chunk)
+            SIGNAL_STATUS.update(detail=f"sampled {done:,}/{len(rows):,} points, "
+                                        f"{len(elev):,} parcels with relief")
+        upd = []
+        for apn, vs in elev.items():
+            if len(vs) < 3:
+                continue
+            lo, hi = min(vs) * 3.28084, max(vs) * 3.28084
+            upd.append((round(lo, 1), round(hi, 1), round(hi - lo, 1), apn))
+        SIGNAL_STATUS.update(detail=f"writing {len(upd):,} parcels")
+        with pool.connection() as c, c.cursor() as cur:
+            cur.executemany("UPDATE parcels SET elev_min_ft=%s, elev_max_ft=%s, "
+                            "relief_ft=%s WHERE apn=%s", upd)
+            # slope proxy: vertical range over the parcel's characteristic width,
+            # which is the side of a square of the same area
+            cur.execute("""
+              UPDATE parcels SET slope_pct = round(
+                (100.0 * relief_ft / NULLIF(sqrt(acres*43560.0),0))::numeric, 1)
+              WHERE relief_ft IS NOT NULL AND acres > 0""")
+            c.commit()
+        with pool.connection() as c:
+            d = c.execute("""SELECT count(*),
+                                    round(percentile_cont(0.5) WITHIN GROUP (ORDER BY slope_pct)::numeric,1),
+                                    round(percentile_cont(0.9) WITHIN GROUP (ORDER BY slope_pct)::numeric,1),
+                                    count(*) FILTER (WHERE slope_pct >= 25)
+                             FROM parcels WHERE slope_pct IS NOT NULL""").fetchone()
+        SIGNAL_STATUS = {"state": "done", "kind": "terrain", "parcels_scored": d[0],
+                         "slope_pct_p50": float(d[1]) if d[1] is not None else None,
+                         "slope_pct_p90": float(d[2]) if d[2] is not None else None,
+                         "steep_over_25pct": d[3], "min_acres": min_acres}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "kind": "terrain", "detail": str(e)[:220]}
+
+@app.get("/admin/probe_terrain")
+def admin_probe_terrain(token: str):
+    """Sample two known points before committing to a long run: a flat spot in
+    central Phoenix and a peak in South Mountain. If the second is not several
+    hundred feet above the first, the elevation service is not answering."""
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    pts = [(-112.074, 33.448), (-112.048, 33.335)]
+    try:
+        v = _sample_elevations(pts)
+        ft = [round(x * 3.28084) if x is not None else None for x in v]
+        ok = all(x is not None for x in ft) and (ft[1] - ft[0]) > 300
+        return {"downtown_phoenix_ft": ft[0], "south_mountain_ft": ft[1],
+                "usable": ok,
+                "verdict": ("run /admin/terrain?token=YOUR_TOKEN" if ok
+                            else "elevation service not returning usable values")}
+    except Exception as e:
+        return {"error": str(e)[:200], "usable": False}
+
+@app.get("/admin/terrain")
+def admin_terrain(token: str, min_acres: float = 5.0):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_terrain, kwargs={"min_acres": min_acres},
+                     daemon=True).start()
+    return {"state": "started", "kind": "terrain", "next": "poll /admin/signals_status"}
 
 @app.get("/admin/ingest_roads")
 def admin_ingest_roads(token: str, source: str = None, tiles: int = 8):

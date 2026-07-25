@@ -140,8 +140,28 @@ def access_factor(road_ft=None):
     return 0.60                     # genuinely remote
 
 
+def terrain_factor(slope_pct=None):
+    """Discount for ground a developer would have to cut into.
+
+    Slope is vertical relief over the parcel's characteristic width. Conventional
+    subdivision economics start to strain around 10-15%, hillside ordinances and
+    cut-and-fill costs bite hard past 25%, and beyond 35% the ground is a
+    mountainside rather than a site. Acreage and outline shape are both blind to
+    this: a 185-acre parcel on the flank of South Mountain reads as ample room
+    for houses on every other measure in this model.
+    """
+    if slope_pct is None:
+        return 1.0
+    s = max(0.0, float(slope_pct))
+    if s < 8:    return 1.00
+    if s < 15:   return 0.90
+    if s < 25:   return 0.65
+    if s < 35:   return 0.35
+    return 0.15
+
+
 def site_factor(landlocked, flood_zone, usable_radius_ft=None, largest_part_acres=None,
-                acres=None, road_ft=None):
+                acres=None, road_ft=None, slope_pct=None):
     """Multiplier on what a developer will pay. Floodway land is not developable
     at any water status; the 1-percent-annual-chance zones are buildable with
     mitigation.
@@ -168,6 +188,7 @@ def site_factor(landlocked, flood_zone, usable_radius_ft=None, largest_part_acre
     elif z:
         f *= 0.75                      # 100-yr floodplain: buildable with mitigation
     f *= shape_factor(usable_radius_ft, largest_part_acres, acres)
+    f *= terrain_factor(slope_pct)
     return f
 
 

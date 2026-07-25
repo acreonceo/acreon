@@ -73,6 +73,9 @@ td.t{font-family:Georgia,serif}
 .foot{margin-top:34px;padding-top:12px;border-top:1px solid var(--line);
       font-size:10.5px;color:var(--faint);line-height:1.5}
 .parcel{page-break-inside:avoid;margin-top:26px;page-break-before:auto}
+.lede{font-size:15px;line-height:1.55;color:var(--soft);margin:6px 0 4px}
+.appendix{margin-top:38px;padding-top:8px;border-top:3px solid var(--ink);page-break-before:always}
+.appendix h2{border-bottom:none;margin-top:8px}
 h4{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
    margin:16px 0 4px;font-family:Georgia,serif}
 .aerial{margin:12px 0 6px}
@@ -267,54 +270,61 @@ def _portfolio(rows):
 
 
 def _investor_body(rows, tot, meta=None):
-    out = []
-    out.append(f"""
-    <h2>The case</h2>
-    <p>This brief covers {tot['n']} parcel{'s' if tot['n']!=1 else ''} totalling
-    {_num(tot['acres'],1)} acres in Maricopa County, currently carried at
-    {money(tot['ask'])}, or {money(tot['per_acre'])} per acre. Against a modelled
-    value of {money(tot['value'])}, the position screens at an average value score of
-    {tot['score']} out of 100, where 50 means an asset is worth what it costs.</p>
-    <p>Figures are stated for a {tot['horizon']}-year holding period. That matters:
-    the same multiple on capital is a very different investment over five years
-    than over thirty, so every parcel here is scored on return per year over that
-    period, not on value accumulated across an arbitrary window.</p>
-    <p>The thesis is not that raw land appreciates steadily. It does not. Fringe land
-    sits close to its holding value for years and then steps up sharply when it
-    becomes developable. What is being bought is the probability of that conversion,
-    discounted for the wait and net of the cost of carrying the land meanwhile. On
-    this position the model puts even odds of conversion at
-    {str(tot['p50']) + ' years' if tot['p50'] else 'beyond the 30-year horizon'}.</p>
-    <div class="note"><b>How the value is derived.</b> Conversion odds are estimated
-    from Maricopa County's own construction history: every improved parcel carries a
-    build year, so the development frontier can be reconstructed for any past year and
-    the relationship between distance-to-frontier and subsequent conversion measured
-    directly.{tot['fit_line']}</div>""")
+    out = [f"""
+    <p class="lede">{tot['n']} parcel{'s' if tot['n']!=1 else ''},
+    {_num(tot['acres'],1)} acres, carried at {money(tot['ask'])}
+    ({money(tot['per_acre'])} per acre). Average value score {tot['score']} of 100,
+    where 50 means an asset returns the target rate. Even odds of conversion at
+    {str(tot['p50']) + ' years' if tot['p50'] else 'beyond the 30-year horizon'},
+    on a {tot['horizon']}-year hold.</p>"""]
 
     for r in rows:
         ws = r.get("water_state") or "C"
         out.append(f"""
         <div class="parcel">
-        <h3>{r.get('situs_address') or r.get('apn')} &middot; {_num(r.get('acres'),2)} acres</h3>
-        <div class="sub">APN {r.get('apn')} &middot; {r.get('city') or ''} {r.get('zcta') or ''}
-          &middot; {r.get('use')}</div>
+        <h2>{r.get('situs_address') or r.get('apn')}</h2>
+        <div class="sub">{_num(r.get('acres'),2)} acres &middot; APN {r.get('apn')}
+          &middot; {r.get('city') or ''} {r.get('zcta') or ''} &middot; {r.get('use')}</div>
+        {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
         <div class="kpis">
-          <div class="kpi"><div class="k">Asking / assessed</div><div class="v">{money(r.get('price_per_acre'))}</div><div class="n">per acre</div></div>
+          <div class="kpi"><div class="k">Assessed</div><div class="v">{money(r.get('price_per_acre'))}</div><div class="n">per acre</div></div>
           <div class="kpi"><div class="k">Modelled value</div><div class="v">{money(r.get('value_per_acre'))}</div><div class="n">per acre</div></div>
           <div class="kpi"><div class="k">Return</div><div class="v">{_num(r.get('annual_return_pct'),1)}%</div><div class="n">per year, {tot['horizon']}-yr hold</div></div>
           <div class="kpi"><div class="k">Even odds by</div><div class="v">{r.get('p50_years') or '30+'}</div><div class="n">years to convert</div></div>
         </div>
-        <p><b>Water.</b> {WS_INVESTOR.get(ws, '')}</p>
-        <p><b>Position.</b> Held by {r.get('owner')} ({r.get('owner_type')}) for
+        <h4>What the ground will hold</h4>
+        <p>{_ground(r)}</p>
+        <h4>Water</h4>
+        <p>{WS_INVESTOR.get(ws, '')}</p>
+        <h4>Position</h4>
+        <p>Held by {r.get('owner')} ({r.get('owner_type')}) for
         {r.get('tenure') if r.get('tenure') is not None else 'an unrecorded period'}
         {'years' if r.get('tenure') is not None else ''}
         {', mailing out of state' if r.get('absentee') else ''}. Whole-parcel modelled
         value {money(r.get('value_total'))} against {money(r.get('est'))} carried.
         Annual carry runs {r.get('carry_pct')}% of value, computed from the tax roll
         rather than assumed.</p>
+        <h4>Recorded sales within three miles</h4>
+        {_comps_table(r)}
         </div>""")
 
-    out.append("""
+    out.append(f"""
+    <div class="appendix">
+    <h2>Appendix &middot; Method and limits</h2>
+    <h3>What is being bought</h3>
+    <p>The thesis is not that raw land appreciates steadily. It does not. Fringe
+    land sits close to its holding value for years and then steps up sharply when
+    it becomes developable. What is being bought is the probability of that
+    conversion, discounted for the wait and net of the cost of carrying the land
+    meanwhile. Figures are stated for a {tot['horizon']}-year holding period,
+    because the same multiple on capital is a very different investment over five
+    years than over thirty; every parcel here is scored on return per year over
+    that period rather than on value accumulated across an arbitrary window.</p>
+    <h3>How the timing is derived</h3>
+    <p>Conversion odds are estimated from Maricopa County's own construction
+    history: every improved parcel carries a build year, so the development
+    frontier can be reconstructed for any past year and the relationship between
+    distance-to-frontier and subsequent conversion measured directly.{tot['fit_line']}</p>
     <div class="risk"><b>What would make this wrong.</b> Both sides of the value
     comparison come from the assessor. The price basis is the parcel's full cash
     value, and the developer price it is measured against is the median full cash
@@ -327,123 +337,8 @@ def _investor_body(rows, tot, meta=None):
     been validated against realised transactions. Conversion odds are fitted on
     construction dates, which trail the speculator's actual payoff by one to four
     years. The probability that Arizona groundwater policy shifts over thirty years is
-    a judgment input, not an estimate.</div>""")
-    return "".join(out)
-
-
-def _partner_body(rows, tot, meta=None):
-    """A partner is not buying a parcel, they are buying a method. So the method
-    leads, what it cannot do is stated before what it can, and the parcels appear
-    as worked examples rather than as the ask."""
-    meta = meta or {}
-    bt = meta.get("backtest") or []
-    out = []
-    out.append(f"""
-    <h2>The thesis</h2>
-    <p>Raw fringe land is not a growth asset. It sits near its holding value for
-    years and then steps up sharply when it becomes developable. What is being
-    bought is the probability and the timing of that single event, discounted for
-    the wait and net of the cost of carrying the land meanwhile. Everything in this
-    brief follows from treating conversion as the event to be predicted, rather
-    than treating price as a trend to be extrapolated.</p>
-
-    <h2>What this method can and cannot do</h2>
-    <p><b>It can date conversion.</b> Every improved parcel in Maricopa County
-    carries a construction year, which is a census of development events going back
-    decades. The frontier can be reconstructed for any past year, each parcel's
-    distance to that frontier measured, and the relationship between distance and
-    subsequent conversion estimated from what actually happened.{tot['fit_line']}</p>
-    <p><b>It cannot appraise land.</b> Fringe parcels trade too rarely to build
-    comparable sales, and county records carry only the most recent transaction, so
-    a repeat-sales index cannot be constructed either. Any per-acre value in this
-    document is a model output resting on assessor opinion, not a market
-    observation. We treat that as a screen, not as a valuation, and we do not
-    represent it as one. Recorded sales, shown per parcel below, are the only
-    observed dollar figures here.</p>
-    <div class="note"><b>Why that distinction is the edge.</b> Timing is the part
-    of this asset class that is genuinely knowable and almost never measured.
-    Valuation is the part everyone claims and no one can evidence. Being explicit
-    about which is which is what makes the timing work credible.</div>""")
-
-    if bt:
-        trs = "".join(
-            f"<tr><td>{b.get('vintage')}</td>"
-            f"<td style='text-align:right'>{b.get('outcome_window_years')}y</td>"
-            f"<td style='text-align:right'>{_pct(_top_q(b,'conversion_rate'))}</td>"
-            f"<td style='text-align:right'>{_pct(b.get('bottom_quintile_rate'))}</td>"
-            f"<td style='text-align:right'>{_num(b.get('spread_above_floor'),1)} pp</td></tr>"
-            for b in bt if not b.get("error"))
-        out.append(f"""
-        <h2>The test</h2>
-        <p>The ranking was run forward from four past start years using only what
-        was knowable then, and scored against what was subsequently built. It was
-        then run again against a permutation floor: which cells converted was
-        reshuffled while population, parcel density and totals were held fixed, so
-        location could no longer carry information. Whatever spread survives that
-        shuffle is skill rather than geometry.</p>
-        <table>
-          <tr><th>Ranked from</th><th style="text-align:right">Watched</th>
-              <th style="text-align:right">Top fifth converted</th>
-              <th style="text-align:right">Bottom fifth</th>
-              <th style="text-align:right">Above the shuffled floor</th></tr>
-          {trs}
-        </table>
-        <p class="sub">Measured on half-mile cells of fixed ground, not parcels, so
-        subdivision cannot inflate the converted side. Cells already developed at
-        the start year are excluded, so these figures describe frontier expansion
-        and say nothing about infill.</p>""")
-
-    out.append(f"""
-    <h2>How the universe narrows</h2>
-    <p>Every vacant and agricultural parcel in the county enters. Public bodies,
-    homebuilders who already assembled their sites, and parcels whose assessed
-    figure is not a credible price are removed, because none of them are sellers.
-    What survives is screened on water status, tenure, owner type, parcel geometry
-    and road access, then ranked on modelled conversion timing. The {tot['n']}
-    parcel{'s' if tot['n']!=1 else ''} below came through that process and total
-    {_num(tot['acres'],1)} acres carried at {money(tot['ask'])}.</p>""")
-
-    for r in rows:
-        ws = r.get("water_state") or "C"
-        out.append(f"""
-        <div class="parcel">
-        <h3>{r.get('situs_address') or r.get('apn')} &middot; {_num(r.get('acres'),2)} acres</h3>
-        <div class="sub">APN {r.get('apn')} &middot; {r.get('city') or ''} {r.get('zcta') or ''}
-          &middot; {r.get('use')} &middot; {WS_LABEL.get(ws, ws)}</div>
-        {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
-        <h4>On record</h4>
-        <table>
-          <tr><td class="t">Owner</td><td style="text-align:right">{r.get('owner') or 'n/a'} ({r.get('owner_type') or 'n/a'})</td></tr>
-          <tr><td class="t">Held</td><td style="text-align:right">{str(r.get('tenure')) + ' years' if r.get('tenure') is not None else 'no recorded sale'}</td></tr>
-          <tr><td class="t">Last recorded sale</td><td style="text-align:right">{(money(r.get('paid')) + ' in ' + str(r.get('acquired'))) if r.get('paid') and r.get('acquired') else 'none on record'}</td></tr>
-          <tr><td class="t">Assessed full cash value</td><td style="text-align:right">{money(r.get('est'))} &middot; {money(r.get('price_per_acre'))}/ac</td></tr>
-          <tr><td class="t">Annual carry, from the tax roll</td><td style="text-align:right">{r.get('carry_pct')}%</td></tr>
-        </table>
-        <h4>What the ground will hold</h4>
-        <p>{_ground(r)}</p>
-        <h4>Water</h4>
-        <p>{WS_INVESTOR.get(ws, '')}</p>
-        <h4>Recorded sales within three miles</h4>
-        {_comps_table(r)}
-        <h4>Modelled timing</h4>
-        <p>Even odds of conversion at
-        {str(r.get('p50_years')) + ' years' if r.get('p50_years') else 'beyond the 30-year horizon'},
-        on a {tot['horizon']}-year view. This is the model output we stand behind;
-        the per-acre value figures elsewhere in the system are a screen and are not
-        reproduced here.</p>
-        </div>""")
-
-    out.append("""
-    <div class="risk"><b>What would make this wrong.</b> Conversion odds are fitted
-    on construction dates, which trail the speculator's payoff by one to four years,
-    so the timing shown is late rather than early. Land platted before 2008 and never
-    built reads as unconverted even though the owner was paid. The probability that
-    Arizona groundwater policy shifts over a thirty-year hold is a judgment input,
-    not an estimate, and it moves every parcel that is not already water-served. No
-    figure in this document has been validated against realised transactions,
-    because on this asset class there are not enough of them to validate against.
-    Legal access, easements, mineral and grazing rights, topography, utility
-    distances, zoning and any Luke AFB overlay have not been verified.</div>""")
+    a judgment input, not an estimate.</div>
+    </div>""")
     return "".join(out)
 
 
@@ -460,14 +355,140 @@ def _pct(v):
         return "n/a"
 
 
+def _partner_body(rows, tot, meta=None):
+    """Parcels first, method last.
+
+    The methodology is what makes the numbers credible, but what a reader needs
+    on page one is the ground: where it is, what it is, what it costs and when it
+    is likely to convert. The test that earns the timing claim, and the honest
+    statement of what this method cannot do, belong in an appendix a sceptical
+    reader will turn to.
+    """
+    meta = meta or {}
+    out = [f"""
+    <p class="lede">{tot['n']} parcel{'s' if tot['n']!=1 else ''},
+    {_num(tot['acres'],1)} acres, carried at {money(tot['ask'])}
+    ({money(tot['per_acre'])} per acre). Screened from every vacant and
+    agricultural parcel in Maricopa County and ranked on modelled time to
+    development, on a {tot['horizon']}-year view.</p>"""]
+
+    for r in rows:
+        ws = r.get("water_state") or "C"
+        out.append(f"""
+        <div class="parcel">
+        <h2>{r.get('situs_address') or r.get('apn')}</h2>
+        <div class="sub">{_num(r.get('acres'),2)} acres &middot; APN {r.get('apn')}
+          &middot; {r.get('city') or ''} {r.get('zcta') or ''} &middot; {r.get('use')}</div>
+        {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
+        <div class="kpis">
+          <div class="kpi"><div class="k">Acres</div><div class="v">{_num(r.get('acres'),0)}</div><div class="n">{money(r.get('price_per_acre'))}/ac assessed</div></div>
+          <div class="kpi"><div class="k">Even odds by</div><div class="v">{r.get('p50_years') or '30+'}</div><div class="n">years to convert</div></div>
+          <div class="kpi"><div class="k">Water</div><div class="v" style="font-size:15px">{ws}</div><div class="n">{WS_LABEL.get(ws, ws)}</div></div>
+          <div class="kpi"><div class="k">Carry</div><div class="v">{r.get('carry_pct')}%</div><div class="n">per year, tax roll</div></div>
+        </div>
+        <h4>What the ground will hold</h4>
+        <p>{_ground(r)}</p>
+        <h4>Water</h4>
+        <p>{WS_INVESTOR.get(ws, '')}</p>
+        <h4>On record</h4>
+        <table>
+          <tr><td class="t">Owner</td><td style="text-align:right">{r.get('owner') or 'n/a'} ({r.get('owner_type') or 'n/a'})</td></tr>
+          <tr><td class="t">Held</td><td style="text-align:right">{str(r.get('tenure')) + ' years' if r.get('tenure') is not None else 'no recorded sale'}</td></tr>
+          <tr><td class="t">Last recorded sale</td><td style="text-align:right">{(money(r.get('paid')) + ' in ' + str(r.get('acquired'))) if r.get('paid') and r.get('acquired') else 'none on record'}</td></tr>
+          <tr><td class="t">Assessed full cash value</td><td style="text-align:right">{money(r.get('est'))}</td></tr>
+        </table>
+        <h4>Recorded sales within three miles</h4>
+        {_comps_table(r)}
+        </div>""")
+
+    out.append(_partner_appendix(tot, meta))
+    return "".join(out)
+
+
+def _partner_appendix(tot, meta):
+    bt = (meta or {}).get("backtest") or []
+    trs = "".join(
+        f"<tr><td>{b.get('vintage')}</td>"
+        f"<td style='text-align:right'>{b.get('outcome_window_years')}y</td>"
+        f"<td style='text-align:right'>{_pct(_top_q(b,'conversion_rate'))}</td>"
+        f"<td style='text-align:right'>{_pct(b.get('bottom_quintile_rate'))}</td>"
+        f"<td style='text-align:right'>{_num(b.get('spread_above_floor'),1)} pp</td></tr>"
+        for b in bt if not b.get("error"))
+    test = f"""
+        <h3>How the ranking was tested</h3>
+        <p>The ranking was run forward from four past start years using only what
+        was knowable then, and scored against what was subsequently built. It was
+        then run again against a permutation floor: which cells converted was
+        reshuffled while population, parcel density and totals were held fixed, so
+        location could no longer carry information. Whatever spread survives that
+        shuffle is skill rather than geometry.</p>
+        <table>
+          <tr><th>Ranked from</th><th style="text-align:right">Watched</th>
+              <th style="text-align:right">Top fifth converted</th>
+              <th style="text-align:right">Bottom fifth</th>
+              <th style="text-align:right">Above the shuffled floor</th></tr>
+          {trs}
+        </table>
+        <p class="sub">Measured on half-mile cells of fixed ground, not parcels, so
+        subdivision cannot inflate the converted side. Cells already developed at
+        the start year are excluded, so these figures describe frontier expansion
+        and say nothing about infill.</p>""" if trs else ""
+    return f"""
+    <div class="appendix">
+    <h2>Appendix &middot; Method, evidence and limits</h2>
+
+    <h3>The thesis</h3>
+    <p>Raw fringe land is not a growth asset. It sits near its holding value for
+    years and then steps up sharply when it becomes developable. What is being
+    bought is the probability and the timing of that single event, discounted for
+    the wait and net of the cost of carrying the land meanwhile.</p>
+
+    <h3>What this method can do</h3>
+    <p>It dates conversion. Every improved parcel in Maricopa County carries a
+    construction year, which is a census of development events going back decades.
+    The frontier can be reconstructed for any past year, each parcel's distance to
+    it measured, and the relationship between distance and subsequent conversion
+    estimated from what actually happened.{tot['fit_line']}</p>
+    {test}
+    <h3>What it cannot do</h3>
+    <p>It cannot appraise land. Fringe parcels trade too rarely to build
+    comparable sales, and county records carry only the most recent transaction,
+    so a repeat-sales index cannot be constructed either. Any per-acre value the
+    underlying system produces rests on assessor opinion, not market observation,
+    which is why no modelled valuation appears in this document. The recorded
+    sales shown under each parcel are the only observed dollar figures here.</p>
+    <div class="note"><b>Why that distinction is the point.</b> Timing is the part
+    of this asset class that is genuinely knowable and almost never measured.
+    Valuation is the part everyone claims and no one can evidence.</div>
+
+    <h3>How the universe narrows</h3>
+    <p>Every vacant and agricultural parcel in the county enters. Public bodies,
+    homebuilders who already assembled their sites, and parcels whose assessed
+    figure is not a credible price are removed, because none of them are sellers.
+    What survives is screened on water status, tenure, owner type, parcel
+    geometry, terrain and road access, then ranked on modelled conversion
+    timing.</p>
+
+    <div class="risk"><b>What would make this wrong.</b> Conversion odds are fitted
+    on construction dates, which trail the speculator's payoff by one to four years,
+    so the timing shown is late rather than early. Land platted before 2008 and never
+    built reads as unconverted even though the owner was paid. The probability that
+    Arizona groundwater policy shifts over a thirty-year hold is a judgment input,
+    not an estimate, and it moves every parcel that is not already water-served. No
+    figure in this document has been validated against realised transactions,
+    because on this asset class there are not enough of them to validate against.
+    Legal access, easements, mineral and grazing rights, utility distances, zoning
+    and any Luke AFB overlay have not been verified.</div>
+    </div>"""
+
+
 def _developer_body(rows, tot, meta=None):
     out = []
     out.append(f"""
-    <h2>Summary</h2>
-    <p>{tot['n']} parcel{'s' if tot['n']!=1 else ''} totalling {_num(tot['acres'],1)}
-    acres in Maricopa County. This brief sets out what each parcel is, the state of
-    its water entitlement, how close development has already reached it, and what
-    would have to be resolved before a subdivision could proceed.</p>""")
+    <p class="lede">{tot['n']} parcel{'s' if tot['n']!=1 else ''},
+    {_num(tot['acres'],1)} acres in Maricopa County. What each parcel is, the state
+    of its water entitlement, what the ground will physically hold, and what would
+    have to be resolved before a subdivision could proceed.</p>""")
 
     for r in rows:
         ws = r.get("water_state") or "C"
@@ -478,6 +499,7 @@ def _developer_body(rows, tot, meta=None):
         <div class="parcel">
         <h3>{r.get('situs_address') or r.get('apn')} &middot; {_num(r.get('acres'),2)} acres</h3>
         <div class="sub">APN {r.get('apn')} &middot; {r.get('city') or ''} {r.get('zcta') or ''}</div>
+        {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
         <div>
           <span class="tag">{r.get('use')}</span>
           <span class="tag">{WS_LABEL.get(ws, ws)}</span>
@@ -493,17 +515,24 @@ def _developer_body(rows, tot, meta=None):
           <tr><td class="t">Development frontier</td><td style="text-align:right">{edge_txt}</td></tr>
           <tr><td class="t">Modelled conversion, even odds</td><td style="text-align:right">{str(r.get('p50_years')) + ' years' if r.get('p50_years') else 'beyond 30 years'}</td></tr>
         </table>
-        <p><b>Water entitlement.</b> {WS_DEVELOPER.get(ws, '')}</p>
-        <p><b>Readiness.</b> {_readiness(r)}</p>
+        <h4>What the ground will hold</h4>
+        <p>{_ground(r)}</p>
+        <h4>Water entitlement</h4>
+        <p>{WS_DEVELOPER.get(ws, '')}</p>
+        <h4>Readiness</h4>
+        <p>{_readiness(r)}</p>
+        <h4>Recorded sales within three miles</h4>
+        {_comps_table(r)}
         </div>""")
 
     out.append("""
+    <div class="appendix"><h2>Appendix &middot; Limits</h2>
     <div class="risk"><b>Diligence still required.</b> Legal access, easements, mineral
     and grazing rights, topography and washes, utility stub distances, jurisdictional
     zoning and any Luke AFB overlay have not been verified here. Acreage and value are
     taken from assessor records and should be confirmed against survey and title. The
     water designation reflects mapped determinations, not an application on this
-    parcel.</div>""")
+    parcel.</div></div>""")
     return "".join(out)
 
 
