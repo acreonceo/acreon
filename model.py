@@ -105,10 +105,27 @@ def hazard_base(growth_index, p):
 APPLY_LANDLOCK_DISCOUNT = False
 
 
-def site_factor(landlocked, flood_zone):
+def site_factor(landlocked, flood_zone, usable_radius_ft=None, largest_part_acres=None,
+                acres=None):
     """Multiplier on what a developer will pay. Floodway land is not developable
     at any water status; the 1-percent-annual-chance zones are buildable with
-    mitigation."""
+    mitigation.
+
+    Geometry matters as much as access or flood status and was previously
+    invisible, because acreage alone cannot tell a square from a ribbon. Fifty
+    acres in a square is 1,476 feet on a side. Fifty acres in a 200-foot strip
+    along a freeway is the same acreage and is not a development site.
+
+    usable_radius_ft is the radius of the largest circle that fits inside the
+    parcel (PostGIS ST_MaximumInscribedCircle). It is the honest measure of the
+    biggest pad that can be placed on the ground, and unlike acreage it does not
+    grow when a parcel is merely long.
+
+    largest_part_acres is the biggest single connected piece. A parcel split by
+    a road or a wash is not one site, and its scale is the largest piece, not
+    the sum. Where it is materially smaller than total acreage, the difference
+    is discounted rather than dropped, since fragments still carry option value.
+    """
     f = 1.0
     if landlocked and APPLY_LANDLOCK_DISCOUNT:
         f *= 0.35                      # no legal access: a 50-90% discount
@@ -117,6 +134,30 @@ def site_factor(landlocked, flood_zone):
         f *= 0.10                      # not developable at any water status
     elif z:
         f *= 0.75                      # 100-yr floodplain: buildable with mitigation
+    f *= shape_factor(usable_radius_ft, largest_part_acres, acres)
+    return f
+
+
+# Depth thresholds a developer actually faces. Standard single-family lots need
+# roughly 300 feet of depth for two-sided blocks; a commercial pad needs about
+# 200; below about 100 feet the ground supports signage, utilities and drainage
+# and nothing else.
+SHAPE_BANDS = [(100.0, 0.15), (200.0, 0.40), (300.0, 0.70), (450.0, 0.90)]
+
+def shape_factor(usable_radius_ft=None, largest_part_acres=None, acres=None):
+    """1.0 for ground that can hold a development, falling toward 0.15 for
+    ribbons and slivers. Returns 1.0 when geometry has not been measured, so an
+    unmeasured parcel is never silently penalised."""
+    f = 1.0
+    if usable_radius_ft is not None:
+        r = max(0.0, float(usable_radius_ft))
+        f *= next((v for edge, v in SHAPE_BANDS if r < edge), 1.0)
+    if largest_part_acres is not None and acres:
+        a, lp = float(acres), float(largest_part_acres)
+        if a > 0 and lp > 0:
+            # scale by the share of acreage in the biggest connected piece,
+            # floored so a fragmented parcel is discounted, not erased
+            f *= max(0.35, min(1.0, lp / a))
     return f
 
 

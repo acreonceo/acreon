@@ -760,6 +760,12 @@ async function loadTargets(){
   gateApns=modelFiltersOn()?rows.map(r=>r.apn):null;
   applyMapFilter();
   syncMapCaption(rows.length);
+  // Repaint the ranked-parcel overlay from THIS result set before any early
+  // return. Bailing out on an empty list used to leave the previous query's dots
+  // sitting on the map next to the words "no parcels match these filters".
+  const tsrc=map.getSource("targets");
+  if(tsrc) tsrc.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
+    geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.value_ratio||0}}))});
   if(!rows.length){ el.innerHTML=`<div class="empty">No parcels match these filters.</div>`; return; }
   el.innerHTML=rows.map(r=>`
     <div class="card" data-apn="${r.apn}" data-lon="${r.lon}" data-lat="${r.lat}">
@@ -776,15 +782,14 @@ async function loadTargets(){
     if(e.target.classList.contains("selbox")) return;
     openParcel(c.dataset.apn); map.flyTo({center:[+c.dataset.lon,+c.dataset.lat],zoom:13});}));
   syncSel();
-  const src=map.getSource("targets");
-  if(src) src.setData({type:"FeatureCollection",features:rows.map(r=>({type:"Feature",
-    geometry:{type:"Point",coordinates:[r.lon,r.lat]},properties:{apn:r.apn,score:r.value_ratio||0}}))});
 }
 // States plainly whether the shaded parcels are the same set as the list, so a
 // mismatch is never left for the user to discover by counting.
 function syncMapCaption(n){
   const el=document.getElementById("mapSync"); if(!el) return;
-  if(modelFiltersOn())
+  if(n===0)
+    el.textContent="Nothing matches. The map is empty too.";
+  else if(modelFiltersOn())
     el.textContent=`Map is showing the ${n} ranked parcels below. Score and timing are model outputs, so the map can only show them once the list is valued.`;
   else if(n>=80)
     el.textContent="Map shows every parcel matching these filters. The list is capped at the top 80 by the chosen sort.";

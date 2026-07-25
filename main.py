@@ -43,6 +43,8 @@ REQUIRED_PARCEL_COLUMNS = {
     "mail_address": "text", "water_state": "text", "carry_rate": "numeric",
     "edge_miles": "numeric", "hazard_fitted": "numeric", "landlocked": "boolean",
     "flood_zone": "text", "zoning": "text", "jurisdiction": "text",
+    "usable_radius_ft": "numeric", "largest_part_acres": "numeric",
+    "compactness": "numeric", "parts": "integer",
 }
 REQUIRED_ZONE_COLUMNS = {"dev_value_per_acre": "numeric", "median_price_per_acre": "numeric",
                          "vacant_price_per_acre": "numeric"}
@@ -359,6 +361,7 @@ def _candidates(where_sql, params):
              p.mail_address, COALESCE(p.water_state,'C') AS water_state,
              p.carry_rate, p.hazard_fitted, p.landlocked, p.flood_zone, p.edge_miles,
              p.zoning, p.jurisdiction,
+             p.usable_radius_ft, p.largest_part_acres, p.compactness, p.parts,
              z.signals AS signals, z.dev_value_per_acre, z.median_price_per_acre,
              z.vacant_price_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
@@ -436,7 +439,9 @@ def _valued(rows, p, horizon=10):
         if key not in cache:
             cache[key] = MODEL.path(gi, st, p, hazard_override=hf)
         c = cache[key]
-        site = MODEL.site_factor(r.get("landlocked"), r.get("flood_zone"))
+        site = MODEL.site_factor(r.get("landlocked"), r.get("flood_zone"),
+                                 r.get("usable_radius_ft"), r.get("largest_part_acres"),
+                                 acres)
         price_ac = est / acres
         d0 = float(r["dev_value_per_acre"] or 0) or price_ac * 3.0
         cr = float(r["carry_rate"]) if r["carry_rate"] is not None else MODEL.carry_rate(est, r["assessed"])
@@ -2203,6 +2208,41 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
 # Landlocked: share of the parcel boundary touching other parcels. Public
 # right-of-way is generally not parcelled, so a parcel whose perimeter is almost
 # entirely shared with neighbours has no frontage and no legal access.
+# Acreage cannot distinguish a square from a ribbon. These four measures can.
+#   usable_radius_ft   radius of the largest circle that fits inside the parcel.
+#                      A 50-acre square gives ~738 ft; a 50-acre strip 200 ft
+#                      wide gives ~100 ft however long it runs.
+#   largest_part_acres biggest connected piece. Ground split by a road or a wash
+#                      is not one site.
+#   compactness        Polsby-Popper, 4*pi*A / P^2. Circle 1.0, square 0.79,
+#                      a two-mile ribbon near zero.
+#   parts              number of disjoint pieces.
+# Geography casts keep everything in metres regardless of the stored SRID.
+SHAPE_SQL = """
+UPDATE parcels p SET
+  usable_radius_ft   = sub.radius_ft,
+  largest_part_acres = sub.largest_acres,
+  compactness        = sub.pp,
+  parts              = sub.parts
+FROM (
+  SELECT p2.apn,
+         round((ST_MaximumInscribedCircle(p2.geom)).radius::numeric
+               * ST_Length(ST_MakeLine(ST_Point(0, ST_Y(p2.centroid)),
+                                       ST_Point(1, ST_Y(p2.centroid)))::geography)::numeric
+               * 3.28084, 1) AS radius_ft,
+         round((SELECT max(ST_Area(g.geom::geography)) / 4046.86
+                  FROM ST_Dump(p2.geom) g)::numeric, 3) AS largest_acres,
+         round(CASE WHEN ST_Perimeter(p2.geom::geography) > 0
+                    THEN (4 * pi() * ST_Area(p2.geom::geography)
+                          / power(ST_Perimeter(p2.geom::geography), 2))::numeric
+                    ELSE NULL END, 4) AS pp,
+         ST_NumGeometries(ST_Multi(p2.geom)) AS parts
+  FROM parcels p2
+  WHERE p2.geom IS NOT NULL AND p2.centroid IS NOT NULL
+) sub
+WHERE p.apn = sub.apn;
+"""
+
 LANDLOCK_SQL = """
 UPDATE parcels p SET landlocked = COALESCE(sub.shared, 0) > 0.97
 FROM (
@@ -2427,7 +2467,15 @@ def run_screens(do_flood=True, flood_source=None):
                 for stmt in [s for s in LANDLOCK_SQL.split(";") if s.strip()]:
                     cur.execute(stmt)
             c.commit()
+            SIGNAL_STATUS["detail"] = "measuring parcel geometry"
+            with c.cursor() as cur:
+                cur.execute(SHAPE_SQL)
+            c.commit()
             ll = c.execute("SELECT count(*) FROM parcels WHERE landlocked").fetchone()[0]
+            shp = c.execute("""SELECT count(*) FILTER (WHERE usable_radius_ft IS NOT NULL),
+                                      count(*) FILTER (WHERE usable_radius_ft < 100),
+                                      count(*) FILTER (WHERE parts > 1)
+                               FROM parcels""").fetchone()
         flood, flood_err = 0, None
         if do_flood:
             # FEMA serves a single polygon but resets on tiled queries, so each
@@ -2481,6 +2529,7 @@ def run_screens(do_flood=True, flood_source=None):
             else:
                 flood_err = "; ".join(errors)[:220]
         out = {"state": "done", "kind": "screens", "landlocked": ll, "flood_zone": flood,
+               "shape_measured": shp[0], "under_100ft_wide": shp[1], "multi_part": shp[2],
                "flood_source": SIGNAL_STATUS.get("flood_source"),
                "flood_polygons": SIGNAL_STATUS.get("flood_polygons")}
         if flood_err:
