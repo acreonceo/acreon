@@ -1777,7 +1777,18 @@ WHERE z.zcta = za.zcta;
 
 # Water gate from real ADWR data: fraction of each zone covered by issued
 # Assured/Adequate Water Supply determinations -> water_status.
-AAWS_URL = "https://services.arcgis.com/C34zQ7veRS0V1t04/ArcGIS/rest/services/AAWS_Issued_Determination_2024/FeatureServer/0/query"
+# ADWR grants assured supply two ways and this layer is only one of them.
+# Designated providers (Phoenix, Mesa, Scottsdale) hold a blanket designation
+# over their whole service area; subdivisions inside them never file
+# individually. Certificates and analyses are issued to subdivisions OUTSIDE
+# those areas, mostly on the fringe. Ingesting only the second inverts the
+# signal: 85045 sits entirely inside Phoenix and returned aaws_coverage 0.0,
+# scoring groundwater-constrained, while fringe zones full of individual
+# certificates scored assured. Both layers are needed. Use /admin/probe_water
+# to find the designated-provider layer, then add it here.
+ADWR_ORG = "https://services.arcgis.com/C34zQ7veRS0V1t04/ArcGIS/rest/services"
+AAWS_URL = f"{ADWR_ORG}/AAWS_Issued_Determination_2024/FeatureServer/0/query"
+AAWS_URLS = [AAWS_URL]
 # zones.water_status and zones.signals->>'water_status' were two different
 # numbers wearing one name. The column is derived here from real AAWS polygon
 # coverage and is what GROWTH_DEFAULT_EXPR gates on. The JSONB key is a seed
@@ -2031,7 +2042,11 @@ def run_signals(kind="migration"):
                 c.commit()
         else:
             SIGNAL_STATUS = {"state": "error", "detail": f"unknown kind: {kind}"}; return
-        SIGNAL_STATUS = {"state": "done", "kind": kind, "zones_updated": updated}
+        # Carry any diagnostics the branch stashed, instead of replacing the dict
+        # and discarding them, which is what swallowed the water reconciliation.
+        extra = {k: v for k, v in SIGNAL_STATUS.items()
+                 if k not in ("state", "kind", "detail", "zones_updated")}
+        SIGNAL_STATUS = {"state": "done", "kind": kind, "zones_updated": updated, **extra}
     except Exception as e:
         SIGNAL_STATUS = {"state": "error", "detail": str(e)[:200]}
 
@@ -3135,6 +3150,68 @@ def admin_ingest_roads(token: str, source: str = None, tiles: int = 8):
     threading.Thread(target=run_ingest_roads,
                      kwargs={"source": source, "tiles": tiles}, daemon=True).start()
     return {"state": "started", "kind": "roads", "next": "poll /admin/signals_status"}
+
+@app.get("/admin/probe_water")
+def admin_probe_water(token: str, keyword: str = ""):
+    """Walk ADWR's ArcGIS org and list water layers BY NAME with a live count
+    over Maricopa.
+
+    The current AAWS layer covers issued certificates only, which are granted to
+    subdivisions outside designated provider service areas. Inside Phoenix the
+    coverage is therefore zero and the water signal reads backwards. This finds
+    the designated-provider layer rather than guessing at its service name, the
+    same way layer discovery found TIGER's Local Roads at index 8.
+    """
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    with pool.connection() as c:
+        bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
+                       "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+    env = {"geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
+           "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+           "spatialRel": "esriSpatialRelIntersects",
+           "where": "1=1", "returnCountOnly": "true", "f": "json"}
+    words = ([keyword.lower()] if keyword else
+             ["aws", "assured", "designat", "provider", "service", "certificate",
+              "analysis", "water"])
+    out, errors = [], []
+    try:
+        r = requests.get(ADWR_ORG, params={"f": "json"}, timeout=60,
+                         headers={"User-Agent": BROWSER_UA})
+        svcs = r.json().get("services") or []
+    except Exception as e:
+        return {"error": f"could not list the ADWR org: {str(e)[:160]}"}
+    hits = [x for x in svcs
+            if any(w in (x.get("name") or "").lower() for w in words)]
+    for svc in hits[:25]:
+        name, typ = svc.get("name"), svc.get("type", "FeatureServer")
+        root = f"{ADWR_ORG}/{name.split('/')[-1]}/{typ}"
+        try:
+            j = requests.get(root, params={"f": "json"}, timeout=45,
+                             headers={"User-Agent": BROWSER_UA}).json()
+            for lyr in (j.get("layers") or []):
+                q = f"{root}/{lyr.get('id')}/query"
+                rec = {"service": name, "layer_id": lyr.get("id"),
+                       "layer_name": lyr.get("name"), "query_url": q}
+                try:
+                    cj = requests.get(q, params=env, timeout=45,
+                                      headers={"User-Agent": BROWSER_UA}).json()
+                    rec["features_over_maricopa"] = cj.get("count")
+                except Exception as e:
+                    rec["error"] = str(e)[:100]
+                out.append(rec)
+        except Exception as e:
+            errors.append(f"{name}: {str(e)[:100]}")
+    usable = [o for o in out if isinstance(o.get("features_over_maricopa"), int)
+              and o["features_over_maricopa"] > 0]
+    usable.sort(key=lambda o: -o["features_over_maricopa"])
+    return {"services_matched": [x.get("name") for x in hits],
+            "layers": out, "errors": errors or None,
+            "ranked_by_coverage": [{"name": o["layer_name"], "service": o["service"],
+                                    "features": o["features_over_maricopa"],
+                                    "url": o["query_url"]} for o in usable[:12]],
+            "next": ("Look for a designated-provider or service-area layer in "
+                     "ranked_by_coverage, then send me its url.")}
 
 @app.get("/admin/probe_roads")
 def admin_probe_roads(token: str):
