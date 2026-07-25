@@ -1842,7 +1842,9 @@ WATER_OVERLAY_SQL = """
 WITH served AS (
   SELECT geom FROM aaws
   UNION ALL
-  SELECT geom FROM cws WHERE population >= %(minpop)s AND coalesce(status,'A') = 'A'
+  SELECT geom FROM cws
+   WHERE right_type ILIKE 'LARGE%%' AND population >= %(minpop)s
+     AND coalesce(status,'A') = 'A'
 ), cov AS (
   SELECT z.zcta,
     COALESCE(SUM(ST_Area(ST_Intersection(z.geom, a.geom))),0) / NULLIF(ST_Area(z.geom),0) AS frac
@@ -2049,10 +2051,17 @@ def run_signals(kind="migration"):
                     cur.execute("""
                       UPDATE parcels p SET water_state = CASE
                         WHEN EXISTS (SELECT 1 FROM aaws a WHERE ST_Contains(a.geom, p.centroid)) THEN 'A'
+                        -- Ordering matters. Irrigated farmland inside a provider's
+                        -- service area is still farmland carrying a grandfathered
+                        -- right, and that right is the SB1611 conversion path.
+                        -- Checking the service area first collapsed B from tens of
+                        -- thousands of parcels to 2,620 and erased the thesis.
+                        WHEN p.use = 'Agricultural' THEN 'B'
                         WHEN EXISTS (SELECT 1 FROM cws w WHERE ST_Contains(w.geom, p.centroid)
+                                       AND w.right_type ILIKE 'LARGE%'
                                        AND w.population >= 10000
                                        AND coalesce(w.status,'A') = 'A') THEN 'A'
-                        WHEN p.use = 'Agricultural' THEN 'B' ELSE 'C' END
+                        ELSE 'C' END
                     """)
                     # carry from the tax roll, not a flat assumption
                     cur.execute("""
