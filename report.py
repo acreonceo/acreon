@@ -233,6 +233,16 @@ def _ground(r):
     return " ".join(out) or "Parcel geometry has not been measured."
 
 
+def _warnings(r):
+    ws = r.get("warnings") or []
+    if not ws:
+        return ""
+    items = "".join(f"<li>{w}</li>" for w in ws)
+    return (f'<div class="risk"><b>This parcel did not pass the screen.</b> It was '
+            f'reached directly by APN, so the filters that build the target list '
+            f'were not applied.<ul style="margin:6px 0 0 16px">{items}</ul></div>')
+
+
 def _comps_table(r):
     cs = r.get("comps") or []
     if not cs:
@@ -240,8 +250,12 @@ def _comps_table(r):
                 'agricultural land within three miles in the last ten years. On fringe '
                 'ground that is common, and it is the reason a comparable-sales '
                 'valuation cannot be produced here.</p>')
+    def _label(c):
+        n = c.get("parcels_in_sale") or 1
+        base = c.get("situs_address") or c.get("apn")
+        return f"{base} <span class='sub'>and {n-1} more in one sale</span>" if n > 1 else base
     rowsh = "".join(
-        f"<tr><td class='t'>{c.get('situs_address') or c.get('apn')}</td>"
+        f"<tr><td class='t'>{_label(c)}</td>"
         f"<td style='text-align:right'>{_num(c.get('acres'),1)}</td>"
         f"<td style='text-align:right'>{money(c.get('paid'))}</td>"
         f"<td style='text-align:right'>{money(c.get('price_per_acre'))}</td>"
@@ -252,8 +266,11 @@ def _comps_table(r):
             f"<th style='text-align:right'>Paid</th><th style='text-align:right'>$/acre</th>"
             f"<th style='text-align:right'>Year</th><th style='text-align:right'>Miles</th></tr>"
             f"{rowsh}</table>"
-            f"<p class='sub'>Recorded transactions, not estimates. These are the only "
-            f"observed dollar figures in this document.</p>")
+            f"<p class='sub'>Recorded transactions, not estimates. Where one sale "
+            f"covered several parcels the county writes the full price against each "
+            f"of them, so those rows are collapsed: the price is the transaction and "
+            f"the acreage is every parcel it covered. These are the only observed "
+            f"dollar figures in this document.</p>")
 
 
 def _portfolio(rows):
@@ -285,6 +302,7 @@ def _investor_body(rows, tot, meta=None):
         <h2>{r.get('situs_address') or r.get('apn')}</h2>
         <div class="sub">{_num(r.get('acres'),2)} acres &middot; APN {r.get('apn')}
           &middot; {r.get('city') or ''} {r.get('zcta') or ''} &middot; {r.get('use')}</div>
+        {_warnings(r)}
         {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
         <div class="kpis">
           <div class="kpi"><div class="k">Assessed</div><div class="v">{money(r.get('price_per_acre'))}</div><div class="n">per acre</div></div>
@@ -379,6 +397,7 @@ def _partner_body(rows, tot, meta=None):
         <h2>{r.get('situs_address') or r.get('apn')}</h2>
         <div class="sub">{_num(r.get('acres'),2)} acres &middot; APN {r.get('apn')}
           &middot; {r.get('city') or ''} {r.get('zcta') or ''} &middot; {r.get('use')}</div>
+        {_warnings(r)}
         {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
         <div class="kpis">
           <div class="kpi"><div class="k">Acres</div><div class="v">{_num(r.get('acres'),0)}</div><div class="n">{money(r.get('price_per_acre'))}/ac assessed</div></div>
@@ -499,6 +518,7 @@ def _developer_body(rows, tot, meta=None):
         <div class="parcel">
         <h3>{r.get('situs_address') or r.get('apn')} &middot; {_num(r.get('acres'),2)} acres</h3>
         <div class="sub">APN {r.get('apn')} &middot; {r.get('city') or ''} {r.get('zcta') or ''}</div>
+        {_warnings(r)}
         {_aerial(r, caption='Parcel boundary in yellow. Imagery: Esri World Imagery.')}
         <div>
           <span class="tag">{r.get('use')}</span>

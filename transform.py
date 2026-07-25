@@ -28,7 +28,15 @@ BUILDER_KEYS = ("HOMES","HOME","HOMEBUILDER","HOMEBUILDERS","HOMEBUILDING","BUIL
                 "CONTRACTORS","DEVELOPMENT","DEVELOPMENTS","DEVELOPERS","DEVELOPER",
                 "COMMUNITIES","DR HORTON","D R HORTON","LENNAR","PULTE","MERITAGE",
                 "TAYLOR MORRISON","KB HOME","RICHMOND AMERICAN","TRI POINTE","SHEA",
-                "MATTAMY","ASHTON WOODS","TOLL BROTHERS","BROOKFIELD RESIDENTIAL")
+                "MATTAMY","ASHTON WOODS","TOLL BROTHERS","BROOKFIELD RESIDENTIAL",
+                # Builders hold land through subsidiaries whose names do not
+                # contain the parent's. DRH ENERGY INC is D R Horton and was
+                # classifying as an ordinary investor.
+                "DRH","DRHI","PULTE GROUP","PULTEGROUP","CENTURY COMMUNITIES",
+                "LGI","LGI HOMES","BEAZER","HOVNANIAN","WOODSIDE","MARACAY",
+                "BLANDFORD","FULTON","ELLIOTT HOMES","GEHAN","STARLIGHT",
+                "TRIPOINTE","TRI POINTE","WILLIAM LYON","GARRETT WALKER",
+                "ROSEWOOD HOMES","CAMELOT HOMES","VIP HOMES","PORCHLIGHT")
 
 US_STATES = {
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY",

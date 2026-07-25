@@ -718,20 +718,48 @@ def evidence(apn: str = "", rank: float = None):
 # is a recorded transaction rather than a model output.
 @app.get("/comps")
 def comps(apn: str, radius_miles: float = 3.0, years: int = 10, limit: int = 25):
+    """Recorded sales near a parcel, with bulk transactions collapsed.
+
+    The county records a multi-parcel sale by writing the FULL transaction price
+    against every parcel in it. A builder buying a subdivision phase for $3.38M
+    therefore leaves twelve tenth-acre lots each showing $3.38M, and dividing by
+    one lot's acreage produced $23.6M per acre. Grouping by price and year
+    recovers the real comp: the same $3.38M against the summed acreage of every
+    parcel that shares it, which is what the builder actually paid per acre.
+    """
     return qall("""
-      SELECT c.apn, c.situs_address, c.city, c.acres, c.paid, c.acquired,
-             round(c.paid / NULLIF(c.acres,0)) AS price_per_acre,
-             c.use, COALESCE(c.water_state,'C') AS water_state,
-             round((ST_Distance(p.centroid::geography, c.centroid::geography)/1609.34)::numeric, 2) AS miles_away
-      FROM parcels p
-      JOIN parcels c ON c.apn <> p.apn
-      WHERE p.apn = %s
-        AND c.paid > 0 AND c.acres > 0 AND c.acquired >= %s
-        AND c.use IN ('Vacant','Agricultural')
-        AND ST_DWithin(p.centroid::geography, c.centroid::geography, %s)
-      ORDER BY ST_Distance(p.centroid::geography, c.centroid::geography)
-      LIMIT %s
-    """, (apn, 2026 - years, radius_miles * 1609.34, limit))
+      WITH near AS (
+        SELECT c.apn, c.situs_address, c.city, c.acres, c.paid, c.acquired, c.use,
+               COALESCE(c.water_state,'C') AS water_state,
+               ST_Distance(p.centroid::geography, c.centroid::geography) AS m
+        FROM parcels p
+        JOIN parcels c ON c.apn <> p.apn
+        WHERE p.apn = %(apn)s
+          AND c.paid > 0 AND c.acres > 0 AND c.acquired >= %(since)s
+          AND c.use IN ('Vacant','Agricultural')
+          AND ST_DWithin(p.centroid::geography, c.centroid::geography, %(radius)s)
+      ), grouped AS (
+        SELECT paid, acquired,
+               count(*) AS parcels_in_sale,
+               sum(acres) AS acres,
+               min(m) AS m,
+               (array_agg(apn ORDER BY m))[1] AS apn,
+               (array_agg(situs_address ORDER BY m))[1] AS situs_address,
+               (array_agg(city ORDER BY m))[1] AS city,
+               (array_agg(use ORDER BY m))[1] AS use,
+               (array_agg(water_state ORDER BY m))[1] AS water_state
+        FROM near GROUP BY paid, acquired
+      )
+      SELECT apn, situs_address, city, acres, paid, acquired, use, water_state,
+             parcels_in_sale,
+             round(paid / NULLIF(acres,0)) AS price_per_acre,
+             round((m/1609.34)::numeric, 2) AS miles_away
+      FROM grouped
+      WHERE paid / NULLIF(acres,0) BETWEEN %(floor)s AND %(ceil)s
+      ORDER BY m
+      LIMIT %(lim)s
+    """, {"apn": apn, "since": 2026 - years, "radius": radius_miles * 1609.34,
+          "floor": MIN_CREDIBLE_PPA, "ceil": 5_000_000, "lim": limit})
 
 @app.get("/targets")
 def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
@@ -755,6 +783,12 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres
         r.pop("mail_address", None)
     return vals
 
+def money_str(v):
+    try:
+        return f"${float(v):,.0f}"
+    except (TypeError, ValueError):
+        return "an unusable figure"
+
 @app.get("/report")
 def report(apns: str, audience: str = "investor", horizon: int = 10,
            lambda_p: float = None, h_max: float = None, g_d: float = None, rho: float = None):
@@ -773,6 +807,21 @@ def report(apns: str, audience: str = "investor", horizon: int = 10,
     # Geometry for the aerial outline, and recorded sales nearby. Comps are the
     # only dollar figures in the system that are transactions rather than
     # opinions, so a document meant for a third party leads with them.
+    # /report reaches parcels by APN, so none of the screens the target list
+    # applies have run. A parcel can therefore reach a document that the system
+    # itself considers unsellable or unpriceable. Flag rather than refuse: the
+    # caller may legitimately want to look at one.
+    for r in vals:
+        w = []
+        if not r.get("price_reliable"):
+            w.append(f"Assessed value is {money_str(r.get('price_per_acre'))} per acre, "
+                     f"below the credible floor. It is not a price and no ratio built "
+                     f"on it means anything.")
+        if (r.get("owner_type") or "") == "Builder/Developer":
+            w.append("Owned by a homebuilder, which is normally excluded from the "
+                     "target list because builders assemble sites to build on, not "
+                     "to resell.")
+        r["warnings"] = w
     apns = [r["apn"] for r in vals]
     geo = {g["apn"]: g["gj"] for g in qall(
         "SELECT apn, ST_AsGeoJSON(ST_SimplifyPreserveTopology(geom, 0.00002)) AS gj "
