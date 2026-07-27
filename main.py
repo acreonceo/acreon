@@ -2471,9 +2471,13 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
                     upd.append((HZ.annual_hazard(p5), apn))
                 cur.executemany("UPDATE parcels SET hazard_fitted=%s WHERE apn=%s", upd)
             c.commit()
+        # Carry the diagnostics the run collected instead of replacing the dict
+        # and discarding them, which is what hid frontier_cells last time.
+        extra = {k: v for k, v in SIGNAL_STATUS.items()
+                 if k in ("frontier_cells", "edge_miles_p50_p90_max")}
         SIGNAL_STATUS = {"state": "done", "kind": "hazard", "panel_rows": len(rows),
                          "conversion_events": events, "parcels_scored": len(rows2),
-                         "coefficients": summary}
+                         "coefficients": summary, **extra}
     except Exception as e:
         SIGNAL_STATUS = {"state": "error", "kind": "hazard", "detail": str(e)[:250]}
 

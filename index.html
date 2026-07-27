@@ -368,9 +368,13 @@ const MODE_LEGEND = {
 
 function timingColorExpr(){
   // median years to conversion = ln(2) / annual hazard
-  const yrs = ["/", 0.6931, ["max", 0.002, ["to-number", ["get", "hazard_fitted"], 0.002]]];
+  // Calibrated to what the fit actually produces, not to what a five-year
+  // horizon would feel like. With the density-based frontier the best-positioned
+  // land in the county carries a 20-year median and the far desert runs to
+  // centuries, so stops of 5/10/20/40 painted all but the nearest band red.
+  const yrs = ["/", 0.6931, ["max", 0.0004, ["to-number", ["get", "hazard_fitted"], 0.0004]]];
   return ["interpolate", ["linear"], yrs,
-          5, "#1a9850", 10, "#a6d96a", 20, "#fee08b", 40, "#d73027"];
+          20, "#1a9850", 35, "#a6d96a", 60, "#fee08b", 150, "#d73027"];
 }
 
 function edgeColorExpr(){
