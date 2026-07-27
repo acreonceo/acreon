@@ -193,6 +193,7 @@ SELECT ST_AsMVT(t,'parcels') FROM (
                THEN 1 ELSE 0 END) AS price_ok,
          round(COALESCE(s.ppa,0))::bigint AS ppa,
          s.tenure, s.owner_type, s.est, s.water_state,
+         s.hazard_fitted, s.edge_miles,
          s.absentee, s.public_owner,
          s.landlocked, s.flood_zone, s.carry_rate, s.target_score, s.growth_score,
          s.geom
@@ -203,6 +204,8 @@ SELECT ST_AsMVT(t,'parcels') FROM (
                    THEN NULLIF(z.vacant_price_per_acre, 0)
                  ELSE p.est / p.acres END) AS ppa,
            z.median_price_per_acre AS zmed,
+           round(coalesce(p.hazard_fitted,0)::numeric, 5)::float8 AS hazard_fitted,
+           round(coalesce(p.edge_miles,0)::numeric, 3)::float8 AS edge_miles,
            coalesce(p.tenure,0)::int AS tenure,
            p.owner_type,
            p.est::bigint AS est,

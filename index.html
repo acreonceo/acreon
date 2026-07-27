@@ -163,9 +163,14 @@
     </div>
 
     <div class="legend">
-      <div style="font-weight:700;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:4px">Growth outlook</div>
-      <div class="row"><span>Lower</span><div class="bar"></div><span>Higher</span></div>
-      <div class="lbls" style="width:186px"><span id="legMode">shaded by ZIP region</span></div>
+      <div style="font-weight:700;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:4px">Colour the map by</div>
+      <select id="colorMode" style="width:100%;padding:4px 6px;font:inherit;font-size:11.5px;border:1px solid var(--line-strong);border-radius:6px;background:#fff;margin-bottom:5px">
+        <option value="timing">Time to development</option>
+        <option value="value">Price vs modelled value</option>
+        <option value="edge">Distance to built edge</option>
+      </select>
+      <div class="row"><span id="legLo">Later</span><div class="bar"></div><span id="legHi">Sooner</span></div>
+      <div class="lbls" style="width:186px"><span id="legMode">median years to development</span></div>
     </div>
   </div>
 </div>
@@ -344,7 +349,35 @@ function recolorZones(){ computeZoneColors(); if(map.getSource("zones")) map.get
 // hazard path, so the path coefficients go in as a per-(zone,state) lookup.
 const FALLBACK_COLOR=["interpolate",["linear"],["to-number",["get","target_score"],0],
   0,"#d73027",25,"#fc8d59",40,"#fee08b",55,"#a6d96a",70,"#1a9850"];
+// What the map is coloured by. This used to be hard-wired to the price-versus-
+// modelled-value ratio while the legend read "Growth outlook", which inverted
+// the reading: cheap remote desert glowed green and prime ground inside the
+// build-out edge went red, on the same screen as a panel calling that ground
+// top-fifth with 63.9% historical conversion. Timing is now the default,
+// because it is the quantity the backtest actually validated and it is what a
+// reader assumes a growth map is showing.
+let colorMode = "timing";
+const MODE_LEGEND = {
+  timing: ["Later", "Sooner"],
+  value:  ["Costlier", "Cheaper"],
+  edge:   ["Farther out", "At the edge"],
+};
+
+function timingColorExpr(){
+  // median years to conversion = ln(2) / annual hazard
+  const yrs = ["/", 0.6931, ["max", 0.002, ["to-number", ["get", "hazard_fitted"], 0.002]]];
+  return ["interpolate", ["linear"], yrs,
+          5, "#1a9850", 10, "#a6d96a", 20, "#fee08b", 40, "#d73027"];
+}
+
+function edgeColorExpr(){
+  return ["interpolate", ["linear"], ["to-number", ["get", "edge_miles"], 99],
+          0.25, "#1a9850", 1, "#a6d96a", 3, "#fee08b", 8, "#d73027"];
+}
+
 function parcelColorExpr(){
+  if(colorMode === "timing") return timingColorExpr();
+  if(colorMode === "edge")   return edgeColorExpr();
   try{
     if(!zonesGeo||!zonesGeo.features.length) return FALLBACK_COLOR;
     const payoff=[],d0=[];const seen=new Set();
@@ -820,6 +853,18 @@ document.querySelectorAll("#parcelReports button").forEach(b=>b.addEventListener
   const p=new URLSearchParams({apns:selApn,audience:b.dataset.a,...modelParams()});
   window.open(API+"/report?"+p,"_blank");
 }));
+document.getElementById("colorMode").addEventListener("change", e => {
+  colorMode = e.target.value;
+  const [lo, hi] = MODE_LEGEND[colorMode] || ["Lower","Higher"];
+  document.getElementById("legLo").textContent = lo;
+  document.getElementById("legHi").textContent = hi;
+  const lm = document.getElementById("legMode");
+  if(lm) lm.textContent = colorMode === "timing" ? "median years to development"
+        : colorMode === "edge" ? "miles to the nearest built parcel"
+        : "cheapness, not growth: assessed price vs modelled value";
+  if(map.getLayer("parcels-fill"))
+    map.setPaintProperty("parcels-fill", "fill-color", parcelColorExpr());
+});
 document.getElementById("resetF").addEventListener("click",()=>{
   ["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fSort"]
     .forEach(id=>{ const el=document.getElementById(id); if(el) el.selectedIndex=0; });
@@ -885,7 +930,10 @@ function showTab(t){
   document.getElementById("pane-targets").style.display=t==="targets"?"block":"none";
   document.getElementById("pane-blocks").style.display=t==="blocks"?"block":"none";
   const lm=document.getElementById("legMode");
-  if(lm) lm.textContent=t==="targets"?"parcels by value score":(t==="blocks"?"owner land blocks":"parcels by value score");
+  if(lm) lm.textContent = t==="blocks" ? "owner land blocks"
+        : (colorMode==="timing" ? "median years to development"
+           : colorMode==="edge" ? "miles to the nearest built parcel"
+           : "cheapness, not growth: assessed price vs modelled value");
   if(t==="targets"){ if(targetsDirty||!document.getElementById("targetList").children.length) loadTargets(); }
   else if(t==="blocks"){ if(blocksDirty||!document.getElementById("blockList").children.length) loadBlocks(); }
   else { const s=map.getSource("targets"); if(s) s.setData({type:"FeatureCollection",features:[]}); }
