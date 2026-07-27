@@ -196,7 +196,7 @@ SELECT ST_AsMVT(t,'parcels') FROM (
          round(COALESCE(s.ppa,0))::bigint AS ppa,
          s.tenure, s.owner_type, s.est, s.water_state,
          s.hazard_fitted, s.edge_miles,
-         s.absentee, s.public_owner,
+         s.absentee, s.public_owner, s.enviro_on_site,
          s.landlocked, s.flood_zone, s.carry_rate, s.target_score, s.growth_score,
          s.geom
   FROM (
@@ -213,6 +213,7 @@ SELECT ST_AsMVT(t,'parcels') FROM (
            p.est::bigint AS est,
            COALESCE(p.water_state,'C') AS water_state,
            (CASE WHEN p.absentee IS TRUE THEN 1 ELSE 0 END) AS absentee,
+           coalesce(p.enviro_on_site,0)::int AS enviro_on_site,
            (CASE WHEN coalesce(p.owner,'') ILIKE ANY(%(pub)s)
                    OR coalesce(p.owner,'') ~* ANY(%(pubre)s) THEN 1 ELSE 0 END) AS public_owner,
            COALESCE(p.landlocked,false) AS landlocked,
@@ -421,7 +422,8 @@ SORT_KEYS = {
 }
 
 def _screen_where(use, owner_type, water_state, min_acres, max_acres, min_tenure,
-                  absentee, city, zcta, max_total_price, include_public, include_builders):
+                  absentee, city, zcta, max_total_price, include_public, include_builders,
+                  enviro=""):
     where = ["p.status='Off-market'", "p.use IN ('Vacant','Agricultural')",
              "p.acres >= %s", "coalesce(p.tenure,0) >= %s", "p.est > 0", "p.acres > 0"]
     args = [min_acres, min_tenure]
@@ -436,6 +438,14 @@ def _screen_where(use, owner_type, water_state, min_acres, max_acres, min_tenure
     if not include_public:
         where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s) OR coalesce(p.owner,'') ~* ANY(%s))")
         args.append(PUBLIC_OWNER_PATTERNS); args.append(PUBLIC_OWNER_REGEXES)
+    # "clean" means nothing recorded on the parcel; "clear" also requires nothing
+    # within a quarter mile, because contamination travels with groundwater.
+    if enviro == "clean":
+        where.append("coalesce(p.enviro_on_site,0) = 0")
+    elif enviro == "clear":
+        where.append("coalesce(p.enviro_on_site,0) = 0 AND coalesce(p.enviro_near,0) = 0")
+    elif enviro == "flagged":
+        where.append("coalesce(p.enviro_on_site,0) > 0")
     if not include_builders:
         # A homebuilder that already assembled the site is not a seller: they
         # bought it to build on. Their land is real and stays on the map, but it
@@ -796,7 +806,8 @@ def comps(apn: str, radius_miles: float = 3.0, years: int = 10, limit: int = 25)
           "floor": MIN_CREDIBLE_PPA, "ceil": 5_000_000, "lim": limit})
 
 @app.get("/targets")
-def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
+def targets(use: str = "", owner_type: str = "", enviro: str = "",
+            min_acres: float = 0, max_acres: float = 0,
             min_tenure: int = 0, water_state: str = "", include_public: bool = False,
             absentee: bool = False, city: str = "", zcta: str = "",
             include_builders: bool = False, include_unpriced: bool = False,
@@ -807,7 +818,7 @@ def targets(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres
             rho: float = None, sort: str = "value_score", limit: int = 100):
     where, args = _screen_where(use, owner_type, water_state, min_acres, max_acres,
                                 min_tenure, absentee, city, zcta, max_total_price,
-                                include_public, include_builders)
+                                include_public, include_builders, enviro)
     rows = _candidates(where, args)
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
@@ -882,7 +893,8 @@ def report(apns: str, audience: str = "investor", horizon: int = 10,
     return Response(html, media_type="text/html")
 
 @app.get("/targets/export")
-def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0, max_acres: float = 0,
+def targets_export(use: str = "", owner_type: str = "", enviro: str = "",
+                   min_acres: float = 0, max_acres: float = 0,
                    min_tenure: int = 0, water_state: str = "", include_public: bool = False,
                    include_builders: bool = False, include_unpriced: bool = False,
                    absentee: bool = False, city: str = "", zcta: str = "",
@@ -895,7 +907,7 @@ def targets_export(use: str = "", owner_type: str = "", min_acres: float = 0, ma
     map and target list use."""
     where, args = _screen_where(use, owner_type, water_state, min_acres, max_acres,
                                 min_tenure, absentee, city, zcta, max_total_price,
-                                include_public, include_builders)
+                                include_public, include_builders, enviro)
     rows = _candidates(where, args)
     p = _model_params(lambda_p, h_max, g_d, rho, horizon)
     vals = _valued(rows, p, _snap_horizon(horizon))
@@ -3466,7 +3478,11 @@ def run_enviro():
                     WHERE ST_DWithin(p2.geom::geography, e.geom::geography, %(near_m)s)) AS near,
                   (SELECT round((ST_Distance(p2.geom::geography, e.geom::geography)*3.28084)::numeric)
                      FROM enviro e ORDER BY p2.geom <-> e.geom LIMIT 1) AS nearest_ft,
-                  (SELECT e.kind FROM enviro e ORDER BY p2.geom <-> e.geom LIMIT 1) AS worst
+                  (SELECT e.kind FROM enviro e
+                    WHERE ST_DWithin(p2.geom::geography, e.geom::geography, %(near_m)s)
+                    ORDER BY CASE e.kind WHEN 'superfund' THEN 1 WHEN 'vrp' THEN 2
+                                         WHEN 'release' THEN 3 ELSE 4 END,
+                             p2.geom <-> e.geom LIMIT 1) AS worst
                 FROM parcels p2 WHERE p2.geom IS NOT NULL
               ) sub WHERE p.apn = sub.apn""",
               {"near_m": ENVIRO_NEAR_FT / 3.28084})

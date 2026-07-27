@@ -181,7 +181,7 @@
 const API = window.API_BASE || "";
 // Tile schema version. Raise this when TILE_SQL gains or changes a property so
 // browsers and any cache in front of them fetch fresh tiles.
-const TILE_V = "6";
+const TILE_V = "7";
 const money=v=>{v=Math.round(v||0);const s=v<0?"-":"";v=Math.abs(v);return v>=1e6?s+"$"+(v/1e6).toFixed(v>=1e7?1:2)+"M":v>=1e3?s+"$"+Math.round(v/1e3)+"k":s+"$"+v};
 const pct=v=>(v*100).toFixed(1)+"%";
 
@@ -450,6 +450,9 @@ function mapFilterExpr(){
   // agricultural land compares on its vacant-land reference, not its use value
   const ppa=+val("fPpa")||0;    if(ppa) f.push(["<=",["to-number",["get","ppa"],0],ppa]);
   if(val("fAbs")) f.push(["==",["to-number",["get","absentee"],0],1]);
+  const env=val("fEnv");
+  if(env==="clean"||env==="clear") f.push(["==",["to-number",["get","enviro_on_site"],0],0]);
+  else if(env==="flagged")         f.push([">",["to-number",["get","enviro_on_site"],0],0]);
   if(gateApns) f.push(["in",["get","apn"],["literal",gateApns]]);
   return f;
 }
@@ -881,8 +884,8 @@ async function loadTargets(){
   const pr=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),water_state:val("fWater"),
     min_acres:val("fAcres"),max_acres:val("fAcresMax"),min_tenure:val("fTen"),
     max_price_per_acre:val("fPpa"),max_total_price:val("fTotal"),min_score:val("fScore"),
-    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",sort:val("fSort"),
-    limit:80,...modelParams()});
+    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",enviro:val("fEnv"),
+    sort:val("fSort"),limit:80,...modelParams()});
   let rows=[];
   try{ rows=await (await fetch(API+"/targets?"+pr,{signal:ctl.signal})).json(); }
   catch(e){
@@ -929,7 +932,7 @@ function syncMapCaption(n){
   else
     el.textContent=`Map and list are showing the same ${n} parcels.`;
 }
-["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fSort"]
+["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fEnv","fSort"]
   .forEach(id=>document.getElementById(id).addEventListener("change",()=>{
     // clear a stale whitelist first, otherwise the previous list's APNs keep
     // constraining the map while the new query is still running
@@ -963,7 +966,7 @@ document.getElementById("colorMode").addEventListener("change", e => {
     map.setPaintProperty("parcels-fill", "fill-color", parcelColorExpr());
 });
 document.getElementById("resetF").addEventListener("click",()=>{
-  ["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fSort"]
+  ["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fEnv","fSort"]
     .forEach(id=>{ const el=document.getElementById(id); if(el) el.selectedIndex=0; });
   gateApns=null; applyMapFilter(); loadTargets();
 });
@@ -979,8 +982,8 @@ document.getElementById("exportBtn").addEventListener("click",()=>{
   const p=new URLSearchParams({use:val("fUse"),owner_type:val("fOwner"),water_state:val("fWater"),
     min_acres:val("fAcres"),max_acres:val("fAcresMax"),min_tenure:val("fTen"),
     max_price_per_acre:val("fPpa"),max_total_price:val("fTotal"),min_score:val("fScore"),
-    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",sort:val("fSort"),
-    limit:2000,...modelParams()});
+    max_years:val("fYears"),absentee:val("fAbs")?"true":"false",enviro:val("fEnv"),
+    sort:val("fSort"),limit:2000,...modelParams()});
   window.location.href=API+"/targets/export?"+p; });
 
 async function loadBlocks(){
