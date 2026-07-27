@@ -3420,6 +3420,46 @@ def admin_probe_roads(token: str):
                       "no source usable; check the arcgis layer names listed above")
     return out
 
+@app.get("/admin/why")
+def admin_why(token: str, apn: str):
+    """Explain, for one parcel, exactly which screen it passes or fails.
+
+    Three layers have to agree for a public-owner parcel to disappear: the
+    stored owner string, the tile's public_owner flag, and the targets WHERE
+    clause. When a parcel keeps appearing, guessing which layer is at fault
+    costs a deploy each time. This reports all three, plus the raw bytes of the
+    owner string, because a non-breaking space or a stray character defeats a
+    pattern that looks correct when printed.
+    """
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    rows = qall("""
+      SELECT p.apn, p.owner, p.owner_type, p.use, p.status,
+             p.est, p.acres, p.absentee,
+             (coalesce(p.owner,'') ILIKE ANY(%(pub)s))  AS like_match,
+             (coalesce(p.owner,'') ~* %(pubre)s)        AS regex_match,
+             length(coalesce(p.owner,''))               AS owner_len
+      FROM parcels p WHERE p.apn = %(apn)s
+    """, {"apn": apn, "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEX})
+    if not rows:
+        return {"apn": apn, "found": False,
+                "note": "not in the parcels table at all"}
+    r = dict(rows[0])
+    owner = r.get("owner") or ""
+    r["owner_repr"] = repr(owner)
+    r["owner_codepoints"] = [f"{c}={ord(c)}" for c in owner if ord(c) > 126 or ord(c) < 32]
+    r["public_owner_in_tile"] = bool(r.pop("like_match")) or bool(r.pop("regex_match"))
+    where, args = _screen_where("", "", "", 0, 0, 0, False, "", "", 0, False, False)
+    passes = q1(f"SELECT count(*) FROM parcels p WHERE p.apn = %s AND ({where})",
+                (apn, *args))
+    r["passes_targets_screen"] = bool(passes and passes[0])
+    r["verdict"] = ("still reaching the target list; the screen is not catching it"
+                    if r["passes_targets_screen"] else
+                    "excluded from the target list. If it still shades on the map, "
+                    "the browser is holding an old tile: the tile URL carries ?v= "
+                    "and that version must change when TILE_SQL does")
+    return r
+
 @app.get("/admin/screens")
 def admin_screens(token: str, flood: bool = False, flood_source: str = None):
     """Flood is OFF by default. Neither public source can serve the geometry:

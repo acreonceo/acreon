@@ -456,8 +456,15 @@ function applyMapFilter(){
   const f=mapFilterExpr();
   try{
     if(map.getLayer("parcels-fill")) map.setFilter("parcels-fill",f);
-    if(map.getLayer("parcels-pt"))   map.setFilter("parcels-pt",["all",["==","$type","Point"],...f.slice(1)]);
-  }catch(e){ console.warn("map filter failed",e); }
+    if(map.getLayer("parcels-pt"))
+      map.setFilter("parcels-pt",["all",["==",["geometry-type"],"Point"],...f.slice(1)]);
+  }catch(e){
+    // A rejected filter used to leave the layer showing everything, which reads
+    // exactly like the filter being wrong rather than absent. Fail visibly.
+    console.error("MAP FILTER REJECTED, layer left unfiltered:", e && e.message, f);
+    const w=document.getElementById("mapSync");
+    if(w) w.textContent="Map filter failed to apply, so the map is showing more than the list. See the browser console.";
+  }
 }
 
 function repaintParcels(){
@@ -490,7 +497,7 @@ map.on("load",()=>{
     tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt?v="+TILE_V],minzoom:6,maxzoom:16});
   map.addLayer({id:"parcels-fill",type:"fill",source:"parcels","source-layer":"parcels",
     paint:{"fill-color":parcelColorExpr(),"fill-opacity":.55,"fill-outline-color":"#fff"}});
-  map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",filter:["==","$type","Point"],
+  map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",filter:["==",["geometry-type"],"Point"],
     paint:{"circle-radius":["interpolate",["linear"],["zoom"],8,2.4,14,6],
       "circle-color":parcelColorExpr(),"circle-stroke-color":"#fff","circle-stroke-width":.7}});
   map.addLayer({id:"labels",type:"raster",source:"labels",paint:{"raster-opacity":0.85}});
