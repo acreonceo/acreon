@@ -3335,6 +3335,94 @@ def admin_ingest_roads(token: str, source: str = None, tiles: int = 8):
                      kwargs={"source": source, "tiles": tiles}, daemon=True).start()
     return {"state": "started", "kind": "roads", "next": "poll /admin/signals_status"}
 
+# --- ENVIRONMENTAL ENCUMBRANCE ---------------------------------------------
+# A well-located infill lot that never develops usually has a reason, and the
+# most common one is an old fuel or waste-oil tank. ADEQ publishes tank and
+# cleanup registries as ArcGIS feature services; this resolves them from their
+# ArcGIS Online item IDs rather than guessing service paths, which has been the
+# failure mode on every external layer so far.
+AGOL_ITEM = "https://www.arcgis.com/sharing/rest/content/items/{}"
+AGOL_SEARCH = "https://www.arcgis.com/sharing/rest/search"
+ADEQ_ITEMS = {
+    "UST Place Facilities": "752923d53232426292854c420777aea9",
+}
+ADEQ_QUERIES = [
+    'owner:ADEQ type:"Feature Service"',
+    'ADEQ leaking underground storage tank',
+    'ADEQ WQARF remediation site',
+    'ADEQ brownfields voluntary remediation',
+]
+
+@app.get("/admin/probe_environmental")
+def admin_probe_environmental(token: str):
+    """Find ADEQ contamination layers and list them by name with a Maricopa count.
+
+    Returns candidates only; writes nothing. LUST and WQARF registries record the
+    reported release point, not the extent of the plume, so anything found here
+    is a flag for diligence rather than a determination about a parcel.
+    """
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    with pool.connection() as c:
+        bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
+                       "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+    env = {"where": "1=1", "returnCountOnly": "true", "f": "json",
+           "geometry": f"{bb[0]},{bb[1]},{bb[2]},{bb[3]}",
+           "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+           "spatialRel": "esriSpatialRelIntersects"}
+    ua = {"User-Agent": BROWSER_UA}
+    services, errors = {}, []
+
+    def add(title, url):
+        if url and url not in services:
+            services[url] = title
+
+    for title, iid in ADEQ_ITEMS.items():
+        try:
+            j = requests.get(AGOL_ITEM.format(iid), params={"f": "json"},
+                             timeout=45, headers=ua).json()
+            add(j.get("title") or title, j.get("url"))
+        except Exception as e:
+            errors.append(f"item {iid}: {str(e)[:110]}")
+    for q in ADEQ_QUERIES:
+        try:
+            j = requests.get(AGOL_SEARCH, timeout=45, headers=ua,
+                             params={"q": q, "f": "json", "num": 40}).json()
+            for it in (j.get("results") or []):
+                if it.get("type") in ("Feature Service", "Map Service"):
+                    add(it.get("title"), it.get("url"))
+        except Exception as e:
+            errors.append(f"search {q[:28]}: {str(e)[:100]}")
+
+    KEY = ("tank", "ust", "lust", "leak", "wqarf", "remediat", "brownfield",
+           "cleanup", "superfund", "contamina", "vrp", "release", "spill")
+    out = []
+    for url, title in list(services.items())[:20]:
+        try:
+            j = requests.get(url, params={"f": "json"}, timeout=45, headers=ua).json()
+            for lyr in (j.get("layers") or []) + (j.get("tables") or []):
+                name = lyr.get("name") or ""
+                rec = {"service_title": title, "layer_name": name,
+                       "query_url": f"{url}/{lyr.get('id')}/query"}
+                if any(k in name.lower() for k in KEY) or any(k in (title or "").lower() for k in KEY):
+                    try:
+                        cj = requests.get(rec["query_url"], params=env, timeout=45,
+                                          headers=ua).json()
+                        rec["features_over_maricopa"] = cj.get("count")
+                    except Exception as e:
+                        rec["error"] = str(e)[:90]
+                    out.append(rec)
+        except Exception as e:
+            errors.append(f"{title}: {str(e)[:110]}")
+    usable = [o for o in out if isinstance(o.get("features_over_maricopa"), int)
+              and o["features_over_maricopa"] > 0]
+    usable.sort(key=lambda o: -o["features_over_maricopa"])
+    return {"services_found": list(services.values()),
+            "contamination_layers": usable or out,
+            "errors": errors or None,
+            "next": ("Send me the layers with a sensible Maricopa count and I will "
+                     "ingest them as a diligence flag, not as a determination.")}
+
 @app.get("/admin/probe_water")
 def admin_probe_water(token: str, keyword: str = ""):
     """Walk ADWR's ArcGIS org and list water layers BY NAME with a live count
