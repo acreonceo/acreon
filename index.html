@@ -558,10 +558,15 @@ function renderDetail(p){
       <span class="k">Type</span><span class="v" style="font-family:inherit" data-tip="${escAttr(
         "Classified by pattern-matching the owner name. A company with an unusual name may be mislabelled, and two entities belonging to the same person will not be linked.")}">${p.owner_type||""}</span>
       <span class="k">Held since</span><span class="v">${heldTxt}</span>
-      <span class="k">Last recorded sale</span><span class="v">${p.paid?money(p.paid):"none on record"}</span>
+      <span class="k">Last recorded sale</span><span class="v" data-tip="${escAttr(
+        "The county writes the full transaction price against every parcel in a multi-parcel sale, so this can be the price of a whole assemblage rather than of this parcel.")}">${
+        p.paid ? money(p.paid) + (p.sale_parcels > 1 ? ` <span style="color:var(--warn)">· one sale covering ${p.sale_parcels} parcels</span>` : "") : "none on record"}</span>
       <span class="k">Assessed value</span><span class="v">${money(p.est)}</span>
       <span class="k">Carrying cost</span><span class="v" id="carryv">—</span></div>
     <div id="acqblock"></div>
+
+    <h3>What the ground will hold</h3>
+    <div id="groundfacts"></div>
 
     <h3>Zone facts</h3>
     <div id="zonefacts"></div>
@@ -602,6 +607,7 @@ function updateValuationUI(){
   loadEvidence(p.apn);
   loadComps(p.apn);
   loadPrice(p.apn);
+  renderGroundFacts(p);
   renderZoneFacts(p);
   renderBreakEven(p,V);
 }
@@ -660,6 +666,48 @@ async function loadComps(apn){
       ${rows.slice(0,8).map(r=>`<tr><td>${r.acquired}</td><td>${(+r.acres).toLocaleString()}</td><td>${money(r.price_per_acre)}</td><td>${r.miles_away}</td></tr>`).join("")}</table>
     <div class="sub" style="margin-top:6px">Draw your own line. The system does not adjust these for condition, access, or water.</div>`;
   window.__compMedian=med;
+}
+
+// Slope, usable width, fragmentation and access all move site_factor and so
+// move every figure on this panel, but none of them were visible. A reader
+// looking at 326 acres on the flank of a mountain range had no way to see that
+// from the screen.
+function renderGroundFacts(p){
+  const el = document.getElementById("groundfacts"); if(!el) return;
+  const rows = [];
+  const ac = +p.acres || 0;
+  if(p.slope_pct != null){
+    const s = +p.slope_pct;
+    const verdict = s < 8 ? "flat, no constraint"
+      : s < 15 ? "gently rolling"
+      : s < 25 ? "hillside, grading cost is material"
+      : s < 35 ? "steep, cut and fill or nothing"
+      : "mountainside, not a development site";
+    rows.push(["Slope", `${s.toFixed(1)}% · ${verdict}`,
+      "Vertical relief across the parcel divided by its width, sampled from USGS elevation."]);
+    if(p.relief_ft != null)
+      rows.push(["Rise across the parcel", `${(+p.relief_ft).toLocaleString()} ft`,
+        "Highest point minus lowest point."]);
+  }
+  if(p.usable_radius_ft != null && ac > 0){
+    const r = +p.usable_radius_ft;
+    const equiv = Math.sqrt(ac * 43560 / Math.PI);
+    const ratio = equiv > 0 ? r / equiv : 1;
+    const verdict = ratio < 0.15 ? "a corridor, not a site"
+      : ratio < 0.28 ? "markedly elongated" : ratio < 0.45 ? "somewhat elongated"
+      : "compact enough to plan conventionally";
+    rows.push(["Widest usable point", `${Math.round(r).toLocaleString()} ft · ${verdict}`,
+      `A compact parcel of ${ac.toLocaleString()} acres would measure about ${Math.round(equiv).toLocaleString()} ft.`]);
+  }
+  if(p.parts > 1 && p.largest_part_acres != null)
+    rows.push(["Separate pieces", `${p.parts}, largest ${(+p.largest_part_acres).toFixed(1)} ac`,
+      "Ground split by a road or wash is not one site; judge it at the size of the largest piece."]);
+  if(p.road_ft != null)
+    rows.push(["Nearest road", `${Math.round(+p.road_ft).toLocaleString()} ft`,
+      "Distance to the nearest mapped centreline. A cost of building access, not a finding about legal access."]);
+  if(!rows.length){ el.innerHTML = `<div class="sub">Geometry and terrain have not been measured for this parcel.</div>`; return; }
+  el.innerHTML = `<div class="kv">` + rows.map(([k,v,tip]) =>
+    `<span class="k">${k}</span><span class="v" style="font-family:inherit" data-tip="${escAttr(tip)}">${v}</span>`).join("") + `</div>`;
 }
 
 function renderZoneFacts(p){

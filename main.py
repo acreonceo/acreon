@@ -271,6 +271,13 @@ def search(q: str = Query(..., min_length=2), limit: int = 12):
 def parcel(apn: str):
     rows = qall("""
       SELECT p.*, z.signals AS zone_signals, z.dev_value_per_acre,
+             -- The county writes the full price of a multi-parcel sale against
+             -- every parcel in it, so $250M against 326 acres can be the price
+             -- of a whole assemblage. Counting the parcels that share the same
+             -- price and year exposes that instead of implying a unit price.
+             (SELECT count(*) FROM parcels q
+               WHERE q.paid = p.paid AND q.acquired = p.acquired
+                 AND p.paid > 0)                       AS sale_parcels,
              ST_X(p.centroid) AS lon, ST_Y(p.centroid) AS lat
       FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
       WHERE p.apn = %s
