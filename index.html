@@ -710,6 +710,25 @@ function renderGroundFacts(p){
   if(p.road_ft != null)
     rows.push(["Nearest road", `${Math.round(+p.road_ft).toLocaleString()} ft`,
       "Distance to the nearest mapped centreline. A cost of building access, not a finding about legal access."]);
+  // Contamination is shown, never valued. Case status varies from open plume to
+  // closed decades ago, and a single multiplier cannot tell those apart. It is a
+  // prompt to order a Phase I, not a discount.
+  if(p.enviro_nearest_ft != null){
+    const on = +p.enviro_on_site || 0, near = +p.enviro_near || 0;
+    const ft = Math.round(+p.enviro_nearest_ft);
+    const KIND = {release:"a reported tank release", facility:"a registered tank facility",
+                  superfund:"a Superfund site", vrp:"a voluntary remediation site"};
+    const what = KIND[p.enviro_worst] || "a recorded environmental site";
+    let txt, tone;
+    if(on > 0){ tone = "var(--bad)";
+      txt = `${on} recorded environmental site${on>1?"s":""} on or touching this parcel. Nearest is ${what}.`; }
+    else if(ft <= 1320){ tone = "var(--warn)";
+      txt = `${what} ${ft.toLocaleString()} ft away${near>1?`, ${near} within a quarter mile`:""}.`; }
+    else { tone = "var(--ink-soft)";
+      txt = `Nearest recorded environmental site is ${ft.toLocaleString()} ft away.`; }
+    rows.push(["Environmental", `<span style="color:${tone}">${txt}</span>`,
+      "ADEQ tank, release, Superfund and voluntary remediation registries. These record the reported point, not how far contamination has moved, and pre-1988 releases were often never reported. Treat as a prompt for a Phase I assessment, not as a finding. Nothing here changes any figure on this page."]);
+  }
   if(!rows.length){ el.innerHTML = `<div class="sub">Geometry and terrain have not been measured for this parcel.</div>`; return; }
   el.innerHTML = `<div class="kv">` + rows.map(([k,v,tip]) =>
     `<span class="k">${k}</span><span class="v" style="font-family:inherit" data-tip="${escAttr(tip)}">${v}</span>`).join("") + `</div>`;

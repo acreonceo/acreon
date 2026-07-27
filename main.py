@@ -45,6 +45,8 @@ REQUIRED_PARCEL_COLUMNS = {
     "flood_zone": "text", "zoning": "text", "jurisdiction": "text",
     "usable_radius_ft": "numeric", "largest_part_acres": "numeric",
     "compactness": "numeric", "parts": "integer", "road_ft": "numeric",
+    "enviro_on_site": "integer", "enviro_near": "integer",
+    "enviro_nearest_ft": "numeric", "enviro_worst": "text",
     "elev_min_ft": "numeric", "elev_max_ft": "numeric", "relief_ft": "numeric",
     "slope_pct": "numeric",
 }
@@ -396,6 +398,7 @@ def _candidates(where_sql, params):
              p.zoning, p.jurisdiction,
              p.usable_radius_ft, p.largest_part_acres, p.compactness, p.parts, p.road_ft,
              p.relief_ft, p.slope_pct, p.elev_min_ft, p.elev_max_ft,
+             p.enviro_on_site, p.enviro_near, p.enviro_nearest_ft, p.enviro_worst,
              z.signals AS signals, z.dev_value_per_acre, z.median_price_per_acre,
              z.vacant_price_per_acre,
              ST_X(p.centroid) lon, ST_Y(p.centroid) lat
@@ -3352,6 +3355,146 @@ ADEQ_QUERIES = [
     'ADEQ WQARF remediation site',
     'ADEQ brownfields voluntary remediation',
 ]
+
+# Confirmed by probe against ADEQ's ArcGIS org. Counts are features over
+# Maricopa at the time of discovery.
+ADEQ_ORG = "https://services.arcgis.com/SzoH1oFM2apCSkx3/arcgis/rest/services"
+ENVIRO_LAYERS = [
+    ("release",   f"{ADEQ_ORG}/UST/FeatureServer/1/query"),        # 7,158 reported releases
+    ("facility",  f"{ADEQ_ORG}/UST/FeatureServer/3/query"),        # 7,704 tank facilities
+    ("superfund", f"{ADEQ_ORG}/Superfund/FeatureServer/1/query"),  # 52 sites
+    ("vrp",       f"{ADEQ_ORG}/County/FeatureServer/11/query"),    # 36 voluntary remediation
+]
+# A release is reported at a point, but contamination travels with groundwater,
+# so the useful question is not "is it on this parcel" but "how close is it".
+ENVIRO_NEAR_FT = 1320          # a quarter mile
+
+def _fetch_layer(url, bbox, cap=40000, page=500):
+    """Generic keyset-paged pull with all attributes kept as JSON, because field
+    names differ between these layers and guessing them has cost us all day."""
+    out, last = [], -1
+    while len(out) < cap:
+        r = requests.get(url, timeout=120, headers={"User-Agent": BROWSER_UA},
+                         params={"where": f"OBJECTID > {last}", "outFields": "*",
+                                 "returnGeometry": "true", "outSR": "4326",
+                                 "f": "geojson", "orderByFields": "OBJECTID",
+                                 "resultRecordCount": page,
+                                 "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+                                 "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                                 "spatialRel": "esriSpatialRelIntersects"})
+        try:
+            feats = r.json().get("features", [])
+        except Exception:
+            raise RuntimeError(f"{url.split('/')[-3]} {r.status_code}: {r.text[:140]}")
+        if not feats:
+            break
+        prev = last
+        for f in feats:
+            p = f.get("properties") or {}
+            for k in ("OBJECTID", "objectid", "FID", "OID"):
+                if isinstance(p.get(k), (int, float)):
+                    last = max(last, int(p[k])); break
+            if f.get("geometry"):
+                out.append((json.dumps(f["geometry"]), json.dumps(p)))
+        if last <= prev or len(feats) < page:
+            break
+    return out
+
+def _pick(props, *names):
+    for n in names:
+        for k, v in props.items():
+            if k.upper() == n and v not in (None, ""):
+                return str(v)[:180]
+    return None
+
+def run_enviro():
+    global SIGNAL_STATUS
+    SIGNAL_STATUS = {"state": "running", "kind": "enviro", "detail": "starting"}
+    try:
+        with pool.connection() as c:
+            bb = c.execute("SELECT ST_XMin(e),ST_YMin(e),ST_XMax(e),ST_YMax(e) "
+                           "FROM (SELECT ST_Extent(geom) e FROM zones) t").fetchone()
+            with c.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS enviro")
+                cur.execute("CREATE TABLE enviro(kind text, name text, status text, "
+                            "props jsonb, geom geometry(Geometry,4326))")
+                c.commit()
+        counts = {}
+        for kind, url in ENVIRO_LAYERS:
+            SIGNAL_STATUS.update(detail=f"fetching {kind}")
+            try:
+                rows = _fetch_layer(url, bb)
+            except Exception as e:
+                SIGNAL_STATUS.setdefault("layer_errors", []).append(f"{kind}: {str(e)[:120]}")
+                continue
+            batch = []
+            for gj, pj in rows:
+                p = json.loads(pj)
+                batch.append((kind,
+                              _pick(p, "SITE_NAME", "FACILITY_NAME", "NAME", "FACNAME",
+                                    "SITENAME", "PLACE_NAME"),
+                              _pick(p, "STATUS", "CASE_STATUS", "LUST_STATUS",
+                                    "SITE_STATUS", "CLOSURE_STATUS"),
+                              pj, gj))
+            if batch:
+                with pool.connection() as c, c.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO enviro(kind,name,status,props,geom) VALUES "
+                        "(%s,%s,%s,%s::jsonb,ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON(%s),4326)))",
+                        batch)
+                    c.commit()
+            counts[kind] = len(batch)
+            SIGNAL_STATUS.update(detail=f"{kind}: {len(batch):,} loaded")
+        with pool.connection() as c, c.cursor() as cur:
+            cur.execute("CREATE INDEX ON enviro USING gist(geom)")
+            cur.execute("CREATE INDEX ON enviro USING gist((geom::geography))")
+            cur.execute("ANALYZE enviro")
+            c.commit()
+        SIGNAL_STATUS.update(detail="measuring distance from every parcel")
+        with pool.connection() as c, c.cursor() as cur:
+            cur.execute("""
+              UPDATE parcels p SET
+                enviro_on_site   = sub.on_site,
+                enviro_near      = sub.near,
+                enviro_nearest_ft= sub.nearest_ft,
+                enviro_worst     = sub.worst
+              FROM (
+                SELECT p2.apn,
+                  (SELECT count(*) FROM enviro e
+                    WHERE ST_DWithin(p2.geom::geography, e.geom::geography, 30)) AS on_site,
+                  (SELECT count(*) FROM enviro e
+                    WHERE ST_DWithin(p2.geom::geography, e.geom::geography, %(near_m)s)) AS near,
+                  (SELECT round((ST_Distance(p2.geom::geography, e.geom::geography)*3.28084)::numeric)
+                     FROM enviro e ORDER BY p2.geom <-> e.geom LIMIT 1) AS nearest_ft,
+                  (SELECT e.kind FROM enviro e ORDER BY p2.geom <-> e.geom LIMIT 1) AS worst
+                FROM parcels p2 WHERE p2.geom IS NOT NULL
+              ) sub WHERE p.apn = sub.apn""",
+              {"near_m": ENVIRO_NEAR_FT / 3.28084})
+            c.commit()
+        with pool.connection() as c:
+            d = c.execute("""SELECT count(*) FILTER (WHERE enviro_on_site > 0),
+                                    count(*) FILTER (WHERE enviro_near > 0),
+                                    round(percentile_cont(0.5) WITHIN GROUP (ORDER BY enviro_nearest_ft))
+                             FROM parcels""").fetchone()
+        SIGNAL_STATUS = {"state": "done", "kind": "enviro", "loaded": counts,
+                         "parcels_with_a_site_on_them": d[0],
+                         "parcels_within_a_quarter_mile": d[1],
+                         "median_ft_to_nearest_site": float(d[2]) if d[2] is not None else None,
+                         "layer_errors": SIGNAL_STATUS.get("layer_errors"),
+                         "note": ("Recorded release points, not plume extents. A flag for "
+                                  "diligence, not a determination. Nothing is discounted "
+                                  "on this: it is displayed only.")}
+    except Exception as e:
+        SIGNAL_STATUS = {"state": "error", "kind": "enviro", "detail": str(e)[:250]}
+
+@app.get("/admin/enviro")
+def admin_enviro(token: str):
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    if SIGNAL_STATUS.get("state") == "running":
+        return {"state": "already_running", "status": SIGNAL_STATUS}
+    threading.Thread(target=run_enviro, daemon=True).start()
+    return {"state": "started", "kind": "enviro", "next": "poll /admin/signals_status"}
 
 @app.get("/admin/probe_environmental")
 def admin_probe_environmental(token: str):
