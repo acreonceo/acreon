@@ -212,7 +212,7 @@ SELECT ST_AsMVT(t,'parcels') FROM (
            COALESCE(p.water_state,'C') AS water_state,
            (CASE WHEN p.absentee IS TRUE THEN 1 ELSE 0 END) AS absentee,
            (CASE WHEN coalesce(p.owner,'') ILIKE ANY(%(pub)s)
-                   OR coalesce(p.owner,'') ~* %(pubre)s THEN 1 ELSE 0 END) AS public_owner,
+                   OR coalesce(p.owner,'') ~* ANY(%(pubre)s) THEN 1 ELSE 0 END) AS public_owner,
            COALESCE(p.landlocked,false) AS landlocked,
            COALESCE(p.flood_zone,'') AS flood_zone,
            round(COALESCE(p.carry_rate,0.003)::numeric,4)::float8 AS carry_rate,
@@ -232,7 +232,7 @@ SELECT ST_AsMVT(t,'parcels') FROM (
 @app.get("/tiles/{z}/{x}/{y}.mvt")
 def tiles(z: int, x: int, y: int):
     row = q1(TILE_SQL, {"z": z, "x": x, "y": y,
-                        "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEX,
+                        "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEXES,
                         "min_ppa": MIN_CREDIBLE_PPA})
     data = row[0] if row and row[0] else b""
     # Tiles carry a ?v= schema version, so a cached body is only ever valid for
@@ -325,19 +325,36 @@ def _live_sql(weights, gate=True):
 # "%STATE OF ARIZONA%" (reversed), not "%DEPT OF%" (no OF after DEPT), not
 # "%DEPARTMENT OF%" (abbreviated). A regex on tokens catches the family rather
 # than each spelling, and freeway right-of-way stops reading as buyable land.
-PUBLIC_OWNER_REGEX = "|".join([
-    r"(^|[^A-Z])(ADOT|MCDOT)([^A-Z]|$)",
-    r"ARIZONA\s+STATE", r"STATE\s+OF\s+ARIZ", r"\bAZ\s+STATE\b",
-    r"ARIZ\w*\s+(DEPT|DEPARTMENT)", r"(DEPT|DEPARTMENT)\s+(OF\s+)?TRANS",
-    r"\bSTATE\s+LAND\b", r"\bLAND\s+DEPT\b",
-    r"MARICOPA\s+(COUNTY|CNTY|CO\b)", r"COUNTY\s+OF\s+MARICOPA",
-    r"FLOOD\s+CONTROL", r"\bRIGHT\s+OF\s+WAY\b",
-    r"\b(IRRIGATION|DRAINAGE|SANITARY|FIRE|LIBRARY|SCHOOL|HOSPITAL)\s+DIST",
-    r"COMMUNITY\s+COLLEGE", r"BOARD\s+OF\s+REGENTS",
-    r"UNITED\s+STATES", r"\bBUREAU\s+OF\b", r"\bU\s*S\s+GOVERNMENT\b",
-    r"\bFOREST\s+SERVICE\b", r"\bGAME\s+AND\s+FISH\b",
-    r"\b(CITY|TOWN)\s+OF\b", r"\bMUNICIPAL\b",
-])
+# PostgreSQL regex is POSIX ARE, not PCRE. Word boundary is \y; \b is a
+# BACKSPACE character, so every alternative written with \b silently matched
+# nothing. That is why "PHOENIX CITY OF" kept reaching the target list while a
+# Python re.search test of the same string passed: the test used a different
+# engine from the database. Held as a list rather than one joined string so
+# /admin/why can report which pattern fired.
+PUBLIC_OWNER_REGEXES = [
+    r"\y(ADOT|MCDOT)\y",
+    r"ARIZONA\s+STATE",
+    r"STATE\s+OF\s+ARIZ",
+    r"\yAZ\s+STATE\y",
+    r"ARIZ\w*\s+(DEPT|DEPARTMENT)",
+    r"(DEPT|DEPARTMENT)\s+(OF\s+)?TRANS",
+    r"\ySTATE\s+LAND\y",
+    r"\yLAND\s+DEPT\y",
+    r"MARICOPA\s+(COUNTY|CNTY|CO)\y",
+    r"COUNTY\s+OF\s+MARICOPA",
+    r"FLOOD\s+CONTROL",
+    r"\yRIGHT\s+OF\s+WAY\y",
+    r"\y(IRRIGATION|DRAINAGE|SANITARY|FIRE|LIBRARY|SCHOOL|HOSPITAL)\s+DIST",
+    r"COMMUNITY\s+COLLEGE",
+    r"BOARD\s+OF\s+REGENTS",
+    r"UNITED\s+STATES",
+    r"\yBUREAU\s+OF\y",
+    r"\yU\s*S\s+GOVERNMENT\y",
+    r"\yFOREST\s+SERVICE\y",
+    r"\yGAME\s+AND\s+FISH\y",
+    r"\y(CITY|TOWN)\s+OF\y",
+    r"\yMUNICIPAL\y",
+]
 
 PUBLIC_OWNER_PATTERNS = [
     'MARICOPA COUNTY%', '%STATE OF ARIZONA%', 'ARIZONA STATE LAND%', '%STATE LAND DEPART%',
@@ -407,8 +424,8 @@ def _screen_where(use, owner_type, water_state, min_acres, max_acres, min_tenure
     if zcta:         where.append("p.zcta = %s");         args.append(zcta)
     if max_total_price: where.append("p.est <= %s");      args.append(max_total_price)
     if not include_public:
-        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s) OR coalesce(p.owner,'') ~* %s)")
-        args.append(PUBLIC_OWNER_PATTERNS); args.append(PUBLIC_OWNER_REGEX)
+        where.append("NOT (coalesce(p.owner,'') ILIKE ANY(%s) OR coalesce(p.owner,'') ~* ANY(%s))")
+        args.append(PUBLIC_OWNER_PATTERNS); args.append(PUBLIC_OWNER_REGEXES)
     if not include_builders:
         # A homebuilder that already assembled the site is not a seller: they
         # bought it to build on. Their land is real and stays on the map, but it
@@ -3437,10 +3454,12 @@ def admin_why(token: str, apn: str):
       SELECT p.apn, p.owner, p.owner_type, p.use, p.status,
              p.est, p.acres, p.absentee,
              (coalesce(p.owner,'') ILIKE ANY(%(pub)s))  AS like_match,
-             (coalesce(p.owner,'') ~* %(pubre)s)        AS regex_match,
+             (coalesce(p.owner,'') ~* ANY(%(pubre)s))   AS regex_match,
+             (SELECT array_agg(pat) FROM unnest(%(pubre)s::text[]) pat
+               WHERE coalesce(p.owner,'') ~* pat)        AS patterns_hit,
              length(coalesce(p.owner,''))               AS owner_len
       FROM parcels p WHERE p.apn = %(apn)s
-    """, {"apn": apn, "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEX})
+    """, {"apn": apn, "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEXES})
     if not rows:
         return {"apn": apn, "found": False,
                 "note": "not in the parcels table at all"}
