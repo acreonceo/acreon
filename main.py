@@ -2348,28 +2348,32 @@ def _flush_built(rows):
 # structure went up, so the frontier can be reconstructed for any past year.
 FRONTIER_MIN_BUILT = 25          # structures in a half-mile cell (160 acres)
 
-FRONTIER_SQL = """
-DROP TABLE IF EXISTS frontier;
-CREATE TABLE frontier AS
-WITH cells AS (
-  SELECT floor(ST_X(centroid)/%(dx)s)::int gx,
-         floor(ST_Y(centroid)/%(dy)s)::int gy,
-         const_year
-  FROM built WHERE const_year IS NOT NULL
-), ranked AS (
-  SELECT gx, gy, const_year,
-         row_number() OVER (PARTITION BY gx, gy ORDER BY const_year) AS rn
-  FROM cells
-)
-SELECT gx, gy,
-       min(const_year) FILTER (WHERE rn = %(minb)s) AS dev_year,
-       ST_SetSRID(ST_Point((gx+0.5)*%(dx)s, (gy+0.5)*%(dy)s), 4326) AS centroid
-FROM ranked
-GROUP BY gx, gy
-HAVING count(*) >= %(minb)s;
-CREATE INDEX ON frontier USING gist(centroid);
-ANALYZE frontier;
-"""
+# psycopg will not accept several commands in one execute when parameters are
+# passed, so these run as separate statements rather than one script.
+FRONTIER_STMTS = [
+    "DROP TABLE IF EXISTS frontier",
+    """
+    CREATE TABLE frontier AS
+    WITH cells AS (
+      SELECT floor(ST_X(centroid)/%(dx)s)::int gx,
+             floor(ST_Y(centroid)/%(dy)s)::int gy,
+             const_year
+      FROM built WHERE const_year IS NOT NULL
+    ), ranked AS (
+      SELECT gx, gy, const_year,
+             row_number() OVER (PARTITION BY gx, gy ORDER BY const_year) AS rn
+      FROM cells
+    )
+    SELECT gx, gy,
+           min(const_year) FILTER (WHERE rn = %(minb)s) AS dev_year,
+           ST_SetSRID(ST_Point((gx+0.5)*%(dx)s, (gy+0.5)*%(dy)s), 4326) AS centroid
+    FROM ranked
+    GROUP BY gx, gy
+    HAVING count(*) >= %(minb)s
+    """,
+    "CREATE INDEX ON frontier USING gist(centroid)",
+    "ANALYZE frontier",
+]
 
 # --- HAZARD FIT ------------------------------------------------------------
 # The frontier at year T is every parcel already built by T. Distance from an
@@ -2414,8 +2418,9 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
             with c.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS panel")
                 SIGNAL_STATUS["detail"] = "building the frontier"
-                cur.execute(FRONTIER_SQL, {"dx": BT.CELL_DX, "dy": BT.CELL_DY,
-                                           "minb": FRONTIER_MIN_BUILT})
+                fp = {"dx": BT.CELL_DX, "dy": BT.CELL_DY, "minb": FRONTIER_MIN_BUILT}
+                for stmt in FRONTIER_STMTS:
+                    cur.execute(stmt, fp) if "%(" in stmt else cur.execute(stmt)
                 ncells = cur.execute("SELECT count(*) FROM frontier").fetchone()[0]
                 SIGNAL_STATUS["frontier_cells"] = ncells
                 SIGNAL_STATUS["detail"] = f"{ncells:,} developed cells; building the panel"
