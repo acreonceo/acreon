@@ -235,7 +235,11 @@ def tiles(z: int, x: int, y: int):
                         "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEX,
                         "min_ppa": MIN_CREDIBLE_PPA})
     data = row[0] if row and row[0] else b""
-    return Response(bytes(data), media_type="application/vnd.mapbox-vector-tile")
+    # Tiles carry a ?v= schema version, so a cached body is only ever valid for
+    # the version that produced it. Short max-age keeps panning quick without
+    # letting a stale property definition survive a deploy.
+    return Response(bytes(data), media_type="application/vnd.mapbox-vector-tile",
+                    headers={"Cache-Control": "public, max-age=300"})
 
 # Zones are only ~130 rows: serve as one GeoJSON for the choropleth backdrop.
 @app.get("/zones")
@@ -2325,6 +2329,48 @@ def _flush_built(rows):
         c.commit()
     return len(rows)
 
+# --- THE FRONTIER ----------------------------------------------------------
+# "Distance to the built edge" was measured to the nearest single parcel in
+# `built`, which holds every improved parcel in the county including isolated
+# farmhouses and well sheds. In the western desert there is a structure every
+# mile or two, so raw ground near the Yuma line measured a quarter mile from
+# "development". That is not a frontier, it is the nearest building.
+#
+# The consequences ran deep. edge_miles is the only covariate in the hazard fit,
+# so if nearly every parcel sits inside the first distance bin the model has
+# nothing to discriminate on and returns a near-constant hazard for the whole
+# county. The map then paints everything one colour and the ranking carries no
+# information about location at all.
+#
+# The frontier is now the edge of CONTIGUOUS development: half-mile cells of
+# ground holding at least FRONTIER_MIN_BUILT structures, which is the same unit
+# the backtest already uses so the two agree. A cell's dev_year is when its Nth
+# structure went up, so the frontier can be reconstructed for any past year.
+FRONTIER_MIN_BUILT = 25          # structures in a half-mile cell (160 acres)
+
+FRONTIER_SQL = """
+DROP TABLE IF EXISTS frontier;
+CREATE TABLE frontier AS
+WITH cells AS (
+  SELECT floor(ST_X(centroid)/%(dx)s)::int gx,
+         floor(ST_Y(centroid)/%(dy)s)::int gy,
+         const_year
+  FROM built WHERE const_year IS NOT NULL
+), ranked AS (
+  SELECT gx, gy, const_year,
+         row_number() OVER (PARTITION BY gx, gy ORDER BY const_year) AS rn
+  FROM cells
+)
+SELECT gx, gy,
+       min(const_year) FILTER (WHERE rn = %(minb)s) AS dev_year,
+       ST_SetSRID(ST_Point((gx+0.5)*%(dx)s, (gy+0.5)*%(dy)s), 4326) AS centroid
+FROM ranked
+GROUP BY gx, gy
+HAVING count(*) >= %(minb)s;
+CREATE INDEX ON frontier USING gist(centroid);
+ANALYZE frontier;
+"""
+
 # --- HAZARD FIT ------------------------------------------------------------
 # The frontier at year T is every parcel already built by T. Distance from an
 # at-risk parcel to that set is the covariate the review identified as the single
@@ -2342,8 +2388,8 @@ SELECT u.apn, y.t AS period,
        (u.const_year IS NOT NULL AND u.const_year >= y.t AND u.const_year < y.t + 5)::int AS event,
        u.acres,
        (SELECT ST_Distance(u.centroid::geography, b.centroid::geography) / 1609.34
-          FROM built b
-         WHERE b.const_year <= y.t
+          FROM frontier b
+         WHERE b.dev_year <= y.t
          ORDER BY u.centroid <-> b.centroid
          LIMIT 1) AS edge_miles
 FROM universe u
@@ -2367,6 +2413,12 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
         with pool.connection() as c:
             with c.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS panel")
+                SIGNAL_STATUS["detail"] = "building the frontier"
+                cur.execute(FRONTIER_SQL, {"dx": BT.CELL_DX, "dy": BT.CELL_DY,
+                                           "minb": FRONTIER_MIN_BUILT})
+                ncells = cur.execute("SELECT count(*) FROM frontier").fetchone()[0]
+                SIGNAL_STATUS["frontier_cells"] = ncells
+                SIGNAL_STATUS["detail"] = f"{ncells:,} developed cells; building the panel"
                 cur.execute(PANEL_SQL, {"s_vac": sample_vacant, "s_blt": sample_built,
                                         "periods": HZ.PERIODS})
                 rows = cur.execute("SELECT period, event, acres, edge_miles FROM panel WHERE edge_miles IS NOT NULL").fetchall()
@@ -2393,7 +2445,7 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
                 cur.execute("""
                   UPDATE parcels p SET edge_miles = sub.d FROM (
                     SELECT p2.apn, (SELECT ST_Distance(p2.centroid::geography, b.centroid::geography)/1609.34
-                                      FROM built b WHERE b.const_year <= %s
+                                      FROM frontier b WHERE b.dev_year <= %s
                                      ORDER BY p2.centroid <-> b.centroid LIMIT 1) AS d
                     FROM parcels p2) sub
                   WHERE p.apn = sub.apn""", (cur_year,))
@@ -2402,6 +2454,11 @@ def run_fit_hazard(sample_vacant=0.06, sample_built=0.05):
                             (json.dumps({"coefs": coefs, "summary": summary, "n": len(rows),
                                          "events": events, "periods": HZ.PERIODS,
                                          "bins": bins}),))
+                d = cur.execute("""SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY edge_miles)::numeric,2),
+                                          round(percentile_cont(0.9) WITHIN GROUP (ORDER BY edge_miles)::numeric,2),
+                                          round(max(edge_miles)::numeric,1)
+                                   FROM parcels WHERE edge_miles IS NOT NULL""").fetchone()
+                SIGNAL_STATUS["edge_miles_p50_p90_max"] = [float(x) for x in d if x is not None]
                 rows2 = cur.execute("SELECT apn, edge_miles, acres FROM parcels WHERE edge_miles IS NOT NULL").fetchall()
                 upd = []
                 for apn, d, ac in rows2:

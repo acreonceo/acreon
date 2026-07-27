@@ -177,6 +177,9 @@
 
 <script>
 const API = window.API_BASE || "";
+// Tile schema version. Raise this when TILE_SQL gains or changes a property so
+// browsers and any cache in front of them fetch fresh tiles.
+const TILE_V = "6";
 const money=v=>{v=Math.round(v||0);const s=v<0?"-":"";v=Math.abs(v);return v>=1e6?s+"$"+(v/1e6).toFixed(v>=1e7?1:2)+"M":v>=1e3?s+"$"+Math.round(v/1e3)+"k":s+"$"+v};
 const pct=v=>(v*100).toFixed(1)+"%";
 
@@ -475,7 +478,12 @@ map.on("load",()=>{
       showTip(e,`<b>${p.zcta}</b><br>frontier heat ${Math.round(p.g)}<br>developer land ${p.dev_value_per_acre?money(p.dev_value_per_acre)+"/ac":"n/a"}`);});
     map.on("mouseleave","zones-fill",hideTip);
   });
-  map.addSource("parcels",{type:"vector",tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt"],minzoom:6,maxzoom:16});
+  // Bump TILE_V whenever TILE_SQL changes. A hard refresh reloads the page but
+  // MapLibre re-requests the same tile URLs, and any layer in between can still
+  // answer from cache, which is how a parcel kept rendering after the filter
+  // that should have removed it was already correct on the server.
+  map.addSource("parcels",{type:"vector",
+    tiles:[location.origin+API+"/tiles/{z}/{x}/{y}.mvt?v="+TILE_V],minzoom:6,maxzoom:16});
   map.addLayer({id:"parcels-fill",type:"fill",source:"parcels","source-layer":"parcels",
     paint:{"fill-color":parcelColorExpr(),"fill-opacity":.55,"fill-outline-color":"#fff"}});
   map.addLayer({id:"parcels-pt",type:"circle",source:"parcels","source-layer":"parcels",filter:["==","$type","Point"],
