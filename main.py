@@ -1877,13 +1877,17 @@ WITH served AS (
    WHERE right_type ILIKE 'LARGE%%' AND population >= %(minpop)s
      AND coalesce(status,'A') = 'A'
 ), cov AS (
+  -- SUM over overlapping service areas counts shared ground twice, which is how
+  -- a coverage fraction came back as 1.0196. Union the polygons first so each
+  -- piece of ground is counted once and the fraction cannot exceed 1.
   SELECT z.zcta,
-    COALESCE(SUM(ST_Area(ST_Intersection(z.geom, a.geom))),0) / NULLIF(ST_Area(z.geom),0) AS frac
+    COALESCE(ST_Area(ST_Intersection(z.geom, ST_Union(a.geom))),0)
+      / NULLIF(ST_Area(z.geom),0) AS frac
   FROM zones z LEFT JOIN served a ON ST_Intersects(z.geom, a.geom)
   GROUP BY z.zcta, z.geom),
 ws AS (
-  SELECT zcta, round(frac::numeric,4) AS frac,
-         CASE WHEN frac > 0.30 THEN 'assured'
+  SELECT zcta, round(least(1.0, greatest(0.0, frac))::numeric,4) AS frac,
+         CASE WHEN least(1.0, frac) > 0.30 THEN 'assured'
               WHEN frac > 0.05 THEN 'alternative_pending'
               ELSE 'groundwater_constrained' END AS status
   FROM cov)
