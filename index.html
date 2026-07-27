@@ -116,6 +116,7 @@
         <div><label>Max total</label><select id="fTotal"><option value="0">Any</option><option value="100000">$100k</option><option value="500000">$500k</option><option value="2000000">$2M</option></select></div>
         <div><label>Min score</label><select id="fScore"><option value="0">Any</option><option value="50">50+</option><option value="60">60+</option><option value="70">70+</option></select></div>
         <div><label>Converts within</label><select id="fYears"><option value="0">Any</option><option value="10">10 yrs</option><option value="20">20 yrs</option><option value="30">30 yrs</option></select></div>
+        <div><label>Environment</label><select id="fEnv"><option value="">Any</option><option value="clean">No site on parcel</option><option value="clear">Clear 1/4 mile</option><option value="flagged">Flagged only</option></select></div>
         <div><label>Owner location</label><select id="fAbs"><option value="">Any</option><option value="1">Out of state only</option></select></div>
         <div><label>Sort by</label><select id="fSort"><option value="value_score">Value score</option><option value="soonest">Soonest to convert</option><option value="value_total">Total value</option><option value="acq_score">Acquirability</option></select></div>
       </div>
@@ -848,7 +849,7 @@ q.addEventListener("input",()=>{clearTimeout(st);const v=q.value.trim(); if(v.le
 document.addEventListener("click",e=>{ if(!q.parentNode.contains(e.target)) res.classList.remove("on"); });
 
 /* ===================== TARGETS / BLOCKS ========================= */
-const val=id=>document.getElementById(id).value;
+const val=id=>{ const el=document.getElementById(id); return el ? el.value : ""; };
 const selected=new Set();
 function syncSel(){
   const n=selected.size;
@@ -933,11 +934,13 @@ function syncMapCaption(n){
     el.textContent=`Map and list are showing the same ${n} parcels.`;
 }
 ["fUse","fOwner","fWater","fAcres","fAcresMax","fTen","fPpa","fTotal","fScore","fYears","fAbs","fEnv","fSort"]
-  .forEach(id=>document.getElementById(id).addEventListener("change",()=>{
+  .forEach(id=>{ const el=document.getElementById(id);
+    if(!el){ console.error("filter control missing from the page:", id); return; }
+    el.addEventListener("change",()=>{
     // clear a stale whitelist first, otherwise the previous list's APNs keep
     // constraining the map while the new query is still running
     if(!modelFiltersOn()) gateApns=null;
-    applyMapFilter(); loadTargets(); }));
+    applyMapFilter(); loadTargets(); }); });
 // Restores every control to its first option, which is "any" for all of them,
 // then runs one query rather than one per control.
 // The parcel pane's buttons always report on the parcel that is open, never on
