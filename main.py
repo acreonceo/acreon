@@ -3695,6 +3695,69 @@ def admin_probe_roads(token: str):
                       "no source usable; check the arcgis layer names listed above")
     return out
 
+@app.get("/admin/probe_apn")
+def admin_probe_apn(token: str, apn: str):
+    """Ask the county directly about one parcel and show its raw attributes.
+
+    When a parcel is absent from our table the cause is upstream of every screen:
+    either COUNTY_WHERE filtered it out at fetch time, or the pull never reached
+    it. Only the county's own record can tell those apart, and only its raw field
+    values can show which classification code missed the filter.
+    """
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        raise HTTPException(403, "forbidden")
+    ua = {"User-Agent": BROWSER_UA}
+    out = {"apn": apn, "county_where": COUNTY_WHERE}
+    found = None
+    for field in ("APN_DASH", "APN", "PARCEL", "PARCELNUM"):
+        try:
+            j = requests.get(COUNTY_PARCELS, timeout=90, headers=ua,
+                             params={"where": f"{field}='{apn}'", "outFields": "*",
+                                     "returnGeometry": "false", "f": "json"}).json()
+            if j.get("error"):
+                continue
+            feats = j.get("features") or []
+            if feats:
+                found = {"matched_on": field, "attributes": feats[0].get("attributes")}
+                break
+        except Exception as e:
+            out.setdefault("errors", []).append(f"{field}: {str(e)[:100]}")
+    if not found:
+        out["found_at_county"] = False
+        out["verdict"] = ("the county layer has no parcel with this number either. "
+                          "Check the APN, or it may be a retired number after a split "
+                          "or merge.")
+        return out
+    out["found_at_county"] = True
+    a = found["attributes"] or {}
+    out["matched_on"] = found["matched_on"]
+    out["attributes"] = a
+    lc = str(a.get("LC_CUR") or "")
+    puc = str(a.get("PUC") or "")
+    passes = lc.startswith("2") or puc.startswith("00")
+    out["classification"] = {
+        "LC_CUR": lc or None, "PUC": puc or None,
+        "LC_CUR starts with 2": lc.startswith("2"),
+        "PUC starts with 00": puc.startswith("00"),
+        "passes COUNTY_WHERE": passes,
+    }
+    # bucket_use in transform.py treats PUC 02xx as agricultural, but
+    # COUNTY_WHERE never asks for 02xx, so an ag parcel outside legal class 2
+    # is filtered out before it is ever classified.
+    out["would_bucket_as"] = ("Agricultural" if puc.zfill(4).startswith("02")
+                              else "Vacant" if puc.zfill(4).startswith("00")
+                              else "Improved")
+    out["verdict"] = (
+        "the county has it and it passes COUNTY_WHERE, so the fetch should have "
+        "picked it up. That points at a gap in the ingest rather than the filter; "
+        "re-run /admin/ingest_county and watch fetched against server_count."
+        if passes else
+        f"the county has it, but it fails COUNTY_WHERE. LC_CUR is {lc!r} and PUC is "
+        f"{puc!r}, and the filter only asks for legal class 2 or PUC starting 00. "
+        f"By its PUC this parcel would bucket as {out['would_bucket_as']}, so the "
+        "fetch filter and the use classification disagree.")
+    return out
+
 @app.get("/admin/why")
 def admin_why(token: str, apn: str):
     """Explain, clause by clause, why one parcel does or does not reach the list.
