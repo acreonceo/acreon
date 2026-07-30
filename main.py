@@ -3697,44 +3697,85 @@ def admin_probe_roads(token: str):
 
 @app.get("/admin/why")
 def admin_why(token: str, apn: str):
-    """Explain, for one parcel, exactly which screen it passes or fails.
+    """Explain, clause by clause, why one parcel does or does not reach the list.
 
-    Three layers have to agree for a public-owner parcel to disappear: the
-    stored owner string, the tile's public_owner flag, and the targets WHERE
-    clause. When a parcel keeps appearing, guessing which layer is at fault
-    costs a deploy each time. This reports all three, plus the raw bytes of the
-    owner string, because a non-breaking space or a stray character defeats a
-    pattern that looks correct when printed.
+    A single pass/fail told you it was excluded but not which of nine screens
+    did it, which is no better than guessing. Every clause is evaluated
+    separately here, plus the price-credibility test that runs after valuation
+    rather than in SQL.
     """
     if token != os.environ.get("ADMIN_TOKEN", ""):
         raise HTTPException(403, "forbidden")
-    rows = qall("""
-      SELECT p.apn, p.owner, p.owner_type, p.use, p.status,
-             p.est, p.acres, p.absentee,
-             (coalesce(p.owner,'') ILIKE ANY(%(pub)s))  AS like_match,
-             (coalesce(p.owner,'') ~* ANY(%(pubre)s))   AS regex_match,
+    base = qall("""
+      SELECT p.apn, p.owner, p.owner_type, p.use, p.status, p.est, p.acres,
+             p.tenure, p.absentee, p.zcta, p.water_state, p.situs_address,
+             p.enviro_on_site, p.enviro_near,
              (SELECT array_agg(pat) FROM unnest(%(pubre)s::text[]) pat
-               WHERE coalesce(p.owner,'') ~* pat)        AS patterns_hit,
-             length(coalesce(p.owner,''))               AS owner_len
-      FROM parcels p WHERE p.apn = %(apn)s
-    """, {"apn": apn, "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEXES})
-    if not rows:
+               WHERE coalesce(p.owner,'') ~* pat)      AS patterns_hit,
+             z.median_price_per_acre
+      FROM parcels p LEFT JOIN zones z ON z.zcta = p.zcta
+      WHERE p.apn = %(apn)s
+    """, {"apn": apn, "pubre": PUBLIC_OWNER_REGEXES})
+    if not base:
         return {"apn": apn, "found": False,
-                "note": "not in the parcels table at all"}
-    r = dict(rows[0])
-    owner = r.get("owner") or ""
-    r["owner_repr"] = repr(owner)
-    r["owner_codepoints"] = [f"{c}={ord(c)}" for c in owner if ord(c) > 126 or ord(c) < 32]
-    r["public_owner_in_tile"] = bool(r.pop("like_match")) or bool(r.pop("regex_match"))
-    where, args = _screen_where("", "", "", 0, 0, 0, False, "", "", 0, False, False)
-    passes = q1(f"SELECT count(*) FROM parcels p WHERE p.apn = %s AND ({where})",
-                (apn, *args))
-    r["passes_targets_screen"] = bool(passes and passes[0])
-    r["verdict"] = ("still reaching the target list; the screen is not catching it"
-                    if r["passes_targets_screen"] else
-                    "excluded from the target list. If it still shades on the map, "
-                    "the browser is holding an old tile: the tile URL carries ?v= "
-                    "and that version must change when TILE_SQL does")
+                "verdict": "not in the parcels table at all. Either the county "
+                           "ingest did not reach it, or its land-use code is not "
+                           "vacant or agricultural."}
+    r = dict(base[0])
+    checks = [
+        ("status is Off-market",        "p.status = 'Off-market'"),
+        ("use is Vacant or Agricultural","p.use IN ('Vacant','Agricultural')"),
+        ("acreage on record",           "p.acres > 0"),
+        ("assessed value on record",    "p.est > 0"),
+        ("owner is not a public body",
+         "NOT (coalesce(p.owner,'') ILIKE ANY(%(pub)s) OR coalesce(p.owner,'') ~* ANY(%(pubre)s))"),
+        ("owner is not a homebuilder",  "coalesce(p.owner_type,'') <> 'Builder/Developer'"),
+    ]
+    failed, results = [], {}
+    for label, cond in checks:
+        ok = q1(f"SELECT ({cond}) FROM parcels p WHERE p.apn = %(apn)s",
+                {"apn": apn, "pub": PUBLIC_OWNER_PATTERNS, "pubre": PUBLIC_OWNER_REGEXES})
+        results[label] = bool(ok and ok[0])
+        if not results[label]:
+            failed.append(label)
+    # price credibility is decided after valuation, not in the WHERE clause
+    try:
+        rows = _candidates("p.apn = %s", (apn,))
+        if rows:
+            v = _valued(rows, _model_params(None, None, None, None, 10), 10)
+            if v:
+                r["price_per_acre"] = v[0].get("price_per_acre")
+                r["price_basis"] = v[0].get("price_basis")
+                r["value_score"] = v[0].get("value_score")
+                r["p50_years"] = v[0].get("p50_years")
+                results["assessed price is credible"] = bool(v[0].get("price_reliable"))
+                if not v[0].get("price_reliable"):
+                    failed.append("assessed price is credible")
+    except Exception as e:
+        results["assessed price is credible"] = f"could not evaluate: {str(e)[:90]}"
+    r["checks"] = results
+    r["failed"] = failed
+    if not failed:
+        r["verdict"] = ("passes every screen. If you still cannot see it, the "
+                        "filters in the Targets panel are narrowing it out: check "
+                        "Min acres, Max total, Min score and Converts within, or "
+                        "press Reset all filters.")
+    else:
+        HINT = {
+          "status is Off-market":
+            f"status reads {r.get('status')!r}. The list only shows off-market land, "
+            "on the reasoning that anything already listed is not an off-market "
+            "approach. A parcel you are selling will sit outside the screen.",
+          "assessed price is credible":
+            f"assessed value works out to {r.get('price_per_acre')} per acre on a "
+            f"{r.get('price_basis')} basis, below the credible floor of "
+            f"{MIN_CREDIBLE_PPA} or under 15% of the ZIP median. The parcel is real; "
+            "the assessor's figure is not usable as a price.",
+          "assessed value on record":
+            "no assessed value on record, so no price basis exists for it.",
+          "owner is not a public body": f"owner matched {r.get('patterns_hit')}.",
+        }
+        r["verdict"] = " ".join(HINT.get(f, f"failed: {f}.") for f in failed)
     return r
 
 @app.get("/admin/screens")
